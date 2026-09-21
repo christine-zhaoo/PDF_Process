@@ -1,0 +1,10 @@
+failed_at_utc,source_uri,error
+2026-09-21T14:08:57.307355+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_1.pdf,"Nov23_1.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:08:57.487715+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_2.pdf,"Nov23_2.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:08:57.693673+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_3.pdf,"Nov23_3.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:08:57.869168+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_4.pdf,"Nov23_4.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:52:24.067709+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_1.pdf,"Nov23_1.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:52:24.216592+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_2.pdf,"Nov23_2.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:52:24.381825+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_3.pdf,"Nov23_3.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:52:24.533135+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_4.pdf,"Nov23_4.pdf has 1 pages, which is not divisible by 2 pages per survey"
+2026-09-21T14:55:06.646579+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_5.pdf,duplicate TPS number in Nov23_5.pdf: 2025_Nov_23_5_TPS_4010.pdf

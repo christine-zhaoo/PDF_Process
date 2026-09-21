@@ -1,0 +1,14 @@
+failed_at_utc,source_uri,error
+2026-09-18T19:47:37.858794+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_4.pdf,duplicate TPS number in Nov3_4.pdf: 2025_Nov_03_4_TPS_2648.pdf
+2026-09-18T19:53:49.154443+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,duplicate TPS number in Nov3_6.pdf: 2025_Nov_03_6_TPS_2548.pdf
+2026-09-18T19:54:43.250353+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_9.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T19:55:59.409836+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T19:56:04.085268+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,duplicate TPS number in Nov3_6.pdf: 2025_Nov_03_6_TPS_2548.pdf
+2026-09-18T19:56:42.540253+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T19:56:59.542248+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_9.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T20:02:26.088232+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T20:02:38.825872+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T20:03:19.192173+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T20:05:09.961094+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
+2026-09-18T20:07:18.792726+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_1.pdf,duplicate TPS number in Nov17_1.pdf: 2025_Nov_17_1_TPS_6158.pdf
+2026-09-18T20:08:38.146087+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf,TPS extraction failed after 3 attempt(s): TPS extraction returned 'UNKNOWN'; expected exactly four digits
