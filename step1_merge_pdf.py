@@ -428,31 +428,52 @@ def extract_tps_number_from_page(
     ) from last_error
 
 
-def assess_page_content_issue(
+def assess_page_content_and_declined(
     page,
     model: str = TPS_EXTRACTION_MODEL,
-) -> Optional[str]:
-    """Best-effort content check for a page that can't be paired into a normal
-    two-page survey unit (see split_combined_pdf()'s page-count-mismatch
-    branch). extract_tps_number_from_page() only crops the small handwritten
+) -> tuple:
+    """Combined content-quality + declined-marking check for a full survey
+    page, in a single Gemini call. Previously this was two separate calls
+    (assess_page_content_issue() and detect_declined_marking()) that each
+    rendered the same whole-page image and asked for one word back — merged
+    here into one render + one prompt to cut Gemini calls (and the token
+    cost of re-sending the same page image) roughly in half.
+
+    extract_tps_number_from_page() only crops the small handwritten
     TPS-number field, which rarely has enough visible text to judge the
-    page's language — this instead renders the WHOLE page so a non-English
-    survey (or a page whose content is unreadable for any other reason) gets
-    flagged even when a normal two-page pairing was never possible. Returns a
-    human-readable reason, or None if nothing looks wrong. Never raises: this
-    is advisory context appended to an already-decided rejection, so a
-    network hiccup here shouldn't block reporting that rejection."""
+    page's language or to see a handwritten marking that could appear
+    anywhere on the form — this instead renders the WHOLE page.
+
+    Returns (content_issue: Optional[str], declined: bool):
+    - content_issue is a human-readable reason the page can't be trusted
+      (non-English or unreadable), or None if nothing looks wrong.
+    - declined is True if a large handwritten "Declined"/"Decline"/"Refused"
+      marking is visible across the page — a page with declined=True still
+      gets split and uploaded like any other survey (the TPS number is still
+      valid and needed), just flagged with needs_review=True so a human
+      confirms it before the response is treated as normal survey data.
+
+    Never raises: this is advisory context, so a network hiccup here
+    shouldn't block the rejection/processing decision it supports —
+    returns (None, False) on any failure."""
     import pymupdf
     from google import genai
     from google.genai import types
 
     prompt = (
-        "Look at this scanned survey page as a whole. Respond with exactly "
-        "one word: OK if the page's text is in English and its handwritten "
-        "TPS number (if visible) is legible; NON_ENGLISH if any visible "
-        "text on the page is written in a language other than English; or "
-        "UNREADABLE if the page content or TPS number can't be made out at "
-        "all. No other text in your response."
+        "Look at this scanned survey page as a whole and answer two "
+        "questions about it, responding with exactly two words separated by "
+        "a space (no other text).\n\n"
+        "First word - the page's content quality: OK if the page's text is "
+        "in English and its handwritten TPS number (if visible) is legible; "
+        "NON_ENGLISH if any visible text on the page is written in a "
+        "language other than English; or UNREADABLE if the page content or "
+        "TPS number can't be made out at all.\n\n"
+        "Second word - whether the respondent declined: DECLINED if you see "
+        "a large handwritten word like 'Declined', 'Decline', or 'Refused' "
+        "written prominently across the page (not just small printed text "
+        "that happens to contain a similar word); otherwise NOT_DECLINED.\n\n"
+        "Example response: 'OK NOT_DECLINED' or 'UNREADABLE DECLINED'."
     )
     try:
         pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
@@ -474,15 +495,19 @@ def assess_page_content_issue(
             RUN_TOKEN_TOTALS["output_tokens"] += getattr(usage, "candidates_token_count", None) or 0
             RUN_TOKEN_TOTALS["total_tokens"] += getattr(usage, "total_token_count", None) or 0
             RUN_TOKEN_TOTALS["requests"] += 1
-        verdict = (response.text or "").strip().upper()
-        if verdict == "NON_ENGLISH":
-            return "the PDF is in a language other than English"
-        if verdict == "UNREADABLE":
-            return "Gemini could not read the page content"
-        return None
-    except Exception as error:  # noqa: BLE001 - advisory only, never block the rejection this supports
-        status("[GEMINI] Page content assessment failed (%s); continuing without it.", error)
-        return None
+        parts = (response.text or "").strip().upper().split()
+        content_word = parts[0] if len(parts) >= 1 else ""
+        declined_word = parts[1] if len(parts) >= 2 else ""
+        content_issue = None
+        if content_word == "NON_ENGLISH":
+            content_issue = "the PDF is in a language other than English"
+        elif content_word == "UNREADABLE":
+            content_issue = "Gemini could not read the page content"
+        declined = declined_word == "DECLINED"
+        return content_issue, declined
+    except Exception as error:  # noqa: BLE001 - advisory only, never block the decision this supports
+        status("[GEMINI] Page content/declined assessment failed (%s); continuing without it.", error)
+        return None, False
 
 
 def verify_same_tps_number(
@@ -594,7 +619,7 @@ def split_combined_pdf(
             # WHY a source ended up with a malformed page count in the first
             # place (e.g. a single stray page scanned in isolation) and is
             # useful context for review.
-            content_issue = assess_page_content_issue(source_doc[0])
+            content_issue, _declined = assess_page_content_and_declined(source_doc[0])
             if content_issue:
                 reject_reason = f"{reject_reason}; Also: {content_issue}"
             return [
@@ -751,7 +776,7 @@ def split_combined_pdf(
                 continue
             previous_tps = tps
 
-            content_issue = assess_page_content_issue(source_doc[start])
+            content_issue, declined = assess_page_content_and_declined(source_doc[start])
             if content_issue:
                 entry = {
                     "source_name": source_name,
@@ -766,10 +791,21 @@ def split_combined_pdf(
                 seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
                 continue
 
-            output_name = (
-                f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                f"_TPS_{tps}.pdf"
-            )
+            if declined:
+                output_name = (
+                    f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
+                    f"_TPS_{tps}_NEEDS_REVIEW.pdf"
+                )
+                declined_reason = (
+                    f"A large handwritten 'Declined' marking was detected on this "
+                    f"survey page (TPS {tps}) - flagged for manual review."
+                )
+            else:
+                output_name = (
+                    f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
+                    f"_TPS_{tps}.pdf"
+                )
+                declined_reason = None
             output_doc = pymupdf.open()
             try:
                 output_doc.insert_pdf(
@@ -784,7 +820,7 @@ def split_combined_pdf(
                     "pdf_bytes": output_doc.tobytes(),
                     "page_start": start + 1,
                     "page_end": start + pages_per_survey,
-                    "reject_reason": None,
+                    "reject_reason": declined_reason,
                 }
                 outputs.append(entry)
                 seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
