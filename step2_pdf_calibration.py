@@ -21,7 +21,7 @@ import pprint
 from pathlib import Path
 
 RENDER_DPI = 300
-BQ_TABLE = "@OutputTable1"
+BQ_TABLE = "ladph_tps.pdf_calibration_profile"
 
 # ==========================================================================
 # calibration baseline — measured box geometry

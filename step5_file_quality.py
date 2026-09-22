@@ -82,8 +82,8 @@ from typing import Optional
 # Configuration — same defaults merge_survey_pdfs.py uses, kept here so this
 # file runs standalone with no shared config import.
 # --------------------------------------------------------------------------
-BQ_PROJECT = None  # None -> your application-default GCP project
-BQ_DATASET = "lapd_survey"
+BQ_PROJECT = "gcp-sapchoda-dev"
+BQ_DATASET = "ladph_tps"
 SURVEY_RESPONSES_TABLE = "survey_responses"
 FILE_QUALITY_TABLE = "file_quality_review"
 

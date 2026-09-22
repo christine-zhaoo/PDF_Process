@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -c \"import pyspark; print\\(pyspark.__version__\\)\")",
+      "Bash(.venv/bin/python /private/tmp/claude-503/-Users-christine-zhao-Documents-LADPH/8b58aeec-a86f-4523-8be2-e07ab03d1175/scratchpad/bq_manifest_smoke_test.py)",
+      "Bash(./.venv/bin/python -u step1_merge_pdf.py --bucket tps_survey --root-prefix 'TPS_Scanned_2025/Nov 23 2025/' --year 2025 --failure-log step1_failed_sources_nov23.csv)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(python3 -m py_compile step1_merge_pdf.py)"
+    ]
+  }
+}

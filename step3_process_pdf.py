@@ -448,7 +448,7 @@ SPARK_BQ_STAGING_BUCKET = BUCKET_NAME
 # --- extraction (Vertex AI Gemini) ---
 VERTEX_PROJECT_ID = "gcp-sapchoda-dev"
 VERTEX_LOCATION = "global"
-GEMINI_MODEL = "gemini-3.8-flash"  # confirm this model ID is enabled in the Vertex AI Model Garden
+GEMINI_MODEL = "gemini-3.1-flash-lite"  # confirm this model ID is enabled in the Vertex AI Model Garden
 
 # --- extraction quality gates: model self-reported confidence + Cloud
 # Vision double-check for handwritten fields (added at user request to
@@ -464,8 +464,8 @@ VISION_FREEFORM_COVERAGE_THRESHOLD = 0.9  # cross_check_written_field_with_visio
 VISION_PROJECT_ID = None  # None -> uses application-default GCP project, same convention as VERTEX_PROJECT_ID
 
 # --- extraction output (BigQuery) ---
-BQ_PROJECT_ID = None  # None -> uses your application-default GCP project
-BQ_DATASET = "lapd_survey"
+BQ_PROJECT_ID = "gcp-sapchoda-dev"
+BQ_DATASET = "ladph_tps"
 BQ_TABLE = "survey_responses"
 BQ_CORRECTIONS_TABLE = "corrections_log"  # see log_corrections() below
 

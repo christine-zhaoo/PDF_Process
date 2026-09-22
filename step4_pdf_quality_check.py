@@ -71,7 +71,7 @@ with your notebook the way a direct call does):
 
     from build_file_quality_review import run, BQ_DATASET, SURVEY_RESPONSES_TABLE, FILE_QUALITY_TABLE
     run(
-        bq_project=None,             # None = your default GCP project
+        bq_project=None,             # None = BQ_PROJECT ("gcp-sapchoda-dev")
         bq_dataset=BQ_DATASET,
         survey_responses_table=SURVEY_RESPONSES_TABLE,
         file_quality_table=FILE_QUALITY_TABLE,
@@ -90,8 +90,8 @@ from typing import Optional
 # Configuration — same defaults merge_survey_pdfs.py uses, kept here so this
 # file runs standalone with no shared config import.
 # --------------------------------------------------------------------------
-BQ_PROJECT = None  # None -> your application-default GCP project
-BQ_DATASET = "lapd_survey"
+BQ_PROJECT = "gcp-sapchoda-dev"
+BQ_DATASET = "ladph_tps"
 SURVEY_RESPONSES_TABLE = "survey_responses"
 FILE_QUALITY_TABLE = "file_quality_review"
 

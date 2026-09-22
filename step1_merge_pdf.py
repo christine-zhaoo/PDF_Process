@@ -92,8 +92,8 @@ TPS_EXTRACTION_LOCATION = "global"
 TPS_EXTRACTION_PROJECT = "gcp-sapchoda-dev"
 TPS_EXTRACTION_MAX_ATTEMPTS = 3
 TPS_EXTRACTION_RETRY_DELAY_SECONDS = 2
-BQ_PROJECT = None  # None -> the Spark/BigQuery connector's default project
-BQ_DATASET = "@database"
+BQ_PROJECT = "gcp-sapchoda-dev"
+BQ_DATASET = "ladph_tps"
 MANIFEST_TABLE = "pdf_manifest_list"
 DEFAULT_FAILURE_LOG = "step1_failed_sources.csv"
 partition_field = "moved_date"  # must be an actual column in BQ_MANIFEST_SCHEMA
@@ -136,18 +136,25 @@ def err(msg, *args) -> None:
     log.error(msg, *args)
 
 
-def log_failed_source(failure_log: str, source_uri: str, error: Exception) -> None:
-    """Persist a source failure immediately so it survives batch interruption."""
+def log_failed_source(failure_log: str, source_uri: str, error: Exception, bad_pdf: Optional[str] = None) -> None:
+    """Persist a source failure immediately so it survives batch interruption.
+
+    bad_pdf identifies exactly which PDF the failure/rejection applies to —
+    source_uri alone isn't enough for a combined scan, where the file that
+    failed to move is the whole batch but the actual problem is one
+    particular survey (page range) inside it. Defaults to source_uri when
+    the failure is at the whole-source-file level."""
     path = Path(failure_log)
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_header = not path.exists() or path.stat().st_size == 0
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         if needs_header:
-            writer.writerow(["failed_at_utc", "source_uri", "error"])
+            writer.writerow(["failed_at_utc", "source_uri", "bad_pdf", "error"])
         writer.writerow([
             datetime.datetime.now(datetime.timezone.utc).isoformat(),
             source_uri,
+            bad_pdf or source_uri,
             str(error),
         ])
         handle.flush()
@@ -257,16 +264,35 @@ def parse_file_name_date(file_name: str) -> Optional[tuple]:
     return (month, day)
 
 
+class TpsRejected(Exception):
+    """Raised when a survey's page 1 can't be trusted for a TPS number —
+    either the handwritten number (or the page content around it) is
+    illegible, or the page is written in a language other than English.
+    This is expected to happen for a genuinely bad or foreign-language
+    scan, not a bug, and is handled by recording a rejected manifest row
+    (with a reject_reason) rather than failing the whole source PDF."""
+
+
 def extract_tps_number_from_page(
     page,
     model: str = TPS_EXTRACTION_MODEL,
     max_attempts: int = TPS_EXTRACTION_MAX_ATTEMPTS,
+    expected_next_tps: Optional[str] = None,
 ) -> str:
     """Reads the handwritten TPS number printed at the upper-right of page 1.
 
     The source scans are image-only and the number is handwritten, so PDF text
     extraction and filename parsing cannot recover it. Gemini receives only a
     tightly cropped image of that field and must return exactly four digits.
+
+    expected_next_tps: the previous survey's TPS number in this same combined
+    scan (surveys are digitized in sequence, so TPS numbers normally
+    increment one-by-one within a batch). Passed along as a hint in the
+    prompt to help disambiguate easily-confused handwritten digits (e.g. a 1
+    misread as a 4, or a 6 misread as an 8) that previously caused two
+    different surveys to resolve to the same TPS number and made the whole
+    combined source PDF look like it had a duplicate. None for the first
+    survey in a batch (no prior number to anchor against).
     """
     import pymupdf
     from google import genai
@@ -283,16 +309,36 @@ def extract_tps_number_from_page(
         page_rect.y0 + page_rect.height * 0.24,
     )
     pixmap = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=crop, alpha=False)
-    prompt = (
+    prompt_parts = [
         "Read the handwritten four-digit TPS number in this cropped survey "
         "field. Return only the four digits, with no spaces, punctuation, "
-        "explanation, or markdown. If the TPS number's digits are not all "
-        "clearly legible, or the cropped image content itself is blank, "
-        "corrupted, or otherwise unreadable, do not guess — return exactly "
-        "REJECT_UNREADABLE instead. If any text visible in the cropped "
-        "image is written in a language other than English, do not guess "
-        "— return exactly REJECT_NON_ENGLISH instead."
+        "explanation, or markdown."
+    ]
+    if expected_next_tps is not None:
+        try:
+            hint_value = f"{int(expected_next_tps) + 1:04d}"
+        except ValueError:
+            hint_value = None
+        if hint_value is not None:
+            prompt_parts.append(
+                f"Context: TPS numbers in this scanned batch are assigned "
+                f"sequentially, one higher than the previous survey. The "
+                f"previous survey's TPS number was {expected_next_tps}, so "
+                f"this one is expected to be close to {hint_value}. Use this "
+                f"only to disambiguate handwritten digits that are hard to "
+                f"tell apart (e.g. 1 vs 4, 6 vs 8, 3 vs 8) - always defer to "
+                f"what is actually handwritten if it clearly differs from "
+                f"this expectation; the sequence can still skip or reset."
+            )
+    prompt_parts.append(
+        "If the TPS number's digits are not all clearly legible, or the "
+        "cropped image content itself is blank, corrupted, or otherwise "
+        "unreadable, do not guess — return exactly REJECT_UNREADABLE "
+        "instead. If any text visible in the cropped image is written in a "
+        "language other than English, do not guess — return exactly "
+        "REJECT_NON_ENGLISH instead."
     )
+    prompt = " ".join(prompt_parts)
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -364,6 +410,63 @@ def extract_tps_number_from_page(
     ) from last_error
 
 
+def assess_page_content_issue(
+    page,
+    model: str = TPS_EXTRACTION_MODEL,
+) -> Optional[str]:
+    """Best-effort content check for a page that can't be paired into a normal
+    two-page survey unit (see split_combined_pdf()'s page-count-mismatch
+    branch). extract_tps_number_from_page() only crops the small handwritten
+    TPS-number field, which rarely has enough visible text to judge the
+    page's language — this instead renders the WHOLE page so a non-English
+    survey (or a page whose content is unreadable for any other reason) gets
+    flagged even when a normal two-page pairing was never possible. Returns a
+    human-readable reason, or None if nothing looks wrong. Never raises: this
+    is advisory context appended to an already-decided rejection, so a
+    network hiccup here shouldn't block reporting that rejection."""
+    import pymupdf
+    from google import genai
+    from google.genai import types
+
+    prompt = (
+        "Look at this scanned survey page as a whole. Respond with exactly "
+        "one word: OK if the page's text is in English and its handwritten "
+        "TPS number (if visible) is legible; NON_ENGLISH if any visible "
+        "text on the page is written in a language other than English; or "
+        "UNREADABLE if the page content or TPS number can't be made out at "
+        "all. No other text in your response."
+    )
+    try:
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+        client = genai.Client(
+            vertexai=True,
+            project=TPS_EXTRACTION_PROJECT,
+            location=TPS_EXTRACTION_LOCATION,
+        )
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Part.from_bytes(data=pixmap.tobytes("png"), mime_type="image/png"),
+                prompt,
+            ],
+        )
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            RUN_TOKEN_TOTALS["prompt_tokens"] += getattr(usage, "prompt_token_count", None) or 0
+            RUN_TOKEN_TOTALS["output_tokens"] += getattr(usage, "candidates_token_count", None) or 0
+            RUN_TOKEN_TOTALS["total_tokens"] += getattr(usage, "total_token_count", None) or 0
+            RUN_TOKEN_TOTALS["requests"] += 1
+        verdict = (response.text or "").strip().upper()
+        if verdict == "NON_ENGLISH":
+            return "the PDF is in a language other than English"
+        if verdict == "UNREADABLE":
+            return "Gemini could not read the page content"
+        return None
+    except Exception as error:  # noqa: BLE001 - advisory only, never block the rejection this supports
+        status("[GEMINI] Page content assessment failed (%s); continuing without it.", error)
+        return None
+
+
 def split_combined_pdf(
     pdf_bytes: bytes,
     source_name: str,
@@ -386,22 +489,103 @@ def split_combined_pdf(
     source_doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         if len(source_doc) % pages_per_survey:
-            raise ValueError(
-                f"{source_name} has {len(source_doc)} pages, which is not divisible "
-                f"by {pages_per_survey} pages per survey"
+            reject_reason = (
+                f"{source_name} has {len(source_doc)} page(s), which is not a "
+                f"multiple of {pages_per_survey} pages per survey"
             )
+            # Can't tell where survey boundaries would even be, so this can't be
+            # split into per-survey units - but still worth checking page 1's
+            # full content for a language/legibility issue, since that's often
+            # WHY a source ended up with a malformed page count in the first
+            # place (e.g. a single stray page scanned in isolation) and is
+            # useful context for review.
+            content_issue = assess_page_content_issue(source_doc[0])
+            if content_issue:
+                reject_reason = f"{reject_reason}; Also: {content_issue}"
+            return [
+                {
+                    "source_name": source_name,
+                    "date_folder": date_folder,
+                    "output_name": None,
+                    "pdf_bytes": None,
+                    "page_start": 1,
+                    "page_end": len(source_doc),
+                    "reject_reason": reject_reason,
+                }
+            ]
         outputs = []
         survey_starts = range(0, len(source_doc), pages_per_survey)
         if max_surveys is not None:
             if max_surveys < 1:
                 raise ValueError("max_surveys must be at least 1")
             survey_starts = list(survey_starts)[:max_surveys]
+
+        previous_tps = None  # last successfully-read TPS number, used as sequential context for the next one
+        seen_tps = {}  # tps -> "start-end" page range already used by an earlier survey in this same source
+
         for start in survey_starts:
-            tps = tps_extractor(source_doc[start])
             batch_match = _COMBINED_FILE_RE.fullmatch(source_name)
             if batch_match is None:
                 raise ValueError(f"cannot determine batch suffix from {source_name!r}")
             batch_suffix = batch_match.group("batch")
+            page_range = f"{start + 1}-{start + pages_per_survey}"
+            try:
+                tps = tps_extractor(source_doc[start], expected_next_tps=previous_tps)
+            except TpsRejected as rejection:
+                outputs.append(
+                    {
+                        "source_name": source_name,
+                        "date_folder": date_folder,
+                        "output_name": None,
+                        "pdf_bytes": None,
+                        "page_start": start + 1,
+                        "page_end": start + pages_per_survey,
+                        "reject_reason": str(rejection),
+                    }
+                )
+                continue
+            # A real batch really can repeat a TPS number by mistake, but far more often
+            # a duplicate here means one of the two reads is a misread of a similar-looking
+            # digit (e.g. 1 vs 4) - flag just this survey for manual review instead of
+            # aborting the whole combined source PDF over it.
+            if tps in seen_tps:
+                outputs.append(
+                    {
+                        "source_name": source_name,
+                        "date_folder": date_folder,
+                        "output_name": None,
+                        "pdf_bytes": None,
+                        "page_start": start + 1,
+                        "page_end": start + pages_per_survey,
+                        "reject_reason": (
+                            f"TPS {tps} was already read from pages {seen_tps[tps]} in "
+                            f"this same source PDF - likely a misread of a similar-"
+                            f"looking handwritten digit rather than a genuine duplicate; "
+                            f"flagged for manual review instead of being uploaded."
+                        ),
+                    }
+                )
+                previous_tps = tps
+                continue
+            previous_tps = tps
+
+            content_issue = assess_page_content_issue(source_doc[start])
+            if content_issue:
+                seen_tps[tps] = page_range
+                outputs.append(
+                    {
+                        "source_name": source_name,
+                        "date_folder": date_folder,
+                        "output_name": None,
+                        "pdf_bytes": None,
+                        "page_start": start + 1,
+                        "page_end": start + pages_per_survey,
+                        "reject_reason": f"{content_issue} (TPS {tps})",
+                    }
+                )
+                continue
+
+            seen_tps[tps] = page_range
             output_name = (
                 f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
                 f"_TPS_{tps}.pdf"
@@ -421,6 +605,7 @@ def split_combined_pdf(
                         "pdf_bytes": output_doc.tobytes(),
                         "page_start": start + 1,
                         "page_end": start + pages_per_survey,
+                        "reject_reason": None,
                     }
                 )
             finally:
@@ -583,9 +768,11 @@ class ManifestRow:
     source_gcs_uri: str
     parsed_month_day: str  # e.g. "12/14" - the (month, day) parsed from the file name, for auditability
     destination_folder: str  # e.g. "Dec 14 2025"
-    destination_gcs_uri: str
+    destination_gcs_uri: Optional[str]  # None when the survey was rejected (never split/uploaded)
     moved_at: Optional[datetime.datetime] = None  # when this ETL run moved the file
     moved_date: Optional[datetime.date] = None  # DATE(moved_at); the BQ table's partitioning column
+    reject_reason: Optional[str] = None  # why this survey was rejected (TPS/content unreadable, non-English), else None
+    source_page_range: Optional[str] = None  # e.g. "1-2" - which pages/survey unit inside source_file this row is about, for a combined scan
 
 
 @dataclass
@@ -729,10 +916,60 @@ def organize_combined_pdf(
     seen_names = set()
     destination_prefix = _normalize_prefix(destination_prefix)
 
+    month, day = (
+        (source_date.month, source_date.day)
+        if isinstance(source_date, datetime.date)
+        else source_date
+    )
+
     for output in outputs:
+        page_range = f"{output['page_start']}-{output['page_end']}"
+        reject_reason = output.get("reject_reason")
+        if reject_reason:
+            err(
+                "[SPLIT] REJECTED survey (pages %s) in %s: %s",
+                page_range,
+                source_uri,
+                reject_reason,
+            )
+            result.moved_rows.append(
+                ManifestRow(
+                    source_file=source_name,
+                    source_gcs_uri=source_uri,
+                    parsed_month_day=f"{month:02d}/{day:02d}",
+                    destination_folder=output["date_folder"],
+                    destination_gcs_uri=None,
+                    moved_at=moved_at,
+                    moved_date=moved_at.date(),
+                    reject_reason=reject_reason,
+                    source_page_range=page_range,
+                )
+            )
+            continue
+
         output_name = output["output_name"]
         if output_name in seen_names:
-            raise ValueError(f"duplicate TPS number in {source_name}: {output_name}")
+            # split_combined_pdf() already dedupes by TPS number across a source's
+            # own survey units - reaching this is unexpected, so flag just this one
+            # survey rather than aborting the rest of an otherwise-good source PDF.
+            err(
+                "[SPLIT] REJECTED survey (pages %s) in %s: duplicate output name %s",
+                page_range, source_uri, output_name,
+            )
+            result.moved_rows.append(
+                ManifestRow(
+                    source_file=source_name,
+                    source_gcs_uri=source_uri,
+                    parsed_month_day=f"{month:02d}/{day:02d}",
+                    destination_folder=output["date_folder"],
+                    destination_gcs_uri=None,
+                    moved_at=moved_at,
+                    moved_date=moved_at.date(),
+                    reject_reason=f"duplicate TPS output name {output_name!r} within this source PDF",
+                    source_page_range=page_range,
+                )
+            )
+            continue
         seen_names.add(output_name)
         destination_blob_name = f"{destination_prefix}{output['date_folder']}/{output_name}"
         destination_uri = f"gs://{bucket.name}/{destination_blob_name}"
@@ -753,11 +990,6 @@ def organize_combined_pdf(
                 output["pdf_bytes"], content_type="application/pdf"
             )
             status("[SPLIT] Uploaded %s -> %s", source_uri, destination_uri)
-        month, day = (
-            (source_date.month, source_date.day)
-            if isinstance(source_date, datetime.date)
-            else source_date
-        )
         result.moved_rows.append(
             ManifestRow(
                 source_file=output_name,
@@ -767,6 +999,8 @@ def organize_combined_pdf(
                 destination_gcs_uri=destination_uri,
                 moved_at=moved_at,
                 moved_date=moved_at.date(),
+                reject_reason=None,
+                source_page_range=page_range,
             )
         )
 
@@ -787,6 +1021,8 @@ BQ_MANIFEST_SCHEMA = [
     ("destination_gcs_uri", "STRING", "gs:// URI the source PDF was moved TO."),
     ("moved_at", "TIMESTAMP", "When this ETL run moved the file."),
     ("moved_date", "DATE", "DATE(moved_at); the table's partitioning column."),
+    ("reject_reason", "STRING", "Why this survey was rejected (unreadable TPS/content, or non-English PDF); NULL if not rejected."),
+    ("source_page_range", "STRING", "e.g. '1-2' - which pages/survey unit inside source_file this row is about, for a combined scan; NULL for a standalone source file."),
 ]
 
 
@@ -853,17 +1089,74 @@ def ensure_manifest_table(bq_client, project: str, dataset: str, table: str):
     return bq_table
 
 
+def delete_existing_manifest_rows_for_sources(
+    bq_client,
+    project: str,
+    dataset: str,
+    table: str,
+    source_keys: list,
+) -> None:
+    """Deletes any existing manifest row(s) matching the given
+    (source_gcs_uri, source_page_range) pairs before a fresh load - keyed at
+    the individual survey-unit level (not the whole combined source PDF), so
+    reprocessing one previously-rejected survey replaces just that survey's
+    row instead of also wiping out other surveys from the same source PDF
+    that already succeeded in an earlier run and aren't being re-emitted
+    this time (they're skipped, not reprocessed - see
+    combined_source_is_complete()/the destination_blob.exists() checks)."""
+    from google.cloud import bigquery
+    from google.api_core.exceptions import NotFound
+
+    unique_keys = sorted(set(source_keys))
+    if not unique_keys:
+        return
+    table_id = f"`{project}`.`{dataset}`.`{table}`"
+    struct_params = [
+        bigquery.StructQueryParameter(
+            None,
+            bigquery.ScalarQueryParameter("source_gcs_uri", "STRING", uri),
+            bigquery.ScalarQueryParameter("source_page_range", "STRING", page_range),
+        )
+        for uri, page_range in unique_keys
+    ]
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("keys", "STRUCT", struct_params),
+        ]
+    )
+    try:
+        bq_client.query(
+            f"""
+            DELETE FROM {table_id} AS t
+            WHERE EXISTS (
+                SELECT 1 FROM UNNEST(@keys) AS k
+                WHERE t.source_gcs_uri = k.source_gcs_uri
+                  AND (t.source_page_range = k.source_page_range
+                       OR (t.source_page_range IS NULL AND k.source_page_range IS NULL))
+            )
+            """,
+            job_config=job_config,
+        ).result()
+    except NotFound:
+        # Table doesn't exist yet - nothing to delete before the first load.
+        pass
+
+
 def load_manifest_rows_into_bq(
     rows: list,
     project: str,
     dataset: str,
     table: str,
     staging_bucket: Optional[str] = None,
+    bq_client=None,
 ) -> int:
-    """Loads manifest rows (a list of ManifestRow) into BigQuery through Spark + the BigQuery Spark connector - requires a SparkSession already
-    in scope as the global `spark` (e.g. a Databricks notebook); this function does not create one itself. Writes with mode='append', so
-    re-running this script appends another copy of any rows rather than replacing them (there's no delete-then-load-per-folder step here, since
-    a manifest row is a record of one organize run rather than a value meant to be superseded by the next run).
+    """Loads manifest rows (a list of ManifestRow) into BigQuery, preferring Spark + the BigQuery Spark connector when a SparkSession is already
+    in scope as the global `spark` (e.g. a Databricks notebook); this function does not create one itself. If no `spark` is in scope, or the
+    Spark write itself raises, this falls back to a direct google.cloud.bigquery.Client write (see load_manifest_rows_into_bq_via_client()) so a
+    plain-Python run (outside a Databricks notebook), or a one-off Spark connector failure, still gets its manifest rows persisted rather than
+    silently losing them. Before writing, deletes any existing row(s) for the same (source_gcs_uri, source_page_range) (see
+    delete_existing_manifest_rows_for_sources()) so reprocessing one survey unit (e.g. a previously-rejected one) replaces just that unit's
+    manifest record - only the latest record per survey unit is kept, without touching other surveys from the same source PDF.
 
     staging_bucket: the connector's default ("indirect") write path stages the DataFrame's data into a GCS bucket before loading it into BigQuery,
     and raises "Either temporary or persistent GCS bucket must be set" if none is configured - it does NOT reuse the source/output bucket this
@@ -873,36 +1166,96 @@ def load_manifest_rows_into_bq(
     SparkSession itself."""
     if not rows:
         return 0
-    if "spark" not in globals():
-        raise RuntimeError(
-            "load_manifest_rows_into_bq() requires a SparkSession already in "
-            "scope as the global `spark` (e.g. running inside a Databricks "
-            "notebook) - none was found. Run this from a Spark-enabled "
-            "notebook environment."
-        )
+    table_id = f"{project}.{dataset}.{table}"
     staging_bucket = staging_bucket or BUCKET_NAME
-    import pandas as pd
 
-    dict_rows = [r.__dict__ for r in rows]
-    df = pd.DataFrame(dict_rows, dtype=object)
-    spark_schema = bq_schema_to_spark_schema(BQ_MANIFEST_SCHEMA)
+    if bq_client is not None:
+        delete_existing_manifest_rows_for_sources(
+            bq_client, project, dataset, table,
+            [(r.source_gcs_uri, r.source_page_range) for r in rows if r.source_gcs_uri],
+        )
 
-    for field in spark_schema.fieldNames():
-        if field not in df.columns:
-            df[field] = None
-    df = df[spark_schema.fieldNames()]
-    df = df.where(df.notna(), None)
+    if "spark" in globals():
+        try:
+            import pandas as pd
 
-    spark_df = globals()["spark"].createDataFrame(df, schema=spark_schema)
-    spark_df.show(truncate = False)
+            dict_rows = [r.__dict__ for r in rows]
+            df = pd.DataFrame(dict_rows, dtype=object)
+            spark_schema = bq_schema_to_spark_schema(BQ_MANIFEST_SCHEMA)
 
-    writeToEventStore(spark_df, "@OutputTable1", 1, "moved_date")
+            for field in spark_schema.fieldNames():
+                if field not in df.columns:
+                    df[field] = None
+            df = df[spark_schema.fieldNames()]
+            df = df.where(df.notna(), None)
 
-    status(
-        "[BQ][SPARK] Wrote %d manifest row(s) into %s via Spark (partitioned by %s, staged through gs://%s).",
-        len(rows), full_table_id, partition_field, staging_bucket,
+            spark_df = globals()["spark"].createDataFrame(df, schema=spark_schema)
+            spark_df.show(truncate = False)
+
+            writeToEventStore(spark_df, "@OutputTable1", 1, "moved_date")
+
+            status(
+                "[BQ][SPARK] Wrote %d manifest row(s) into %s via Spark (partitioned by %s, staged through gs://%s).",
+                len(rows), table_id, partition_field, staging_bucket,
+            )
+            return len(rows)
+        except Exception as error:  # noqa: BLE001 - fall back to a direct BQ client write below
+            err(
+                "[BQ][SPARK] Spark load into %s failed (%s); falling back to a direct BigQuery client write.",
+                table_id, error,
+            )
+    else:
+        status(
+            "[BQ][SPARK] No SparkSession found in scope as the global `spark` (not running in a "
+            "Databricks notebook); falling back to a direct BigQuery client write for %s.",
+            table_id,
+        )
+
+    return load_manifest_rows_into_bq_via_client(rows, project, dataset, table, bq_client=bq_client)
+
+
+def load_manifest_rows_into_bq_via_client(
+    rows: list,
+    project: str,
+    dataset: str,
+    table: str,
+    bq_client=None,
+) -> int:
+    """Fallback write path for load_manifest_rows_into_bq() - used when no Spark session is available at all, or the Spark write itself failed.
+    Writes manifest rows straight through a plain google.cloud.bigquery.Client load job instead of the Spark BigQuery connector, so a run outside
+    a Databricks notebook (or a Spark connector hiccup) still gets its rows persisted into BigQuery rather than losing them."""
+    if not rows:
+        return 0
+    from google.cloud import bigquery
+
+    bq_client = bq_client or bigquery.Client(project=project)
+    table_id = f"{project}.{dataset}.{table}"
+
+    def _row_to_json(row: ManifestRow) -> dict:
+        record = dict(row.__dict__)
+        if isinstance(record.get("moved_at"), datetime.datetime):
+            record["moved_at"] = record["moved_at"].isoformat()
+        if isinstance(record.get("moved_date"), datetime.date):
+            record["moved_date"] = record["moved_date"].isoformat()
+        return record
+
+    job = bq_client.load_table_from_json(
+        [_row_to_json(r) for r in rows],
+        table_id,
+        job_config=bigquery.LoadJobConfig(
+            schema=[
+                bigquery.SchemaField(name, typ if typ != "FLOAT" else "FLOAT64")
+                for name, typ, _desc in BQ_MANIFEST_SCHEMA
+            ],
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        ),
     )
-    return len(rows)
+    job.result()
+    status(
+        "[BQ][CLIENT] Wrote %d manifest row(s) into %s via a direct BigQuery client load (fallback path).",
+        job.output_rows, table_id,
+    )
+    return job.output_rows
 
 
 def run(
@@ -972,6 +1325,21 @@ def run(
                 )
             result.moved_rows.extend(pdf_result.moved_rows)
             result.skipped_files.extend(pdf_result.skipped_files)
+            for row in pdf_result.moved_rows:
+                if not row.reject_reason:
+                    continue
+                bad_pdf = source_uri
+                if row.source_page_range:
+                    bad_pdf = f"{source_uri} (pages {row.source_page_range})"
+                try:
+                    log_failed_source(failure_log, source_uri, ValueError(row.reject_reason), bad_pdf=bad_pdf)
+                except OSError as log_error:
+                    err(
+                        "[PROGRESS] FAILED recording rejection for %s in %s: %s",
+                        bad_pdf,
+                        failure_log,
+                        log_error,
+                    )
             status(
                 "[PROGRESS] Finished source PDF %d/%d: %s (%d output(s), %d skipped)",
                 pdf_index,
@@ -1024,6 +1392,7 @@ def run(
             n_loaded = load_manifest_rows_into_bq(
                 result.moved_rows, resolved_bq_project, bq_dataset, manifest_table,
                 staging_bucket=spark_staging_bucket or BUCKET_NAME,
+                bq_client=bq_client,
             )
             status(
                 "[BQ] Loaded %d manifest row(s) into %s.%s.%s.",
