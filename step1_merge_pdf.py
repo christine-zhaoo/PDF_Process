@@ -278,12 +278,20 @@ def extract_tps_number_from_page(
     model: str = TPS_EXTRACTION_MODEL,
     max_attempts: int = TPS_EXTRACTION_MAX_ATTEMPTS,
     expected_next_tps: Optional[str] = None,
-) -> str:
+) -> tuple:
     """Reads the handwritten TPS number printed at the upper-right of page 1.
 
     The source scans are image-only and the number is handwritten, so PDF text
     extraction and filename parsing cannot recover it. Gemini receives only a
-    tightly cropped image of that field and must return exactly four digits.
+    tightly cropped image of that field and must return exactly four digits
+    plus its own confidence in that reading.
+
+    Returns (tps: str, confidence: "HIGH"|"LOW") rather than just the digits -
+    confidence gates what split_combined_pdf() is allowed to do when this
+    reading collides with an already-used TPS number (see its docstring):
+    a HIGH-confidence collision still gets a visual re-check before being
+    called a genuine duplicate; a LOW-confidence one goes straight to manual
+    review instead of being trusted enough to reject anything over.
 
     expected_next_tps: the previous survey's TPS number in this same combined
     scan (surveys are digitized in sequence, so TPS numbers normally
@@ -311,8 +319,13 @@ def extract_tps_number_from_page(
     pixmap = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=crop, alpha=False)
     prompt_parts = [
         "Read the handwritten four-digit TPS number in this cropped survey "
-        "field. Return only the four digits, with no spaces, punctuation, "
-        "explanation, or markdown."
+        "field. Respond with exactly the four digits, then a space, then "
+        "your own confidence in that reading as exactly HIGH or LOW - HIGH "
+        "only if every digit is unambiguous and clearly formed, LOW if any "
+        "single digit could plausibly be misread as a different digit (e.g. "
+        "1/4/7, 3/8, 5/6, 0/6/8/9, 2/7 are commonly confused in handwriting). "
+        "Example response: '5202 HIGH'. No other text, punctuation, or "
+        "markdown."
     ]
     if expected_next_tps is not None:
         try:
@@ -382,11 +395,16 @@ def extract_tps_number_from_page(
                     "Gemini could not read the TPS number or page content "
                     f"(returned {raw_text!r})"
                 )
-            value = re.sub(r"\D", "", raw_text)
-            if re.fullmatch(r"\d{4}", value):
-                return value
+            digit_confidence_match = re.fullmatch(r"(\d{4})\s*(HIGH|LOW)?", normalized)
+            if digit_confidence_match:
+                # A response with no parseable confidence word is treated as LOW,
+                # never HIGH - an unrecognized/missing confidence shouldn't get the
+                # benefit of the doubt that lets split_combined_pdf() skip straight
+                # to visual duplicate verification instead of manual review.
+                return digit_confidence_match.group(1), digit_confidence_match.group(2) or "LOW"
             last_error = TpsRejected(
-                f"TPS extraction returned {raw_text!r}; expected exactly four digits"
+                f"TPS extraction returned {raw_text!r}; expected exactly four digits "
+                f"followed by HIGH or LOW"
             )
         except TpsRejected as error:
             last_error = error
@@ -467,6 +485,83 @@ def assess_page_content_issue(
         return None
 
 
+def verify_same_tps_number(
+    page_a,
+    page_b,
+    model: str = TPS_EXTRACTION_MODEL,
+) -> str:
+    """Visually re-checks whether two pages' handwritten TPS numbers are
+    genuinely the same, before split_combined_pdf() calls two surveys
+    duplicates. A matching OCR reading alone does NOT prove two surveys share
+    a TPS number - Gemini can misread one ambiguous digit (e.g. 1 vs 4) and
+    make two genuinely-different surveys collide on the same four digits.
+    This sends BOTH cropped number images to Gemini in one call and asks it
+    to compare them digit-by-digit, rather than re-reading each in isolation
+    (which would just repeat whatever mistake caused the collision).
+
+    Returns "SAME", "DIFFERENT", or "AMBIGUOUS" (never raises - any failure
+    to get a clean verdict returns "AMBIGUOUS", the safe default that routes
+    to manual review instead of either wrongly confirming or wrongly
+    dismissing a duplicate)."""
+    import pymupdf
+    from google import genai
+    from google.genai import types
+
+    def _crop(page):
+        page_rect = page.rect
+        crop = pymupdf.Rect(
+            page_rect.x0 + page_rect.width * 0.80,
+            page_rect.y0 + page_rect.height * 0.08,
+            page_rect.x1 - page_rect.width * 0.01,
+            page_rect.y0 + page_rect.height * 0.24,
+        )
+        return page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=crop, alpha=False)
+
+    prompt = (
+        "IMAGE A and IMAGE B each show a cropped handwritten four-digit "
+        "survey ID number. Read each one character-by-character, digit by "
+        "digit, paying special attention to digits that are commonly "
+        "confused in handwriting (1/4/7, 3/8, 5/6, 0/6/8/9, 2/7). Then state "
+        "whether IMAGE A and IMAGE B show the SAME four-digit number or "
+        "DIFFERENT numbers. Respond with exactly one word: SAME if every "
+        "digit matches, DIFFERENT if any digit differs, or AMBIGUOUS if you "
+        "cannot confidently read one or more digits on either image well "
+        "enough to compare them. No other text."
+    )
+    try:
+        pixmap_a = _crop(page_a)
+        pixmap_b = _crop(page_b)
+        client = genai.Client(
+            vertexai=True,
+            project=TPS_EXTRACTION_PROJECT,
+            location=TPS_EXTRACTION_LOCATION,
+        )
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                "IMAGE A:",
+                types.Part.from_bytes(data=pixmap_a.tobytes("png"), mime_type="image/png"),
+                "IMAGE B:",
+                types.Part.from_bytes(data=pixmap_b.tobytes("png"), mime_type="image/png"),
+                prompt,
+            ],
+        )
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            RUN_TOKEN_TOTALS["prompt_tokens"] += getattr(usage, "prompt_token_count", None) or 0
+            RUN_TOKEN_TOTALS["output_tokens"] += getattr(usage, "candidates_token_count", None) or 0
+            RUN_TOKEN_TOTALS["total_tokens"] += getattr(usage, "total_token_count", None) or 0
+            RUN_TOKEN_TOTALS["requests"] += 1
+        verdict = (response.text or "").strip().upper()
+        if verdict in ("SAME", "DIFFERENT", "AMBIGUOUS"):
+            return verdict
+        status("[GEMINI] Duplicate-TPS visual check returned an unexpected verdict (%r); treating as AMBIGUOUS.", verdict)
+        return "AMBIGUOUS"
+    except Exception as error:  # noqa: BLE001 - never let this crash the run; be conservative instead
+        status("[GEMINI] Duplicate-TPS visual check failed (%s); treating as AMBIGUOUS.", error)
+        return "AMBIGUOUS"
+
+
 def split_combined_pdf(
     pdf_bytes: bytes,
     source_name: str,
@@ -521,7 +616,7 @@ def split_combined_pdf(
             survey_starts = list(survey_starts)[:max_surveys]
 
         previous_tps = None  # last successfully-read TPS number, used as sequential context for the next one
-        seen_tps = {}  # tps -> "start-end" page range already used by an earlier survey in this same source
+        seen_tps = {}  # tps -> {"page_range": str, "start": int} for the earlier survey in this same source that first read this TPS number
 
         for start in survey_starts:
             batch_match = _COMBINED_FILE_RE.fullmatch(source_name)
@@ -530,7 +625,7 @@ def split_combined_pdf(
             batch_suffix = batch_match.group("batch")
             page_range = f"{start + 1}-{start + pages_per_survey}"
             try:
-                tps = tps_extractor(source_doc[start], expected_next_tps=previous_tps)
+                tps, confidence = tps_extractor(source_doc[start], expected_next_tps=previous_tps)
             except TpsRejected as rejection:
                 outputs.append(
                     {
@@ -544,48 +639,133 @@ def split_combined_pdf(
                     }
                 )
                 continue
-            # A real batch really can repeat a TPS number by mistake, but far more often
-            # a duplicate here means one of the two reads is a misread of a similar-looking
-            # digit (e.g. 1 vs 4) - flag just this survey for manual review instead of
-            # aborting the whole combined source PDF over it.
+
+            # A matching OCR reading alone does NOT prove two surveys share a TPS
+            # number - never reject solely because two OCR reads collided. A
+            # HIGH-confidence collision still gets a visual, digit-by-digit
+            # re-check before being called a genuine duplicate; a LOW-confidence
+            # one skips straight to manual review, since a re-check would just
+            # repeat the same uncertain reading. Either way, neither survey's ID
+            # is ever silently changed to resolve the collision.
             if tps in seen_tps:
-                outputs.append(
-                    {
-                        "source_name": source_name,
-                        "date_folder": date_folder,
-                        "output_name": None,
-                        "pdf_bytes": None,
-                        "page_start": start + 1,
-                        "page_end": start + pages_per_survey,
-                        "reject_reason": (
-                            f"TPS {tps} was already read from pages {seen_tps[tps]} in "
-                            f"this same source PDF - likely a misread of a similar-"
-                            f"looking handwritten digit rather than a genuine duplicate; "
-                            f"flagged for manual review instead of being uploaded."
-                        ),
-                    }
-                )
                 previous_tps = tps
+                prior = seen_tps[tps]
+                if confidence == "HIGH":
+                    verdict = verify_same_tps_number(source_doc[prior["start"]], source_doc[start])
+                else:
+                    verdict = None  # LOW confidence: go straight to review, don't trust a re-check of an uncertain read
+
+                if verdict == "SAME":
+                    # A confirmed genuine duplicate - this survey really is the same
+                    # physical form as an earlier one in this batch; don't upload it.
+                    reject_reason = (
+                        f"TPS {tps} visually confirmed as a genuine duplicate of pages "
+                        f"{prior['page_range']} in this same source PDF."
+                    )
+                    outputs.append(
+                        {
+                            "source_name": source_name,
+                            "date_folder": date_folder,
+                            "output_name": None,
+                            "pdf_bytes": None,
+                            "page_start": start + 1,
+                            "page_end": start + pages_per_survey,
+                            "reject_reason": reject_reason,
+                        }
+                    )
+                    continue
+
+                # Not a confirmed duplicate - the ID collision is unresolved (visually
+                # different, ambiguous, or too low-confidence to trust a re-check).
+                # Neither survey's TPS is ever changed to resolve this: both still get
+                # split and uploaded (so nothing is silently lost), but under a
+                # NEEDS_REVIEW file name instead of the normal TPS-only name, so a human
+                # can tell at a glance which files need a manual look before use.
+                if verdict == "DIFFERENT":
+                    review_reason = (
+                        f"TPS {tps} initially matched pages {prior['page_range']} in this "
+                        f"same source PDF, but a digit-by-digit visual re-check found they "
+                        f"are actually different numbers - one of the two readings is "
+                        f"wrong. Not treated as a duplicate; flagged for manual review "
+                        f"instead of guessing which reading to trust."
+                    )
+                else:
+                    reason_prefix = (
+                        f"TPS {tps} was already read from pages {prior['page_range']} in "
+                        f"this same source PDF"
+                    )
+                    review_reason = (
+                        f"{reason_prefix}, and the visual re-check could not confidently "
+                        f"confirm or rule out a duplicate - flagged for manual review."
+                        if verdict == "AMBIGUOUS" else
+                        f"{reason_prefix}, and this reading's own confidence was LOW - "
+                        f"flagged for manual review instead of trusting either reading "
+                        f"enough to call it a duplicate."
+                    )
+
+                # Page range is included so this doesn't collide with the earlier
+                # survey's own NEEDS_REVIEW file below - both surveys share the same
+                # (disputed) TPS number, so the bare TPS number alone isn't unique here.
+                review_name = (
+                    f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
+                    f"_pages_{page_range}_TPS_{tps}_NEEDS_REVIEW.pdf"
+                )
+                output_doc = pymupdf.open()
+                try:
+                    output_doc.insert_pdf(
+                        source_doc,
+                        from_page=start,
+                        to_page=start + pages_per_survey - 1,
+                    )
+                    outputs.append(
+                        {
+                            "source_name": source_name,
+                            "date_folder": date_folder,
+                            "output_name": review_name,
+                            "pdf_bytes": output_doc.tobytes(),
+                            "page_start": start + 1,
+                            "page_end": start + pages_per_survey,
+                            "reject_reason": review_reason,
+                        }
+                    )
+                finally:
+                    output_doc.close()
+
+                # The earlier survey's reading is now in question too - rename it to a
+                # NEEDS_REVIEW file (keeping its already-built pdf_bytes so it still
+                # gets uploaded) instead of silently leaving it looking trustworthy
+                # under its original TPS-only name.
+                prior_output = prior.get("output")
+                if prior_output is not None and prior_output.get("reject_reason") is None:
+                    prior_output["output_name"] = (
+                        f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
+                        f"_pages_{prior['page_range']}_TPS_{tps}_NEEDS_REVIEW.pdf"
+                    )
+                    prior_output["reject_reason"] = (
+                        f"TPS {tps} on this survey (pages {prior['page_range']}) was "
+                        f"called into question by a later collision with pages "
+                        f"{page_range} in the same source PDF; the visual re-check "
+                        f"could not confirm both readings are correct - flagged for "
+                        f"manual review alongside pages {page_range}."
+                    )
                 continue
             previous_tps = tps
 
             content_issue = assess_page_content_issue(source_doc[start])
             if content_issue:
-                seen_tps[tps] = page_range
-                outputs.append(
-                    {
-                        "source_name": source_name,
-                        "date_folder": date_folder,
-                        "output_name": None,
-                        "pdf_bytes": None,
-                        "page_start": start + 1,
-                        "page_end": start + pages_per_survey,
-                        "reject_reason": f"{content_issue} (TPS {tps})",
-                    }
-                )
+                entry = {
+                    "source_name": source_name,
+                    "date_folder": date_folder,
+                    "output_name": None,
+                    "pdf_bytes": None,
+                    "page_start": start + 1,
+                    "page_end": start + pages_per_survey,
+                    "reject_reason": f"{content_issue} (TPS {tps})",
+                }
+                outputs.append(entry)
+                seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
                 continue
 
-            seen_tps[tps] = page_range
             output_name = (
                 f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
                 f"_TPS_{tps}.pdf"
@@ -597,17 +777,17 @@ def split_combined_pdf(
                     from_page=start,
                     to_page=start + pages_per_survey - 1,
                 )
-                outputs.append(
-                    {
-                        "source_name": source_name,
-                        "date_folder": date_folder,
-                        "output_name": output_name,
-                        "pdf_bytes": output_doc.tobytes(),
-                        "page_start": start + 1,
-                        "page_end": start + pages_per_survey,
-                        "reject_reason": None,
-                    }
-                )
+                entry = {
+                    "source_name": source_name,
+                    "date_folder": date_folder,
+                    "output_name": output_name,
+                    "pdf_bytes": output_doc.tobytes(),
+                    "page_start": start + 1,
+                    "page_end": start + pages_per_survey,
+                    "reject_reason": None,
+                }
+                outputs.append(entry)
+                seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
             finally:
                 output_doc.close()
         return outputs
@@ -773,6 +953,14 @@ class ManifestRow:
     moved_date: Optional[datetime.date] = None  # DATE(moved_at); the BQ table's partitioning column
     reject_reason: Optional[str] = None  # why this survey was rejected (TPS/content unreadable, non-English), else None
     source_page_range: Optional[str] = None  # e.g. "1-2" - which pages/survey unit inside source_file this row is about, for a combined scan
+    needs_review: bool = False  # auto-derived in __post_init__ - True whenever reject_reason is set, whether or not the file was still uploaded (e.g. a NEEDS_REVIEW-named split)
+
+    def __post_init__(self):
+        # Derived rather than set at each call site, so every ManifestRow - present and
+        # future - stays consistent with reject_reason without relying on every
+        # constructor call to remember to set this itself.
+        if self.reject_reason is not None:
+            self.needs_review = True
 
 
 @dataclass
@@ -925,7 +1113,14 @@ def organize_combined_pdf(
     for output in outputs:
         page_range = f"{output['page_start']}-{output['page_end']}"
         reject_reason = output.get("reject_reason")
-        if reject_reason:
+        # A reject_reason with no output_name means split_combined_pdf() couldn't (or
+        # decided not to) produce a file at all - e.g. an unreadable page, a
+        # non-English survey, or a genuine confirmed duplicate. That's a true reject:
+        # nothing to upload. A reject_reason WITH an output_name (a NEEDS_REVIEW file
+        # name) means the opposite - the survey still gets split and uploaded, just
+        # under a name that flags it for a human, so it falls through to the same
+        # upload path as a normal success below instead of being skipped here.
+        if reject_reason and output.get("output_name") is None:
             err(
                 "[SPLIT] REJECTED survey (pages %s) in %s: %s",
                 page_range,
@@ -977,9 +1172,11 @@ def organize_combined_pdf(
         if destination_blob.exists():
             status("[SPLIT] Already present; skipping %s", destination_uri)
             continue
+        review_tag = " [NEEDS REVIEW]" if reject_reason else ""
         if dry_run:
             status(
-                "[SPLIT] [dry-run] %s pages %d-%d -> %s",
+                "[SPLIT] [dry-run]%s %s pages %d-%d -> %s",
+                review_tag,
                 source_uri,
                 output["page_start"],
                 output["page_end"],
@@ -989,7 +1186,7 @@ def organize_combined_pdf(
             destination_blob.upload_from_string(
                 output["pdf_bytes"], content_type="application/pdf"
             )
-            status("[SPLIT] Uploaded %s -> %s", source_uri, destination_uri)
+            status("[SPLIT] Uploaded%s %s -> %s", review_tag, source_uri, destination_uri)
         result.moved_rows.append(
             ManifestRow(
                 source_file=output_name,
@@ -999,7 +1196,7 @@ def organize_combined_pdf(
                 destination_gcs_uri=destination_uri,
                 moved_at=moved_at,
                 moved_date=moved_at.date(),
-                reject_reason=None,
+                reject_reason=reject_reason,
                 source_page_range=page_range,
             )
         )
@@ -1023,6 +1220,7 @@ BQ_MANIFEST_SCHEMA = [
     ("moved_date", "DATE", "DATE(moved_at); the table's partitioning column."),
     ("reject_reason", "STRING", "Why this survey was rejected (unreadable TPS/content, or non-English PDF); NULL if not rejected."),
     ("source_page_range", "STRING", "e.g. '1-2' - which pages/survey unit inside source_file this row is about, for a combined scan; NULL for a standalone source file."),
+    ("needs_review", "BOOLEAN", "True whenever reject_reason is set - whether the survey was fully rejected (destination_gcs_uri NULL) or still uploaded under a NEEDS_REVIEW file name."),
 ]
 
 
@@ -1269,6 +1467,8 @@ def run(
     spark_staging_bucket: Optional[str] = None,
     max_surveys: Optional[int] = None,
     failure_log: str = DEFAULT_FAILURE_LOG,
+    loose_only: bool = False,
+    only_file: Optional[str] = None,
 ) -> None:
     for key in RUN_TOKEN_TOTALS:
         RUN_TOKEN_TOTALS[key] = 0
@@ -1277,6 +1477,24 @@ def run(
     # One listing serves both the year inference and the organize step —
     # see list_root_contents() for why this used to be two separate calls.
     pdf_blobs, folder_names = list_root_contents(bucket, root_prefix)
+    if loose_only:
+        normalized_root = _normalize_prefix(root_prefix)
+        before = len(pdf_blobs)
+        pdf_blobs = [b for b in pdf_blobs if "/" not in b.name[len(normalized_root):]]
+        status(
+            "[GCS] --loose-only: skipping %d PDF(s) already inside a date subfolder; %d loose file(s) remain.",
+            before - len(pdf_blobs), len(pdf_blobs),
+        )
+    if only_file:
+        before = len(pdf_blobs)
+        pdf_blobs = [b for b in pdf_blobs if b.name.rsplit("/", 1)[-1] == only_file]
+        status(
+            "[GCS] --only-file %s: %d/%d listed PDF(s) matched.",
+            only_file, len(pdf_blobs), before,
+        )
+        if not pdf_blobs:
+            err("[GCS] --only-file %s: no matching PDF found under gs://%s/%s - nothing to do.", only_file, bucket_name, root_prefix)
+            return
     resolved_year = year if year is not None else infer_survey_year(folder_names, bucket_name, root_prefix)
 
     result = OrganizeResult(moved_rows=[], skipped_files=[])
@@ -1451,6 +1669,20 @@ def main():
         help=f"CSV file to append failed source PDFs to (default: {DEFAULT_FAILURE_LOG}).",
     )
     ap.add_argument(
+        "--loose-only",
+        action="store_true",
+        help="Only process PDFs sitting directly under --root-prefix; skip any PDF that's "
+        "already inside a date subfolder (e.g. useful when --root-prefix is a parent "
+        "directory containing both loose files and already-organized date folders).",
+    )
+    ap.add_argument(
+        "--only-file",
+        default=None,
+        help="Only process the PDF with this exact file name (e.g. 'Nov10_1.pdf') found "
+        "under --root-prefix; every other PDF listed is skipped. Useful for testing a "
+        "single source file without touching the rest of a folder.",
+    )
+    ap.add_argument(
         "--self-test",
         action="store_true",
         help="Run the offline self-test (mocked GCS bucket, local SparkSession) and exit.",
@@ -1476,6 +1708,8 @@ def main():
         spark_staging_bucket=args.spark_staging_bucket,
         max_surveys=args.max_surveys,
         failure_log=args.failure_log,
+        loose_only=args.loose_only,
+        only_file=args.only_file,
     )
 
 
