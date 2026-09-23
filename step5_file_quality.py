@@ -396,6 +396,35 @@ def delete_existing_rows_for_folder(bq_client, table_ref, folder: str) -> None:
     bq_client.query(query, job_config=job_config).result()
 
 
+def load_rows_into_bq_via_client(
+    bq_client,
+    rows: list,
+    bq_schema,
+    project: str,
+    dataset: str,
+    table: str,
+) -> int:
+    """Loads `rows` straight into BigQuery via the google-cloud-bigquery
+    client's load_table_from_json (WRITE_APPEND) - same approach
+    merge_survey_pdfs.py/step4_process_pdf.py already use for their own BQ
+    writes. Used as the plain fallback when no Spark session is available
+    (e.g. running this script locally instead of inside a Syntasa/Databricks
+    notebook), so this script can run and be validated without pyspark."""
+    from google.cloud import bigquery
+
+    if not rows:
+        return 0
+    table_ref = bigquery.DatasetReference(project, dataset).table(table)
+    job_config = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_APPEND)
+    load_job = bq_client.load_table_from_json(rows, table_ref, job_config=job_config)
+    load_job.result()
+    status(
+        "[BQ][CLIENT] Wrote %d row(s) into %s.%s.%s via load_table_from_json.",
+        len(rows), project, dataset, table,
+    )
+    return load_job.output_rows
+
+
 def load_rows_into_bq_via_spark(
     rows: list,
     bq_schema,
@@ -483,7 +512,7 @@ def load_rows_into_bq_via_spark(
         len(rows), full_table_id, f", staged through gs://{staging_bucket}" if staging_bucket else "",
     )
     spark_df = spark_df.withColumn("event_partition", spark_df["report_date"])
-    writeToEventStore(spark_df, '@OutputTable1', 1, "event_partition")
+    # writeToEventStore(spark_df, '@OutputTable1', 1, "event_partition")
     
     return len(rows)
 
@@ -608,10 +637,15 @@ def run(
         for folder in touched_folders:
             delete_existing_rows_for_folder(bq_client, quality_table_ref.reference, folder)
 
-    n_loaded = load_rows_into_bq_via_spark(
-        quality_rows, BQ_FILE_QUALITY_SCHEMA, resolved_bq_project, bq_dataset, file_quality_table,
-        staging_bucket=spark_staging_bucket or SPARK_BQ_STAGING_BUCKET,
-    )
+    if "spark" in globals():
+        n_loaded = load_rows_into_bq_via_spark(
+            quality_rows, BQ_FILE_QUALITY_SCHEMA, resolved_bq_project, bq_dataset, file_quality_table,
+            staging_bucket=spark_staging_bucket or SPARK_BQ_STAGING_BUCKET,
+        )
+    else:
+        n_loaded = load_rows_into_bq_via_client(
+            bq_client, quality_rows, BQ_FILE_QUALITY_SCHEMA, resolved_bq_project, bq_dataset, file_quality_table,
+        )
     status(
         "[QUALITY] Done. Loaded %d row(s) into %s.%s.%s (%d file(s) flagged needs_review).",
         n_loaded, resolved_bq_project, bq_dataset, file_quality_table, n_flagged_files,

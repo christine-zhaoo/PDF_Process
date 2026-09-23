@@ -356,67 +356,6 @@ Setup
    (VISION_DOUBLE_CHECK_ENABLED below) — the script degrades gracefully
    (skips the double-check, logs it once) if this isn't enabled.
 
---------------------------------------------------------------------------
-Usage
---------------------------------------------------------------------------
-Just run it (uses the CONFIG defaults below — edit them to point at your
-bucket/project, or override any of them with the matching --flag).
-
-As of Revision 39, this file does EXTRACT ONLY (read Q&A via Gemini and
-load into BigQuery). The MERGE phase (combine each date folder's PDFs into
-one PDF + generate a page-level manifest.csv) has been split out into its
-own standalone script: merge_pdfs_to_folder.py. Run that file separately
-if you need to merge PDFs; it has no import dependency on this file.
-
-    python merge_survey_pdfs.py                          # extract, writes to BigQuery
-    python merge_survey_pdfs.py --dry-run                 # list what would be sent to Gemini, no calls/writes made
-    python merge_survey_pdfs.py --folders "Nov 18 2025" "Nov 23 2025"
-    python merge_survey_pdfs.py --bq-dataset my_ds --bq-table my_table
-    python merge_survey_pdfs.py --verify-file "Nov 10 2025/Nov10_1.pdf"  # audit one file's readings, no BQ write
-    python merge_survey_pdfs.py --no-vision-check           # skip the Cloud Vision double-check for this run
-    python merge_pdfs_to_folder.py                          # (separate file) merge PDFs per folder + load manifest into BigQuery
-
---------------------------------------------------------------------------
-Running from a Jupyter / notebook cell
---------------------------------------------------------------------------
-Do NOT do `python merge_survey_pdfs.py --dry-run` via `%run` and expect
-flags to work the way they do in a terminal — inside a notebook kernel,
-sys.argv holds the *kernel's* own launch arguments (e.g. "-f
-/path/kernel.json"), not flags you typed, and argparse will error out on
-them (SystemExit: 2) if it doesn't recognize them. This script tolerates
-that (unknown args are ignored), but the more reliable pattern in a
-notebook is to skip the command line entirely and call the functions
-straight from a cell:
-
-    from merge_survey_pdfs import (
-        extract_to_bigquery, BUCKET_NAME, ROOT_PREFIX,
-        VERTEX_PROJECT_ID, VERTEX_LOCATION, GEMINI_MODEL,
-        BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE,
-    )
-    extract_to_bigquery(
-        bucket_name=BUCKET_NAME,
-        root_prefix=ROOT_PREFIX,
-        folders=None,               # None = all folders found; or e.g. ["Nov 10 2025"]
-        vertex_project=VERTEX_PROJECT_ID,
-        vertex_location=VERTEX_LOCATION,
-        gemini_model=GEMINI_MODEL,
-        bq_project=BQ_PROJECT_ID,
-        bq_dataset=BQ_DATASET,
-        bq_table=BQ_TABLE,
-        dry_run=True,                # start with True to preview, then set False
-    )
-
-    # To merge PDFs instead (secondary/optional step):
-    from merge_survey_pdfs import run
-    run(
-        bucket_name=BUCKET_NAME,
-        root_prefix=ROOT_PREFIX,
-        output_prefix=None,   # defaults to "<root_prefix>_merged/"
-        folders=None,
-        local_out=None,
-        upload=True,
-        dry_run=True,
-    )
 """
 import argparse
 import csv
@@ -428,6 +367,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
@@ -436,19 +376,17 @@ from typing import Optional, Tuple
 # CONFIG — edit these to point at your bucket/project, or override on the
 # command line (e.g. --bucket other-bucket). These are just the defaults.
 # ==========================================================================
-BUCKET_NAME = "tps_survey"
-ROOT_PREFIX = "TPS_Scanned_2025/"
+BUCKET_NAME = "syntasa-saas"
+ROOT_PREFIX = "syn-workspace/users/christine.zhao@syntasa.com/notebooks/test_pdf/"
 OUTPUT_PREFIX = None  # None -> derived as "<ROOT_PREFIX>_merged/"
 # The Spark BigQuery connector's default write path (used by
-# load_rows_into_bq_via_spark(), Revision 40) stages data through a GCS
-# bucket before loading it into BigQuery - reuses BUCKET_NAME so a separate
-# bucket doesn't need to be created just for this.
+# load_rows_into_bq_via_spark(), Revision 40) stages data through a GCS bucket before loading it into BigQuery - reuses BUCKET_NAME so a separate bucket doesn't need to be created just for this.
 SPARK_BQ_STAGING_BUCKET = BUCKET_NAME
 
 # --- extraction (Vertex AI Gemini) ---
-VERTEX_PROJECT_ID = "gcp-sapchoda-dev"
-VERTEX_LOCATION = "global"
-GEMINI_MODEL = "gemini-3.1-flash-lite"  # confirm this model ID is enabled in the Vertex AI Model Garden
+VERTEX_PROJECT_ID = None  # None -> uses your application-default GCP project
+VERTEX_LOCATION = "us-central1"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 # --- extraction quality gates: model self-reported confidence + Cloud
 # Vision double-check for handwritten fields (added at user request to
@@ -458,14 +396,18 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"  # confirm this model ID is enabled in th
 # flag, since they have no fixed choice list to check mark_position
 # against). See the "Model confidence + Cloud Vision double-check" module
 # docstring section above for the full design and reasoning. ---
-MODEL_CONFIDENCE_THRESHOLD = 0.8  # model's own self-reported confidence (build_extraction_prompt() rule 15) below this -> needs_review=True. Only gates a question where no pixel-verified reading already took over (see answers_to_qa_rows()) - a confident pixel detector's own margin check already independently vouches for those.
+MODEL_CONFIDENCE_THRESHOLD = 0.8
+MAX_FILE_RETRIES = 3  # per-file extraction attempts before giving up and recording it as failed
+RETRY_BACKOFF_SECONDS = 10  # base delay between retries; doubles each attempt (10s, 20s, 40s, ...) - long enough to ride out a 429 Resource Exhausted from Vertex AI
+# model's own self-reported confidence (build_extraction_prompt() rule 15) below this -> needs_review=True. Only gates a question where no pixel-verified reading already took over (see answers_to_qa_rows()) - a confident pixel detector's own margin check already independently vouches for those.
 VISION_DOUBLE_CHECK_ENABLED = True  # set False (or pass --no-vision-check) to skip Cloud Vision calls entirely, e.g. no Vision API enabled/quota - written-text questions then fall back to model-only + confidence-threshold checking alone, same as before this feature existed.
-VISION_FREEFORM_COVERAGE_THRESHOLD = 0.9  # cross_check_written_field_with_vision()'s freeform fields (H4/H5/H6/24): word-level matching coverage (see that function - Revision 19's word-level, sum-of-all-matching-runs fix) below this -> vision_match=False, needs_review=True. Raised from 0.7 to 0.9 (explicit user request) now that the coverage score is computed correctly and can be trusted at a tighter cutoff - was 0.7 while the score itself was still unreliable (see Revision 19's project doc for the four bugs fixed there).
+VISION_FREEFORM_COVERAGE_THRESHOLD = 0.9  
+# cross_check_written_field_with_vision()'s freeform fields (H4/H5/H6/24): word-level matching coverage (see that function - Revision 19's word-level, sum-of-all-matching-runs fix) below this -> vision_match=False, needs_review=True. Raised from 0.7 to 0.9 (explicit user request) now that the coverage score is computed correctly and can be trusted at a tighter cutoff - was 0.7 while the score itself was still unreliable (see Revision 19's project doc for the four bugs fixed there).
 VISION_PROJECT_ID = None  # None -> uses application-default GCP project, same convention as VERTEX_PROJECT_ID
 
 # --- extraction output (BigQuery) ---
-BQ_PROJECT_ID = "gcp-sapchoda-dev"
-BQ_DATASET = "ladph_tps"
+BQ_PROJECT_ID = None  # None -> uses your application-default GCP project
+BQ_DATASET = "@database"
 BQ_TABLE = "survey_responses"
 BQ_CORRECTIONS_TABLE = "corrections_log"  # see log_corrections() below
 
@@ -647,8 +589,7 @@ def query_pipeline_config(
     table_name: str = PIPELINE_CONFIG_TABLE,
 ) -> dict:
     """Loads calibration/tuning overrides from the pipeline_config BigQuery
-    table (Revision 38 - see the "revision-38-externalized-pipeline-config.md"
-    project doc). One row per parameter: param_name (matching a name in
+    table. One row per parameter: param_name (matching a name in
     _PIPELINE_CONFIG_DEFAULTS below - e.g. "_GRID_BLANK_INK_FLOOR",
     "_YESNO_BOX_CALIBRATION") and param_value (that parameter's value,
     JSON-encoded as TEXT).
@@ -746,7 +687,15 @@ def apply_pipeline_config(overrides: dict) -> list:
             continue
         default = _PIPELINE_CONFIG_DEFAULTS[name]
         if name == "_YESNO_BOX_CALIBRATION":
-            value = _restore_yesno_box_calibration_shape(value, default)
+            value = _restore_yesno_box_calibration_shape(value, default, param_name=name)
+        elif name == "_MULTISELECT_BOX_CALIBRATION":
+            # Same (page_idx, boxes) shape and same real, confirmed
+            # corruption risk as _YESNO_BOX_CALIBRATION (missing pixel
+            # coordinates) - reuses that same restore-and-validate helper,
+            # just without the "or a list of candidates" branch, since no
+            # multiselect question here has ever had more than one observed
+            # printed layout.
+            value = _restore_yesno_box_calibration_shape(value, default, param_name=name)
         elif isinstance(default, tuple):
             value = tuple(value)
         elif isinstance(default, set):
@@ -756,7 +705,42 @@ def apply_pipeline_config(overrides: dict) -> list:
     return sorted(applied)
 
 
-def _restore_yesno_box_calibration_shape(loaded: dict, default: dict) -> dict:
+def _is_valid_yesno_candidate(candidate) -> bool:
+    """Validates one (page_idx, boxes) candidate has the shape
+    detect_yesno_box_answers() actually needs: boxes must be a dict mapping
+    each choice label to a real (x0, x1, y0, y1) 4-tuple of numbers - NOT,
+    e.g., {"page": 0, "labels": [...]} with the pixel coordinates missing
+    entirely. Confirmed directly against a real, corrupted pipeline_config
+    row for _YESNO_BOX_CALIBRATION["19"]: seeded as {"page": 0, "labels":
+    [...]} with no coordinates at all. Without this check,
+    _restore_yesno_box_calibration_shape() silently turned that dict into
+    tuple({"page": 0, "labels": [...]}) == ("page", "labels") - a tuple of
+    its own KEY NAMES, not (page_idx, boxes) - which then crashed every
+    pixel comparison downstream with "'>=' not supported between instances
+    of 'str' and 'int'" only once this override was actually exercised in a
+    real extraction run (not caught by --verify-file runs against files
+    whose pdf_quality route didn't force this code path, and not caught by
+    the pipeline_config load itself succeeding structurally)."""
+    if (
+        not isinstance(candidate, (tuple, list))
+        or len(candidate) != 2
+        or not isinstance(candidate[1], dict)
+    ):
+        return False
+    boxes = candidate[1]
+    if not boxes:
+        return False
+    for coords in boxes.values():
+        if (
+            not isinstance(coords, (tuple, list))
+            or len(coords) != 4
+            or not all(isinstance(v, (int, float)) for v in coords)
+        ):
+            return False
+    return True
+
+
+def _restore_yesno_box_calibration_shape(loaded: dict, default: dict, param_name: str = "_YESNO_BOX_CALIBRATION") -> dict:
     """See apply_pipeline_config()'s _YESNO_BOX_CALIBRATION special-case
     comment for why this exists. Per question number, restores either a
     single (mode, boxes) tuple, or a list of such tuples (for a
@@ -767,14 +751,50 @@ def _restore_yesno_box_calibration_shape(loaded: dict, default: dict) -> dict:
     (a brand new question added directly in BigQuery, never seen in this
     code version) is defensively treated as single-candidate, matching the
     overwhelming majority shape and this file's own documented convention
-    for a newly-calibrated question."""
+    for a newly-calibrated question.
+
+    Each restored candidate is validated with _is_valid_yesno_candidate()
+    before being trusted - a malformed override (missing pixel coordinates
+    entirely, a real confirmed case in production data) falls back to this
+    SAME question's own built-in default from `default`, exactly like a
+    JSON-decode failure elsewhere in this file keeps the built-in default
+    for just that one row rather than crashing or silently corrupting every
+    question's calibration."""
     restored = {}
     for qnum, loaded_value in loaded.items():
         default_value = default.get(qnum)
-        if isinstance(default_value, list):
-            restored[qnum] = [tuple(candidate) for candidate in loaded_value]
-        else:
-            restored[qnum] = tuple(loaded_value)
+        try:
+            if isinstance(default_value, list):
+                candidates = [tuple(candidate) for candidate in loaded_value]
+            else:
+                candidates = tuple(loaded_value)
+        except (TypeError, ValueError):
+            candidates = None
+        is_list_shape = isinstance(default_value, list)
+        valid = (
+            candidates is not None
+            and (
+                all(_is_valid_yesno_candidate(c) for c in candidates) if is_list_shape
+                else _is_valid_yesno_candidate(candidates)
+            )
+        )
+        if valid:
+            restored[qnum] = candidates
+        elif default_value is not None:
+            err(
+                "[CONFIG] pipeline_config's %s override for question %r is malformed "
+                "(missing real pixel coordinates) - keeping this file's own built-in default for this "
+                "question instead of using it.",
+                param_name, qnum,
+            )
+            restored[qnum] = default_value
+        # else: neither a valid override nor a known default for this qnum - drop it silently,
+        # same as this file's own built-in calibration simply not covering a question.
+    # Any question present in `default` but missing from the override entirely keeps its own
+    # built-in default too - an override table is a partial patch, not a full replacement.
+    for qnum, default_value in default.items():
+        if qnum not in restored:
+            restored[qnum] = default_value
     return restored
 
 
@@ -1588,7 +1608,13 @@ def build_extraction_prompt() -> str:
         "answer is \"\", even if an earlier or later question on the form was "
         "answered.",
         "7. For open-text or write-in questions (e.g. Age, Today's Date, "
-        "Comment), transcribe the handwritten/typed text as written.",
+        "Comment), transcribe the handwritten/typed text as written. Do NOT "
+        "transcribe the form's own PRINTED label/instructional text as if it "
+        "were the respondent's answer - for example, the printed word "
+        "\"Address\" or \"Agency\" labeling a blank field is not itself an "
+        "answer. If a write-in field's box/line has no actual handwritten or "
+        "typed content in it, report \"\" for that field, even if a printed "
+        "label sits directly next to or above the empty box.",
         "8. When the marked choice for a checkbox question is an \"(specify)\" "
         "option (e.g. \"Other (specify)\"), look for handwritten or typed text "
         "next to or below that choice and APPEND it to the answer in the format "
@@ -1651,7 +1677,15 @@ def build_extraction_prompt() -> str:
         f"question ({multi_select_list}), every marked position, comma-separated "
         'in the same order as your "answer" choices (e.g. "1,5"). Use "" for '
         "open-text/write-in questions (no choices list) or when nothing is "
-        "marked.",
+        "marked. Count positions using ONLY the choices listed for that "
+        "question in the (choices: ...) list below, in that exact order - "
+        "position 1 is the first listed choice, position 2 the second, and "
+        "so on, with no gaps. An \"(specify)\" choice's own blank "
+        "handwritten-text box/line sitting next to or below it (rule 8) is "
+        "NOT a separate choice and never gets its own position number - do "
+        "not count it as an extra row when numbering the choices that come "
+        "after it, even though it visually looks like its own line on the "
+        "page.",
         "13. \"answer\" and \"mark_position\" must describe the SAME choice - "
         "double-check them against each other, and against \"reasoning\", before "
         "responding.",
@@ -1691,7 +1725,21 @@ def build_extraction_prompt() -> str:
     ]
     for number, group_key, sub_text, choices in SURVEY_QUESTIONS:
         full_text = build_full_question_text(number, group_key, sub_text)
-        lines.append(f"{full_text} (choices: {choices})")
+        choice_list = CHOICE_LISTS_BY_NUMBER.get(number)
+        if choice_list is not None:
+            # Numbered explicitly (e.g. "1=Physically Disabled, 2=...") so the
+            # model can report the mark_position that goes with a choice's
+            # TEXT directly from this list, rather than re-deriving a
+            # position by counting rows/boxes on the page itself - a real,
+            # confirmed failure mode (Q34 on 2025_Nov_23_5_TPS_3995.pdf: the
+            # model correctly read the choice text "None" but reported
+            # mark_position "8" for a 7-choice question, having apparently
+            # counted the "Other (specify)" choice's own blank handwritten-
+            # text box as an extra visual row when tallying positions by eye).
+            numbered = ", ".join(f"{i}={c}" for i, c in enumerate(choice_list, start=1))
+            lines.append(f"{full_text} (choices: {numbered})")
+        else:
+            lines.append(f"{full_text} (choices: {choices})")
     return "\n".join(lines)
 
 
@@ -2802,7 +2850,23 @@ _YESNO_ROW_MODE = {
 }
 _YESNO_BOX_INK_BORDER_OVERRIDE = {"19": 6, "23": 6}
 
-_LEGACY_YESNO_BOX_GEOMETRY = {
+# Real user-reported misreads on 2025_Nov_23_5_TPS_3995.pdf: Q19 ("Very
+# little" read as "None"), Q23 ("I am Neutral" read as "Strongly Agree"),
+# Q25 ("4 weeks or more" read as "First visit/day"), and Q31
+# ("Heterosexual/Straight" read as "Gay (Male)") all shipped a wrong,
+# unreviewed pixel-corrected answer - each of these four calibration entries
+# is explicitly documented above as single-file-measured/partly-extrapolated
+# and not yet re-validated against a second file. Unlike the general
+# pixel-vs-model disagreement policy in answers_to_qa_rows() (deliberately
+# NOT a review trigger on its own, for calibration entries that HAVE proven
+# reliable across files - see that function's comment), these four don't
+# yet have that track record, so a disagreement here should still surface
+# for a human to check rather than silently trusting the pixel reading.
+# Remove a question from this set once its calibration has been confirmed
+# correct against additional real files.
+_YESNO_UNVALIDATED_CALIBRATION = {"19", "23", "25", "31"}
+
+_YESNO_BOX_CALIBRATION = {
     # Q19/Q20 - REPLACED. The previous entries here shared the exact same
     # (1357, 1389) x-range and stepped y in exact 50px increments as the old
     # fabricated Q23 entry below (see Q23's own comment) - the identical
@@ -3036,7 +3100,7 @@ _LEGACY_YESNO_BOX_GEOMETRY = {
     }),
 }
 
-_LEGACY_MULTISELECT_BOX_GEOMETRY = {
+_MULTISELECT_BOX_CALIBRATION = {
     "33": (1, {
         "American Indian/Alaskan Native": (1357, 1392, 1618, 1652),
         "Asian": (1357, 1392, 1671, 1705),
@@ -3056,31 +3120,6 @@ _LEGACY_MULTISELECT_BOX_GEOMETRY = {
         "None": (1360, 1389, 2444, 2473),
     }),
 }
-
-# Public calibration metadata intentionally contains no scan-specific pixel
-# rectangles. The resolver below discovers those rectangles from each PDF and
-# retains the legacy geometry only as a safe, local fallback.
-_YESNO_BOX_CALIBRATION = {
-    "19": {"page": 0, "labels": ["None", "Very little", "About half", "Almost all", "All"]},
-    "20": {"page": 0, "labels": ["Much better", "Somewhat better", "About the same", "Somewhat worse", "N/A"]},
-    "21": {"page": 0, "labels": ["Yes", "No"]},
-    "22": {"page": 0, "labels": ["Yes", "No"]},
-    "23": {"page": 0, "labels": ["Strongly Agree", "Agree", "I am Neutral", "Disagree", "Strongly Disagree", "N/A"]},
-    "25": {"page": 1, "labels": ["First visit/day", "2 weeks or less", "More than 2 weeks but less than 4 weeks", "4 weeks or more"]},
-    "27": {"page": 1, "labels": ["Yes", "No"], "layouts": 2},
-    "28": {"page": 1, "labels": ["Yes, I am currently receiving Contingency Management services", "Yes, I received Contingency Management services in the past", "No, I have never received Contingency Management services"]},
-    "29": {"page": 1, "labels": ["Male", "Female", "Female-to-Male (FTM)/Transgender Male/Trans Man", "Male-to-Female (MTF)/Transgender Female/Trans Woman", "Gender Queer/Gender Non-Conforming", "Other (specify)", "Prefer not to state"]},
-    "30": {"page": 1, "labels": ["Female", "Male", "Other (specify)", "Prefer not to state"]},
-    "31": {"page": 1, "labels": ["Heterosexual/Straight", "Lesbian (Female)", "Gay (Male)", "Bisexual", "Unsure/Questioning/Don't know", "Pansexual", "Asexual", "Queer", "Other (specify)", "Prefer not to state"]},
-    "32": {"page": 1, "labels": ["Yes", "No", "Unknown"]},
-    "35": {"page": 1, "labels": ["Post-release Community Supervision (AB109) or on Probation from any federal, state, or local jurisdiction", "Awaiting trial, charges or sentencing", "On parole from any other jurisdiction", "Any other criminal justice involvement", "No criminal justice involvement"]},
-}
-_MULTISELECT_BOX_CALIBRATION = {
-    "33": {"page": 1, "labels": ["American Indian/Alaskan Native", "Asian", "Black/African American", "Native Hawaiian/Pacific Islander", "White/Caucasian", "Other (specify)", "Prefer not to state"]},
-    "34": {"page": 1, "labels": ["Physically Disabled", "Visually Impaired/Blind", "Hearing Impaired/Deaf", "Co-occurring Mental Health Condition", "Developmentally or Intellectually Disabled", "Other (specify)", "None"]},
-}
-_YESNO_BOX_SEMANTICS = _YESNO_BOX_CALIBRATION
-_MULTISELECT_BOX_SEMANTICS = _MULTISELECT_BOX_CALIBRATION
 _MULTISELECT_BOX_PAD_OVERRIDE = {"33": 20, "34": 20}
 _MULTISELECT_INK_BORDER_OVERRIDE = {"33": 6, "34": 6}
 _MULTISELECT_UNMARKED_CEILING = 0.10
@@ -4107,77 +4146,6 @@ def _checkbox_ink_ratio(binary_img, box, border: int = 2) -> float:
     return float(inner.mean()) / 255.0
 
 
-def _resolve_runtime_box_geometry(page_images: list, dpi: int = _RENDER_DPI):
-    """Resolve semantic controls to rectangles observed in the supplied PDF.
-
-    Registration/layout metadata is used only to bound a local search. The
-    returned rectangles come from OpenCV contours in the current scan. If a
-    dependency or scan is unusable, the private legacy geometry is retained as
-    a conservative compatibility fallback.
-    """
-    import cv2
-    import numpy as np
-
-    def find_box(img, expected):
-        x0, x1, y0, y1 = expected
-        pad = max(int(90 * dpi / 300), 20)
-        binary = cv2.threshold(img, _INK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)[1]
-        h, w = binary.shape
-        crop = binary[max(0, y0 - pad):min(h, y1 + pad),
-                      max(0, x0 - pad):min(w, x1 + pad)]
-        contours, _ = cv2.findContours(crop, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        best = None
-        best_distance = None
-        ex, ey = (x0 + x1) / 2, (y0 + y1) / 2
-        for contour in contours:
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            if not (20 <= bw <= 60 and 20 <= bh <= 60 and 0.55 <= bw / max(bh, 1) <= 1.8):
-                continue
-            ax, ay = bx + max(0, x0 - pad), by + max(0, y0 - pad)
-            distance = abs(ax + bw / 2 - ex) + abs(ay + bh / 2 - ey)
-            if distance <= pad * 2 and (best_distance is None or distance < best_distance):
-                best_distance, best = distance, (ax, ax + bw, ay, ay + bh)
-        return best
-
-    def resolve(semantic_map, legacy_map):
-        resolved = {}
-        for qnum, semantic in semantic_map.items():
-            legacy = legacy_map.get(qnum)
-            if legacy is None:
-                continue
-            candidates = legacy if isinstance(legacy, list) else [legacy]
-            out_candidates = []
-            for page_idx, boxes in candidates:
-                if page_idx >= len(page_images):
-                    continue
-                arr = np.frombuffer(page_images[page_idx], dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-                if img is None:
-                    continue
-                found = {}
-                for label in semantic["labels"]:
-                    expected = boxes.get(label)
-                    if expected is not None:
-                        found[label] = find_box(img, expected) or expected
-                if len(found) == len(semantic["labels"]):
-                    out_candidates.append((page_idx, found))
-            if out_candidates:
-                resolved[qnum] = out_candidates if isinstance(legacy, list) else out_candidates[0]
-            else:
-                resolved[qnum] = legacy
-        return resolved
-
-    global _YESNO_BOX_CALIBRATION, _MULTISELECT_BOX_CALIBRATION
-    _YESNO_BOX_CALIBRATION = resolve(_YESNO_BOX_SEMANTICS, _LEGACY_YESNO_BOX_GEOMETRY)
-    _MULTISELECT_BOX_CALIBRATION = resolve(_MULTISELECT_BOX_SEMANTICS, _LEGACY_MULTISELECT_BOX_GEOMETRY)
-    return _YESNO_BOX_CALIBRATION, _MULTISELECT_BOX_CALIBRATION
-
-
-def resolve_box_calibration(page_images: list, dpi: int = _RENDER_DPI):
-    """Compatibility adaptor for consumers that need resolved pixel maps."""
-    return _resolve_runtime_box_geometry(page_images, dpi=dpi)
-
-
 def detect_yesno_box_answers(page_images: list, dpi: int = _RENDER_DPI, include_diagnostics: bool = False):
     """Deterministic, non-LLM reading of questions 21, 22, 27, and 32 (simple
     isolated Yes/No or Yes/No/Unknown rows), 23 (a standalone 6-point-scale
@@ -4611,12 +4579,12 @@ def render_pdf_to_images(pdf_bytes: bytes, dpi: int = _RENDER_DPI) -> list:
     """Renders every page of a PDF (given as raw bytes) to a high-resolution
     PNG image using PyMuPDF, returning a list of PNG byte strings (one per
     page)."""
-    import pymupdf
+    import fitz  # PyMuPDF
 
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         zoom = dpi / 72.0
-        matrix = pymupdf.Matrix(zoom, zoom)
+        matrix = fitz.Matrix(zoom, zoom)
         return [page.get_pixmap(matrix=matrix).tobytes("png") for page in doc]
     finally:
         doc.close()
@@ -5129,9 +5097,11 @@ def _extract_anchored_field_value(question_number: str, vision_result: dict) -> 
         y_band = (agency_box[1] - 20, agency_box[3] + 20)
 
     anchor_box = None
+    matched_phrase = None
     for phrase in phrase_alternatives:
         anchor_box = _find_anchor_phrase(ordered, phrase, y_band=y_band)
         if anchor_box is not None:
+            matched_phrase = phrase
             break
     if anchor_box is None:
         return None
@@ -5152,7 +5122,20 @@ def _extract_anchored_field_value(question_number: str, vision_result: dict) -> 
     if row_tolerance_override is not None:
         window_kwargs["row_tolerance"] = row_tolerance_override
     value_words = _words_in_window(ordered, anchor_box, direction, max_reach, **window_kwargs)
-    return " ".join(w["text"] for w in value_words)
+    joined = " ".join(w["text"] for w in value_words)
+
+    # Guard against the value window re-capturing the anchor's OWN printed
+    # label text as if it were the answer (e.g. a duplicate/overlapping OCR
+    # detection of the same word, or the window's start edge landing back
+    # inside the label itself) - a field's value can never legitimately BE
+    # its own label phrase, so treat this the same as "nothing in the
+    # window" (a positive, blank reading) rather than trusting it.
+    normalized_joined = _normalize_for_match(joined).strip(":,.")
+    normalized_anchor_phrase = " ".join(matched_phrase) if matched_phrase else ""
+    if matched_phrase is not None and normalized_joined == normalized_anchor_phrase:
+        return ""
+
+    return joined
 
 
 def cross_check_written_field_with_vision(question_number: str, model_answer: str, vision_result: dict):
@@ -5637,12 +5620,6 @@ def extract_qa_from_pdf(
         _VERTEX_INITIALIZED = True
 
     page_images = render_pdf_to_images(pdf_bytes)
-    # Resolve semantic controls against this scan before any pixel detector
-    # runs. A failed local CV search leaves the legacy geometry in place.
-    try:
-        _resolve_runtime_box_geometry(page_images)
-    except Exception as e:  # noqa: BLE001 - pixel detection is best effort
-        err("[GRID] Runtime box geometry resolution skipped: %s", e)
     image_parts = [Part.from_data(data=img, mime_type="image/png") for img in page_images]
 
     model = GenerativeModel(model_name)
@@ -5650,15 +5627,6 @@ def extract_qa_from_pdf(
         [get_extraction_prompt(), *image_parts],
         generation_config=GenerationConfig(temperature=0, response_mime_type="application/json"),
     )
-    usage = getattr(response, "usage_metadata", None)
-    if usage is not None:
-        status(
-            "[GEMINI] model=%s prompt_tokens=%s output_tokens=%s total_tokens=%s",
-            model_name,
-            getattr(usage, "prompt_token_count", None),
-            getattr(usage, "candidates_token_count", None),
-            getattr(usage, "total_token_count", None),
-        )
     raw_text = response.text
     parsed = json.loads(raw_text)  # let a malformed response raise -> caller decides how to handle
 
@@ -6015,7 +5983,6 @@ def answers_to_qa_rows(
         vision_cross_check = ""
 
         choices = CHOICE_LISTS_BY_NUMBER.get(number)
-        gemini_authoritative = number in {"34", "35"}
         margin_threshold, method_label, source_name = pixel_source_info.get(
             pixel_source, pixel_source_info["grid"]
         )
@@ -6038,8 +6005,6 @@ def answers_to_qa_rows(
         yesno_promoted = pixel_source == "yesno_box" and pixel_yesno_ambiguous and pixel_position is not None
 
         if (
-            not gemini_authoritative
-            and
             choices is not None
             and pixel_position is not None
             and pixel_margin is not None
@@ -6051,7 +6016,14 @@ def answers_to_qa_rows(
             answer = pixel_label
             mark_position = str(pixel_position)
             if model_answer.strip().lower() != pixel_label.strip().lower():
-                # Intentionally NOT setting needs_review here. This is a
+                if number in _YESNO_UNVALIDATED_CALIBRATION:
+                    # This question's calibration is still single-file/
+                    # unvalidated (see _YESNO_UNVALIDATED_CALIBRATION) - a
+                    # disagreement here doesn't yet have the cross-file track
+                    # record that justifies auto-correcting without a human
+                    # look, unlike the general policy just below.
+                    needs_review = True
+                # Intentionally NOT setting needs_review here otherwise. This is a
                 # question with a fixed, known checkbox layout, and the pixel
                 # margin has already cleared margin_threshold - i.e. the
                 # deterministic detector is confident about which box has
@@ -6111,20 +6083,6 @@ def answers_to_qa_rows(
             )
             answer, mark_position = "", ""
 
-        if (
-            number == "35"
-            and pixel_position is not None
-            and choices is not None
-            and 1 <= pixel_position <= len(choices)
-            and model_answer.strip().lower() != choices[pixel_position - 1].strip().lower()
-        ):
-            needs_review = True
-            review_reasons.append(
-                f"Gemini read {model_answer!r}, while the pixel detector read "
-                f"{choices[pixel_position - 1]!r}; retaining the Gemini answer and "
-                "flagging the disagreement for review."
-            )
-
         if detection_method == "model":
             cc_needs_review, cc_note = cross_check_answer(number, answer, mark_position)
             if cc_needs_review:
@@ -6153,32 +6111,23 @@ def answers_to_qa_rows(
             reconcile_result = _reconcile_multiselect_choices(number, answer, pixel_multiselect_ratios)
             if reconcile_result is not None:
                 new_answer, removed, added = reconcile_result
-                if number in {"34"}:
-                    if new_answer.strip().lower() != model_answer.strip().lower():
-                        needs_review = True
-                        review_reasons.append(
-                            f"Gemini read {model_answer!r}, while the pixel detector read "
-                            f"{new_answer!r} for this multi-select question; retaining the "
-                            "Gemini answer and flagging the disagreement for review."
-                        )
-                else:
-                    answer = new_answer
-                    mark_position = _positions_for_multiselect_answer(number, answer)
-                if number != "34" and removed and added:
+                answer = new_answer
+                mark_position = _positions_for_multiselect_answer(number, answer)
+                if removed and added:
                     review_reasons.append(
                         f"model claimed {removed!r} marked (but pixel found blank) "
                         f"and missed {added!r} marked (pixel found them) - "
                         f"reconciled to {answer!r} (no review needed for this "
                         "disagreement alone)."
                     )
-                elif number != "34" and removed:
+                elif removed:
                     review_reasons.append(
                         f"model additionally claimed {removed!r} marked, but the pixel detector found "
                         f"{'that choice' if len(removed) == 1 else 'those choices'} confidently blank on "
                         "this scan - removed from the answer (no review needed for this "
                         "disagreement alone)."
                     )
-                elif number != "34" and added:
+                elif added:
                     review_reasons.append(
                         f"model missed {added!r} marked, but the pixel detector found "
                         f"{'that choice' if len(added) == 1 else 'those choices'} confidently marked on "
@@ -6197,11 +6146,33 @@ def answers_to_qa_rows(
         # that case, regardless of whether the final answer used here is the
         # model's original or a reconciled one.
         if pixel_multiselect_ambiguous and number in MULTI_SELECT_QUESTION_NUMBERS:
-            needs_review = True
-            review_reasons.append(
-                f"pixel detector found {pixel_multiselect_ambiguous!r}'s mark unclear or exceeding its "
-                "own checkbox area on this scan - needs review to confirm the true answer."
-            )
+            # Same corroboration exception as the yesno_box ambiguous
+            # backstop below (explicit user request): a choice the pixel
+            # detector merely couldn't cleanly measure (ink near the box
+            # edge, or bleeding outside it) isn't a real disagreement when
+            # the model's own answer already, independently, includes that
+            # exact choice - the pixel side's uncertainty is about ink
+            # quality, not about which choice is actually marked, so there's
+            # nothing left for a human to adjudicate. Only skip the flag for
+            # choices the model actually confirmed; any ambiguous choice the
+            # model did NOT report still needs a human look, same as before.
+            selected_labels = [a.strip() for a in answer.split(";") if a.strip()]
+            unresolved_ambiguous = [
+                label for label in pixel_multiselect_ambiguous
+                if not any(_choice_matches(label, selected) for selected in selected_labels)
+            ]
+            if unresolved_ambiguous:
+                needs_review = True
+                review_reasons.append(
+                    f"pixel detector found {unresolved_ambiguous!r}'s mark unclear or exceeding its "
+                    "own checkbox area on this scan - needs review to confirm the true answer."
+                )
+            else:
+                review_reasons.append(
+                    f"pixel detector found {pixel_multiselect_ambiguous!r}'s mark unclear or exceeding "
+                    "its own checkbox area on this scan, but the model's own answer already, "
+                    "independently, includes that choice - no review needed for this ambiguity alone."
+                )
 
         # Same ambiguous-mark backstop as above, for the single-select
         # yesno_box detector (Q19/20/21/22/23/25/27/28/29/30/32/35): this
@@ -6467,7 +6438,29 @@ BQ_SURVEY_RESPONSES_SCHEMA = [
 _BQ_REPEATED_COLUMNS = {"issues", "unreadable_areas"}
 
 
-def ensure_bq_table(bq_client, project: str, dataset: str, table: str):
+def _normalize_bq_type(field_type: str) -> str:
+    """Canonicalizes a BigQuery field type name so equivalent aliases the API
+    can return interchangeably (e.g. "FLOAT" and "FLOAT64" are the SAME
+    type, just two spellings - BigQuery's own docs list FLOAT64 as the
+    "preferred" name and FLOAT as a legacy SQL alias) never register as a
+    "mismatch". This is a real, confirmed bug: comparing a live table's
+    "FLOAT" against this file's own schema's "FLOAT64" (see the schema list
+    comprehension in ensure_bq_table(), which explicitly maps FLOAT ->
+    FLOAT64) previously flagged EVERY table as mismatched on every run,
+    which - before the opt-in gate below was added - silently dropped and
+    recreated the entire table (all folders, not just the one being
+    processed) on every single invocation. Confirmed the hard way: this
+    destroyed a live table's data during a routine single-folder reprocess."""
+    aliases = {
+        "FLOAT": "FLOAT64",
+        "INTEGER": "INT64",
+        "BOOLEAN": "BOOL",
+        "RECORD": "STRUCT",
+    }
+    return aliases.get(field_type, field_type)
+
+
+def ensure_bq_table(bq_client, project: str, dataset: str, table: str, allow_schema_recreate: bool = False):
     from google.api_core.exceptions import NotFound
     from google.cloud import bigquery
 
@@ -6503,24 +6496,36 @@ def ensure_bq_table(bq_client, project: str, dataset: str, table: str):
         expected_field_types = {f.name: f.field_type for f in schema}
         type_mismatches = [
             f for f in bq_table.schema
-            if f.name in expected_field_types and f.field_type != expected_field_types[f.name]
+            if f.name in expected_field_types
+            and _normalize_bq_type(f.field_type) != _normalize_bq_type(expected_field_types[f.name])
         ]
         if type_mismatches:
             # BigQuery cannot ALTER a column's type in place (only add new
             # NULLABLE columns) - a live table left over from before a column
             # was retyped in BQ_SURVEY_RESPONSES_SCHEMA (e.g. model_confidence
             # created as STRING before it was declared FLOAT) has no in-place
-            # fix. Per explicit user decision, this DROPS AND RECREATES the
-            # table with the correct schema - existing rows are lost. If that
-            # data must be kept, migrate it out (or CAST it into a new table)
-            # before running this, or point --bq-table at a new table name.
+            # fix other than dropping and recreating the table, which loses
+            # every existing row - not just the folder/file being processed.
+            # NEVER do this silently (a real incident: a false-positive
+            # mismatch here - see _normalize_bq_type()'s docstring - once
+            # dropped a live production table with no prompt at all).
+            # Requires the caller to explicitly pass allow_schema_recreate=
+            # True (--allow-schema-recreate on the CLI) after confirming the
+            # existing data is backed up or truly disposable.
+            mismatch_desc = [f"{f.name}: {f.field_type} -> {expected_field_types[f.name]}" for f in type_mismatches]
+            if not allow_schema_recreate:
+                err(
+                    "[BQ] Table %s.%s.%s has genuine type mismatch(es) %s. Recreating this table would DELETE "
+                    "ALL existing rows (every folder/file, not just the one being processed) - refusing to do "
+                    "this automatically. If you've confirmed the existing data is backed up or safe to lose, "
+                    "re-run with --allow-schema-recreate to proceed.",
+                    project, dataset, table, mismatch_desc,
+                )
+                sys.exit(1)
             status(
-                "[BQ] Table %s.%s.%s has type mismatch(es) %s — dropping and recreating with the correct schema "
-                "(existing rows will be lost; BigQuery cannot alter a column's type in place).",
-                project,
-                dataset,
-                table,
-                [f"{f.name}: {f.field_type} -> {expected_field_types[f.name]}" for f in type_mismatches],
+                "[BQ] Table %s.%s.%s has type mismatch(es) %s — --allow-schema-recreate was passed, dropping "
+                "and recreating with the correct schema (ALL existing rows will be lost).",
+                project, dataset, table, mismatch_desc,
             )
             bq_client.delete_table(table_ref)
             raise NotFound("table dropped for schema-type recreation")
@@ -6566,6 +6571,29 @@ def delete_existing_rows_for_folder(bq_client, table_ref, folder: str) -> None:
         query_parameters=[bigquery.ScalarQueryParameter("folder", "STRING", folder)]
     )
     status("[BQ] Deleting existing rows (if any) for folder_name = %r in %s", folder, full_table_id)
+    bq_client.query(query, job_config=job_config).result()
+
+
+def delete_existing_rows_for_file(bq_client, table_ref, folder: str, file_name: str) -> None:
+    """DELETEs any rows already loaded for this exact (folder_name, file_name)
+    pair, so re-running extraction against a single file replaces just that
+    file's rows instead of duplicating them or touching any other file in
+    the same folder. Keyed on BOTH folder_name and file_name (not file_name
+    alone) since file_name isn't guaranteed unique across different survey
+    folders - see the same caveat on the corrections-log lookup above. A
+    no-op (deletes 0 rows) the first time this file is loaded. Uses a query
+    job (DML), same reasoning as delete_existing_rows_for_folder()."""
+    from google.cloud import bigquery
+
+    full_table_id = f"{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}"
+    query = f"DELETE FROM `{full_table_id}` WHERE folder_name = @folder AND file_name = @file_name"
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("folder", "STRING", folder),
+            bigquery.ScalarQueryParameter("file_name", "STRING", file_name),
+        ]
+    )
+    status("[BQ] Deleting existing rows (if any) for folder_name = %r, file_name = %r in %s", folder, file_name, full_table_id)
     bq_client.query(query, job_config=job_config).result()
 
 
@@ -7019,6 +7047,77 @@ def query_corrections(
     return [dict(row) for row in bq_client.query(query, job_config=job_config).result()]
 
 
+def _extract_one_pdf_with_retries(
+    blob, bucket_name, folder, report_date, refreshed_at,
+    vertex_project, vertex_location, gemini_model,
+    vision_project, vision_enabled,
+    quality_routing_enabled, pdf_quality_table, bq_client,
+    resolved_bq_project, bq_dataset,
+    max_retries: int = MAX_FILE_RETRIES,
+) -> Tuple[list, bool]:
+    """Extracts one PDF's Q&A rows, retrying up to `max_retries` times with
+    exponential backoff on failure (e.g. a transient 429 Resource Exhausted
+    from Vertex AI). Returns (rows, True) on success, or ([], False) once
+    every attempt has failed - the caller decides what "still failed after
+    every attempt" means (extract_to_bigquery() itself does a further
+    whole-folder retry pass before giving up for good)."""
+    gcs_uri = f"gs://{bucket_name}/{blob.name}"
+    file_name = Path(blob.name).name
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            pdf_bytes = blob.download_as_bytes()
+            quality_route = None
+            if quality_routing_enabled and pdf_quality_table and bq_client is not None:
+                quality_row = query_pdf_quality_route(
+                    bq_client, resolved_bq_project, bq_dataset, gcs_uri, pdf_quality_table
+                )
+                if quality_row is not None:
+                    quality_route = quality_row.get("recommended_route")
+                    status(
+                        "[QUALITY] %s: pdf_quality recommended_route=%r (overall_quality=%r) - %s",
+                        file_name, quality_route, quality_row.get("overall_quality"),
+                        {
+                            "pixel": "processing normally.",
+                            "vision": "forcing Cloud Vision double-check + needs_review for this file.",
+                            "fallback": "SKIPPING pixel detection, forcing Cloud Vision double-check + needs_review for this file.",
+                        }.get(quality_route, "unrecognized route, ignoring."),
+                    )
+            answers = extract_qa_from_pdf(
+                pdf_bytes, vertex_project, vertex_location, gemini_model,
+                vision_project=vision_project, vision_enabled=vision_enabled,
+                quality_route=quality_route,
+            )
+            rows = answers_to_qa_rows(folder, file_name, answers, report_date, refreshed_at)
+            n_flagged = sum(1 for r in rows if r.needs_review)
+            status(
+                "[GCS] Loaded + extracted %s from %s (%d question rows, %d flagged needs_review)%s",
+                file_name, gcs_uri, len(rows), n_flagged,
+                f" (succeeded on retry {attempt}/{max_retries})" if attempt > 1 else "",
+            )
+            if n_flagged:
+                status(
+                    "[GEMINI] %s: run verify_pdf(%r, %r) to audit the flagged answer(s) against the scan.",
+                    file_name, bucket_name, blob.name,
+                )
+            return rows, True
+        except Exception as e:  # noqa: BLE001 - keep going across a batch of scans
+            last_error = e
+            if attempt < max_retries:
+                delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                err(
+                    "[GEMINI] FAILED extracting %s (%s) on attempt %d/%d: %s - retrying in %ds",
+                    file_name, gcs_uri, attempt, max_retries, e, delay,
+                )
+                time.sleep(delay)
+            else:
+                err(
+                    "[GEMINI] FAILED extracting %s (%s) after %d attempt(s): %s",
+                    file_name, gcs_uri, max_retries, e,
+                )
+    return [], False
+
+
 def extract_to_bigquery(
     bucket_name: str,
     root_prefix: str,
@@ -7038,6 +7137,7 @@ def extract_to_bigquery(
     pipeline_config_table: Optional[str] = PIPELINE_CONFIG_TABLE,
     pipeline_config_enabled: Optional[bool] = None,
     spark_staging_bucket: Optional[str] = None,
+    allow_schema_recreate: bool = False,
 ) -> None:
     root_prefix = root_prefix if root_prefix.endswith("/") else root_prefix + "/"
     grid_ok = check_grid_dependencies()  # loud warning up front if this silently degrades
@@ -7080,7 +7180,7 @@ def extract_to_bigquery(
     if not dry_run:
         bq_client = connect_bigquery(bq_project)
         resolved_bq_project = bq_project or bq_client.project
-        bq_table_ref = ensure_bq_table(bq_client, resolved_bq_project, bq_dataset, bq_table)
+        bq_table_ref = ensure_bq_table(bq_client, resolved_bq_project, bq_dataset, bq_table, allow_schema_recreate=allow_schema_recreate)
         bq_full_table_id = f"{resolved_bq_project}.{bq_dataset}.{bq_table}"
 
     # Revision 38: load calibration/tuning overrides from pipeline_config
@@ -7136,60 +7236,55 @@ def extract_to_bigquery(
         )
 
         folder_rows = []
+        folder_failed_blobs = []
         for blob in pdf_blobs:
             gcs_uri = f"gs://{bucket_name}/{blob.name}"
-            file_name = Path(blob.name).name
             if dry_run:
                 status("[GCS] [dry-run] would send to Gemini: %s", gcs_uri)
                 total_files += 1
                 continue
-            try:
-                pdf_bytes = blob.download_as_bytes()
-                quality_route = None
-                if quality_routing_enabled and pdf_quality_table and bq_client is not None:
-                    quality_row = query_pdf_quality_route(
-                        bq_client, resolved_bq_project, bq_dataset, gcs_uri, pdf_quality_table
-                    )
-                    if quality_row is not None:
-                        quality_route = quality_row.get("recommended_route")
-                        status(
-                            "[QUALITY] %s: pdf_quality recommended_route=%r (overall_quality=%r) - %s",
-                            file_name, quality_route, quality_row.get("overall_quality"),
-                            {
-                                "pixel": "processing normally.",
-                                "vision": "forcing Cloud Vision double-check + needs_review for this file.",
-                                "fallback": "SKIPPING pixel detection, forcing Cloud Vision double-check + needs_review for this file.",
-                            }.get(quality_route, "unrecognized route, ignoring."),
-                        )
-                answers = extract_qa_from_pdf(
-                    pdf_bytes, vertex_project, vertex_location, gemini_model,
-                    vision_project=vision_project, vision_enabled=vision_enabled,
-                    quality_route=quality_route,
-                )
-                rows = answers_to_qa_rows(folder, file_name, answers, report_date, refreshed_at)
+            rows, ok = _extract_one_pdf_with_retries(
+                blob, bucket_name, folder, report_date, refreshed_at,
+                vertex_project, vertex_location, gemini_model,
+                vision_project, vision_enabled,
+                quality_routing_enabled, pdf_quality_table, bq_client,
+                resolved_bq_project, bq_dataset,
+            )
+            if ok:
                 folder_rows.extend(rows)
                 total_files += 1
-                n_flagged = sum(1 for r in rows if r.needs_review)
-                status(
-                    "[GCS] Loaded + extracted %s from %s (%d question rows, %d flagged needs_review)",
-                    file_name,
-                    gcs_uri,
-                    len(rows),
-                    n_flagged,
-                )
-                if n_flagged:
-                    status(
-                        "[GEMINI] %s: run verify_pdf(%r, %r) to audit the flagged answer(s) against the scan.",
-                        file_name,
-                        bucket_name,
-                        blob.name,
-                    )
-            except Exception as e:  # noqa: BLE001 - keep going across a batch of scans
-                err("[GEMINI] FAILED extracting %s (%s): %s", file_name, gcs_uri, e)
-                failed_files.append(blob.name)
+            else:
+                folder_failed_blobs.append(blob)
 
         if dry_run:
             continue
+
+        # Second pass: retry every file that still failed after its own
+        # per-file retries (e.g. a run of 429s that outlasted the backoff
+        # window for several files in a row). Only after THIS pass gives up
+        # on a file does it get recorded in failed_files - so "no file left
+        # unprocessed" holds as long as the failure is transient.
+        if folder_failed_blobs:
+            status(
+                "[GEMINI] Retrying %d file(s) that failed in folder %r after their own retries...",
+                len(folder_failed_blobs), folder,
+            )
+            still_failed = []
+            for blob in folder_failed_blobs:
+                rows, ok = _extract_one_pdf_with_retries(
+                    blob, bucket_name, folder, report_date, refreshed_at,
+                    vertex_project, vertex_location, gemini_model,
+                    vision_project, vision_enabled,
+                    quality_routing_enabled, pdf_quality_table, bq_client,
+                    resolved_bq_project, bq_dataset,
+                )
+                if ok:
+                    folder_rows.extend(rows)
+                    total_files += 1
+                else:
+                    still_failed.append(blob)
+            for blob in still_failed:
+                failed_files.append(blob.name)
 
         if not folder_rows:
             err("[BQ] Folder %r produced 0 extracted rows (every file failed) — nothing loaded for this folder.", folder)
@@ -7204,9 +7299,16 @@ def extract_to_bigquery(
                 json_rows, BQ_SURVEY_RESPONSES_SCHEMA, resolved_bq_project, bq_dataset, bq_table,
                 staging_bucket=spark_staging_bucket or SPARK_BQ_STAGING_BUCKET,
             )
-        except Exception as e:  # noqa: BLE001 - report and keep going with remaining folders
-            err("[BQ] FAILED loading folder %r into %s: %s", folder, bq_full_table_id, e)
-            continue
+        except Exception as spark_error:  # noqa: BLE001 - fall back to a direct BQ client load job below
+            err(
+                "[BQ] Spark load into %s failed (%s); falling back to a direct BigQuery client load job.",
+                bq_full_table_id, spark_error,
+            )
+            try:
+                n_loaded = load_rows_into_bq(bq_client, bq_table_ref, json_rows)
+            except Exception as e:  # noqa: BLE001 - report and keep going with remaining folders
+                err("[BQ] FAILED loading folder %r into %s: %s", folder, bq_full_table_id, e)
+                continue
 
         n_folder_flagged = sum(1 for r in folder_rows if r.needs_review)
         n_folder_conf_flagged = sum(
@@ -7247,6 +7349,121 @@ def extract_to_bigquery(
         total_confidence_flagged,
         total_vision_flagged,
         bq_full_table_id,
+    )
+
+
+def extract_one_file_to_bigquery(
+    bucket_name: str,
+    root_prefix: str,
+    file_path: str,
+    vertex_project: Optional[str],
+    vertex_location: str,
+    gemini_model: str,
+    bq_project: Optional[str],
+    bq_dataset: str,
+    bq_table: str,
+    vision_project: Optional[str] = None,
+    vision_enabled: Optional[bool] = None,
+    pdf_quality_table: Optional[str] = PDF_QUALITY_TABLE,
+    quality_routing_enabled: Optional[bool] = None,
+    pipeline_config_table: Optional[str] = PIPELINE_CONFIG_TABLE,
+    pipeline_config_enabled: Optional[bool] = None,
+    spark_staging_bucket: Optional[str] = None,
+    allow_schema_recreate: bool = False,
+) -> None:
+    """Same extraction + BigQuery load as extract_to_bigquery(), but scoped
+    to exactly ONE PDF instead of a whole folder: only that file's own rows
+    are deleted-then-reloaded (via delete_existing_rows_for_file(), keyed on
+    folder_name AND file_name), so every other file already loaded for that
+    folder is left untouched. This is the tool for re-landing a single
+    corrected file into BigQuery (e.g. after a pipeline fix) without
+    re-running - and re-billing Vertex AI for - every other file in its
+    folder.
+
+    file_path may be a full gs:// URI, or a path relative to root_prefix
+    (e.g. "Nov 23 2025/2025_Nov_23_5_TPS_3996.pdf") - same convention as
+    --verify-file."""
+    if file_path.startswith("gs://"):
+        _, _, rest = file_path.partition("gs://")
+        bucket_name, _, blob_name = rest.partition("/")
+    else:
+        root = root_prefix.rstrip("/")
+        blob_name = file_path if file_path.startswith(root + "/") else f"{root}/{file_path}"
+
+    # folder_name is the single path segment directly under root_prefix -
+    # same "folder_name" value list_date_folders()/extract_to_bigquery() use
+    # for every other row of this file's own folder, so a per-file delete
+    # here can never orphan rows under a different folder_name spelling.
+    root = root_prefix.rstrip("/") + "/"
+    if not blob_name.startswith(root):
+        err("[FILE] %r does not sit under root_prefix %r - cannot determine its folder_name.", blob_name, root_prefix)
+        sys.exit(1)
+    remainder = blob_name[len(root):]
+    if "/" not in remainder:
+        err("[FILE] %r sits directly under root_prefix %r, not inside a date folder - cannot determine its folder_name.", blob_name, root_prefix)
+        sys.exit(1)
+    folder, _, _ = remainder.partition("/")
+    file_name = Path(blob_name).name
+    report_date = parse_report_date(folder)
+
+    grid_ok = check_grid_dependencies()
+    status(
+        "[GRID] Pixel-based accuracy checks (Q1-18 grid + Q21/22/27/32/25/29/35 checkbox rows/lists): %s.",
+        "ENABLED" if grid_ok else "DISABLED (see error above) - falling back to model-only reading",
+    )
+    vision_enabled = VISION_DOUBLE_CHECK_ENABLED if vision_enabled is None else vision_enabled
+    vision_ok = vision_enabled and check_vision_dependencies()
+    status(
+        "[VISION] Cloud Vision double-check (H1/H2/H4/H5/H6/24/26 handwritten/write-in fields): %s.",
+        "ENABLED" if vision_ok else ("DISABLED (--no-vision-check)" if not vision_enabled else "DISABLED (see error above)"),
+    )
+
+    bq_client = connect_bigquery(bq_project)
+    resolved_bq_project = bq_project or bq_client.project
+    bq_table_ref = ensure_bq_table(bq_client, resolved_bq_project, bq_dataset, bq_table, allow_schema_recreate=allow_schema_recreate)
+    bq_full_table_id = f"{resolved_bq_project}.{bq_dataset}.{bq_table}"
+
+    pipeline_config_enabled = PIPELINE_CONFIG_ENABLED if pipeline_config_enabled is None else pipeline_config_enabled
+    if pipeline_config_enabled and pipeline_config_table:
+        ensure_and_maybe_seed_pipeline_config(bq_client, resolved_bq_project, bq_dataset, pipeline_config_table)
+        config_overrides = query_pipeline_config(bq_client, resolved_bq_project, bq_dataset, pipeline_config_table)
+        apply_pipeline_config(config_overrides)
+
+    quality_routing_enabled = PDF_QUALITY_ROUTING_ENABLED if quality_routing_enabled is None else quality_routing_enabled
+    refreshed_at = datetime.datetime.now(datetime.timezone.utc)
+
+    bucket = connect_gcs_bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    rows, ok = _extract_one_pdf_with_retries(
+        blob, bucket_name, folder, report_date, refreshed_at,
+        vertex_project, vertex_location, gemini_model,
+        vision_project, vision_enabled,
+        quality_routing_enabled, pdf_quality_table, bq_client,
+        resolved_bq_project, bq_dataset,
+    )
+    if not ok:
+        err("[FILE] Extraction failed for %s after retries - nothing loaded, existing BQ rows for this file left untouched.", blob_name)
+        sys.exit(1)
+
+    delete_existing_rows_for_file(bq_client, bq_table_ref, folder, file_name)
+
+    json_rows = [row.__dict__ for row in rows]
+    try:
+        n_loaded = load_rows_into_bq_via_spark(
+            json_rows, BQ_SURVEY_RESPONSES_SCHEMA, resolved_bq_project, bq_dataset, bq_table,
+            staging_bucket=spark_staging_bucket or SPARK_BQ_STAGING_BUCKET,
+        )
+    except Exception as spark_error:  # noqa: BLE001 - fall back to a direct BQ client load job below
+        err(
+            "[BQ] Spark load into %s failed (%s); falling back to a direct BigQuery client load job.",
+            bq_full_table_id, spark_error,
+        )
+        n_loaded = load_rows_into_bq(bq_client, bq_table_ref, json_rows)
+
+    n_flagged = sum(1 for r in rows if r.needs_review)
+    status(
+        "[BQ] Done. Replaced %s's rows in %s: %d row(s) loaded (refreshed_at=%s), %d flagged needs_review=TRUE.",
+        file_name, bq_full_table_id, n_loaded, refreshed_at.isoformat(), n_flagged,
     )
 
 
@@ -7440,6 +7657,16 @@ def main():
         "existing table's hand-tuned rows back to the code's own defaults.",
     )
     ap.add_argument(
+        "--allow-schema-recreate",
+        action="store_true",
+        help="[extract] Allow ensure_bq_table() to DROP AND RECREATE the target table when it finds a "
+        "genuine column type mismatch (BigQuery can't ALTER a column's type in place) - this DELETES "
+        "EVERY existing row in the table (all folders/files, not just the one being processed), not "
+        "just the file(s) in this run. Off by default: a mismatch is reported and the run aborts, "
+        "rather than silently destroying the table. Only pass this after confirming the existing data "
+        "is backed up (e.g. via a BigQuery table copy/snapshot) or is truly disposable.",
+    )
+    ap.add_argument(
         "--no-replace-folder",
         action="store_true",
         help="[extract] Skip the per-folder DELETE before loading — pure append, "
@@ -7454,6 +7681,16 @@ def main():
         "comparison table - no BigQuery write. Pass the full path inside the bucket, "
         "e.g. --verify-file \"Nov 10 2025/Nov10_1.pdf\" (relative to --root-prefix) "
         "or a full gs:// path.",
+    )
+    ap.add_argument(
+        "--only-file",
+        default=None,
+        help="[extract] Extract and load ONE PDF into BigQuery, deleting and replacing "
+        "only THAT file's existing rows (by folder_name + file_name) - every other file "
+        "already loaded for its folder is left untouched, unlike a normal --folders run "
+        "(which replaces the WHOLE folder). Same path convention as --verify-file: a full "
+        "gs:// path, or one relative to --root-prefix, e.g. "
+        "--only-file \"Nov 23 2025/2025_Nov_23_5_TPS_3996.pdf\".",
     )
     ap.add_argument(
         "--corrections-table",
@@ -7544,6 +7781,27 @@ def main():
             vision_enabled=vision_enabled,
         )
         return
+    if args.only_file:
+        extract_one_file_to_bigquery(
+            bucket_name=args.bucket,
+            root_prefix=args.root_prefix,
+            file_path=args.only_file,
+            vertex_project=args.vertex_project,
+            vertex_location=args.vertex_location,
+            gemini_model=args.gemini_model,
+            bq_project=args.bq_project,
+            bq_dataset=args.bq_dataset,
+            bq_table=args.bq_table,
+            vision_project=args.vision_project,
+            vision_enabled=vision_enabled,
+            pdf_quality_table=args.pdf_quality_table or None,
+            quality_routing_enabled=not args.no_quality_routing,
+            pipeline_config_table=args.pipeline_config_table or None,
+            pipeline_config_enabled=not args.no_pipeline_config,
+            spark_staging_bucket=args.spark_staging_bucket,
+            allow_schema_recreate=args.allow_schema_recreate,
+        )
+        return
     extract_to_bigquery(
             bucket_name=args.bucket,
             root_prefix=args.root_prefix,
@@ -7563,6 +7821,7 @@ def main():
             pipeline_config_table=args.pipeline_config_table or None,
             pipeline_config_enabled=not args.no_pipeline_config,
             spark_staging_bucket=args.spark_staging_bucket,
+            allow_schema_recreate=args.allow_schema_recreate,
         )
 
 
