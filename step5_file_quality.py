@@ -78,14 +78,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
+import pipeline_config
+
 # --------------------------------------------------------------------------
-# Configuration — same defaults merge_survey_pdfs.py uses, kept here so this
-# file runs standalone with no shared config import.
+# Configuration — every value below is this file's local name for a setting
+# defined once in pipeline_config.py (the shared source of truth across
+# step1-step6); edit pipeline_config.py to change any of these.
 # --------------------------------------------------------------------------
-BQ_PROJECT = "gcp-sapchoda-dev"
-BQ_DATASET = "ladph_tps"
-SURVEY_RESPONSES_TABLE = "survey_responses"
-FILE_QUALITY_TABLE = "file_quality_review"
+BQ_PROJECT = pipeline_config.GCP_PROJECT_ID
+BQ_DATASET = pipeline_config.BQ_DATASET
+SURVEY_RESPONSES_TABLE = pipeline_config.BQ_TABLE_SURVEY_RESPONSES
+FILE_QUALITY_TABLE = pipeline_config.BQ_TABLE_FILE_QUALITY
 
 # The Spark BigQuery connector's default write path stages data through a
 # GCS bucket before loading it into BigQuery (the connector's

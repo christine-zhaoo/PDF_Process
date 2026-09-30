@@ -205,3 +205,52 @@ All pixel thresholds are centrally defined and can be overridden at runtime from
 | `q34_Nov18_1.png`, `q35_Nov18_1.png` | Rendered question-region crops for visual verification |
 
 **Note:** internal module docstrings use older working titles (e.g. step 2/3 as `notebook_1`/`notebook_2`, step 4 as `merge_survey_pdfs.py`, step 5 as `build_file_quality_review.py`) from before the scripts were renumbered into this `step1`–`step5` pipeline order.
+
+## Commands
+### Run local host for link auth
+IAP_ENABLED=false python3 auth_link.py
+
+### End-to-end: extract a file, review its feedback, reload it
+The human-review feedback loop lives across two scripts: `step4_process_pdf.py
+--export-needs-review-feedback` **generates** the Excel review file, and
+`step6_load_feedback.py` **ingests** it back in. Both read/write `survey_responses_
+with_feedback` (a copy of `survey_responses` plus `correct_answer`/`updated_with_
+feedback`/`feedback_updated_time`/`ingested_from` - see `sync_survey_responses_with_feedback()` in
+`step4_process_pdf.py`), never `survey_responses` itself.
+
+1. **Extract one file in step 4** (or run a normal folder/full extraction instead -
+   this is just the single-file form):
+   ```
+  python3 step4_process_pdf.py \
+    --bucket tps_survey \
+    --root-prefix "TPS_Scanned_2025_Reorgnized/" \
+    --only-file "Nov 23 2025/Nov23_5/2025_Nov_23_5_TPS_3996.pdf" \
+    --bq-project gcp-sapchoda-dev \
+    --bq-dataset ladph_tps \
+    --bq-table survey_responses \
+    --vertex-location global \
+    2>&1 | grep -Ei "ERROR|INFO.*QUALITY|INFO.*FILE|Loaded|survey_responses|Traceback" 
+
+   ```
+
+2. **Generate the feedback Excel in step 4** - syncs `survey_responses_with_feedback`
+   from `survey_responses`, then exports every `needs_review=TRUE` row not yet covered
+   by ingested feedback to a new `gs://tps_survey/TPS_Feedback/tps_feedback_{datetime}.xlsx`:
+   ```
+   python3 step4_process_pdf.py --export-needs-review-feedback
+   ```
+
+3. **Review it** - download that file, fill in `correct_answer` for any row that's
+   wrong (leave it blank for a row that's already correct), and upload it back to the
+   *same* GCS path (overwrite in place).
+
+4. **Ingest the feedback with step 6** - finds the LATEST `tps_feedback_*.xlsx` file,
+   syncs again, then ingests it: a row whose `correct_answer` was filled in gets
+   `survey_answer` overwritten; a row left blank keeps its `survey_answer` unchanged.
+   Every matched row not already ingested gets `updated_with_feedback=TRUE` +
+   `feedback_updated_time=now` + `ingested_from=<this file's gs:// URI>` - already-
+   ingested rows are cross-checked against `survey_responses_with_feedback` and
+   skipped, so this is safe to run repeatedly:
+   ```
+   python3 step6_load_feedback.py
+   ```

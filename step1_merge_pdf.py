@@ -82,21 +82,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import pipeline_config
+
 # --------------------------------------------------------------------------
-# Configuration — same defaults as merge_survey_pdfs.py had for its merge side, kept here so this file runs standalone with no shared config import.
+# Configuration — every value below is this file's local name for a setting
+# defined once in pipeline_config.py (the shared source of truth across
+# step1-step6); edit pipeline_config.py to change any of these for a
+# different bucket/project/deployment. Kept as plain module-level constants
+# (not read from pipeline_config inline everywhere) so this file still runs
+# standalone with no other changes needed elsewhere.
 # --------------------------------------------------------------------------
-BUCKET_NAME = "tps_survey"
-ROOT_PREFIX = "TPS_Scanned_2025/"
-DESTINATION_PREFIX = "TPS_Scanned_2025_Reorgnized/"
+BUCKET_NAME = pipeline_config.GCS_BUCKET
+ROOT_PREFIX = pipeline_config.GCS_RAW_PREFIX
+DESTINATION_PREFIX = pipeline_config.GCS_SPLIT_PREFIX
 PAGES_PER_SURVEY = 2
-TPS_EXTRACTION_MODEL = "gemini-3.1-flash-lite"
-TPS_EXTRACTION_LOCATION = "global"
-TPS_EXTRACTION_PROJECT = "gcp-sapchoda-dev"
+TPS_EXTRACTION_MODEL = pipeline_config.TPS_EXTRACTION_MODEL
+# Explicit user request: keep gemini-3.1-flash-lite as the one model used
+# across all of step1's Gemini calls (TPS digit extraction, language
+# gating, blank/declined checking) rather than mixing in a stronger/
+# costlier model for just one check.
+TPS_EXTRACTION_LOCATION = pipeline_config.VERTEX_LOCATION
+TPS_EXTRACTION_PROJECT = pipeline_config.GCP_PROJECT_ID
 TPS_EXTRACTION_MAX_ATTEMPTS = 3
 TPS_EXTRACTION_RETRY_DELAY_SECONDS = 2
-BQ_PROJECT = "gcp-sapchoda-dev"
-BQ_DATASET = "ladph_tps"
-MANIFEST_TABLE = "pdf_manifest_list"
+BQ_PROJECT = pipeline_config.GCP_PROJECT_ID
+BQ_DATASET = pipeline_config.BQ_DATASET
+MANIFEST_TABLE = pipeline_config.BQ_TABLE_MANIFEST
 DEFAULT_FAILURE_LOG = "step1_failed_sources.csv"
 partition_field = "moved_date"  # must be an actual column in BQ_MANIFEST_SCHEMA
 RUN_TOKEN_TOTALS = {
@@ -360,6 +371,36 @@ def _extract_digit_crops(page) -> Optional[list]:
         (x, y, w, h) for x, y, w, h, area in (stats[i] for i in range(1, num_labels))
         if area > 60 and w < 40
     ]
+
+    # Merge vertically-split fragments of the same digit before checking for
+    # exactly 4 - confirmed directly (2025_Oct_30_1_TPS_1878.pdf, whose real
+    # TPS is 1678): a printed '6' whose thin waist (where the upper curve
+    # meets the lower loop) is too faint/thin to survive Otsu thresholding
+    # splits into TWO connected components instead of one, so this used to
+    # find 5 boxes instead of 4 and bail out entirely (return None) - which
+    # meant the confusable-pair pixel backstop below never even ran for this
+    # record, letting Gemini's confidently-wrong HIGH '8' reading (it's a
+    # known 6/8 confusable pair - see _CONFUSABLE_DIGIT_PAIRS) sail through
+    # with no independent check at all. Two fragments sharing substantial
+    # horizontal (x-axis) overlap are almost certainly one digit split
+    # top/bottom, not two separate adjacent digits - real neighboring digits
+    # in this printed TPS number are spaced apart with little to no x-overlap,
+    # so this merge only ever fuses fragments that share a column, never two
+    # genuinely different digits.
+    merged = []
+    for box in sorted(boxes, key=lambda b: b[0]):
+        x, y, w, h = box
+        for i, (mx, my, mw, mh) in enumerate(merged):
+            overlap = min(x + w, mx + mw) - max(x, mx)
+            if overlap > 0.5 * min(w, mw):
+                nx0, ny0 = min(x, mx), min(y, my)
+                nx1, ny1 = max(x + w, mx + mw), max(y + h, my + mh)
+                merged[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0)
+                break
+        else:
+            merged.append(box)
+    boxes = merged
+
     if len(boxes) != 4:
         return None
     boxes.sort(key=lambda box: box[0])
@@ -654,9 +695,14 @@ def extract_tps_number_from_page(
         "If the TPS number's digits are not all clearly legible, or the "
         "cropped image content itself is blank, corrupted, or otherwise "
         "unreadable, do not guess — return exactly REJECT_UNREADABLE "
-        "instead. If any text visible in the cropped image is written in a "
-        "language other than English, do not guess — return exactly "
-        "REJECT_NON_ENGLISH instead."
+        "instead."
+        # Explicit user request: this used to also instruct REJECT_NON_ENGLISH
+        # here, but the cropped image is just the small handwritten TPS-number
+        # field (see _crop_tps_field_pixmap()) - it essentially never contains
+        # enough visible text to judge the survey's language at all, so this
+        # instruction was dead weight that didn't actually solve the
+        # Spanish-PDF problem. Language is now gated by validate_survey_
+        # language() below, against the FULL survey page, instead.
     )
     prompt = " ".join(prompt_parts)
     last_error = None
@@ -687,8 +733,6 @@ def extract_tps_number_from_page(
                 )
             raw_text = (response.text or "").strip()
             normalized = raw_text.upper()
-            if normalized == "REJECT_NON_ENGLISH":
-                raise TpsRejected("the PDF is in a language other than English")
             if normalized == "REJECT_UNREADABLE":
                 raise TpsRejected(
                     "Gemini could not read the TPS number or page content "
@@ -753,6 +797,109 @@ def extract_tps_number_from_page(
     ) from last_error
 
 
+def validate_survey_language(
+    page,
+    model: str = TPS_EXTRACTION_MODEL,
+    max_attempts: int = TPS_EXTRACTION_MAX_ATTEMPTS,
+) -> bool:
+    """The dedicated language gate for a survey - explicit user request,
+    replacing two earlier, weaker attempts at the same check:
+
+    1. extract_tps_number_from_page() used to ask Gemini to return
+       REJECT_NON_ENGLISH, but it only ever sees a tight crop of the
+       handwritten TPS-number FIELD (see _crop_tps_field_pixmap()) - there's
+       essentially never enough visible text in that crop to judge language
+       at all, so that instruction was dead weight and never caught a real
+       non-English survey.
+    2. assess_page_content_and_declined() used to fold a NON_ENGLISH verdict
+       into its combined content-quality/declined check. That one DOES see
+       the full page, but bundling three judgments (blank / legible /
+       language) into one two-word response diluted the model's attention -
+       confirmed directly on 2025_Oct_31_9.pdf pages 9-10 (a Spanish-
+       language survey whose OWN printed footer reads "Revised 9/17/25,
+       (Adult) - Spanish"), which that combined check misread as "OK"
+       instead of "NON_ENGLISH".
+
+    This function does exactly one thing - render the FULL survey page and
+    ask a single, focused language question - so there's nothing else in
+    the prompt to dilute the model's attention.
+
+    Returns True only when the survey is confidently identified as English.
+    Spanish, other languages, or uncertain language are rejected - i.e. this
+    is a fail-closed gate: an ambiguous model response, a response that
+    doesn't parse, or every retry attempt erroring out all return False
+    (reject), not True. This is deliberately the opposite of this module's
+    usual "advisory, never blocks the decision it supports" pattern (see
+    e.g. assess_page_content_and_declined()'s own docstring) - a language
+    gate that fails open would silently let exactly the kind of survey it
+    exists to catch through undetected."""
+    import pymupdf
+    from google.genai import types
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    prompt = (
+        "Look at this whole scanned survey page. Is the visible printed and "
+        "handwritten text written in English? Respond with exactly one "
+        "word: ENGLISH if all the visible text is in English, NON_ENGLISH "
+        "if any visible text (printed or handwritten) is written in a "
+        "different language, or UNCERTAIN if you cannot tell. No other "
+        "text, punctuation, or markdown."
+    )
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+            client = _get_genai_client()
+            response = _generate_content_with_limits(
+                client,
+                model,
+                [
+                    types.Part.from_bytes(data=pixmap.tobytes("png"), mime_type="image/png"),
+                    prompt,
+                ],
+                "survey language gate",
+            )
+            usage = getattr(response, "usage_metadata", None)
+            if usage is not None:
+                prompt_tokens, output_tokens, total_tokens = _record_gemini_usage(usage)
+                status(
+                    "[GEMINI] model=%s attempt=%d/%d prompt_tokens=%s "
+                    "output_tokens=%s total_tokens=%s",
+                    model,
+                    attempt,
+                    max_attempts,
+                    prompt_tokens,
+                    output_tokens,
+                    total_tokens,
+                )
+            verdict = (response.text or "").strip().upper()
+            if verdict == "ENGLISH":
+                return True
+            if verdict in ("NON_ENGLISH", "UNCERTAIN"):
+                return False
+            last_error = ValueError(f"language gate returned {verdict!r}; expected ENGLISH/NON_ENGLISH/UNCERTAIN")
+        except Exception as error:  # noqa: BLE001 - retry, then fail closed (reject) below
+            last_error = error
+
+        if attempt < max_attempts:
+            status(
+                "[GEMINI] Survey language gate attempt %d/%d failed (%s); retrying in %d second(s).",
+                attempt,
+                max_attempts,
+                last_error,
+                TPS_EXTRACTION_RETRY_DELAY_SECONDS,
+            )
+            time.sleep(TPS_EXTRACTION_RETRY_DELAY_SECONDS)
+
+    status(
+        "[GEMINI] Survey language gate failed after %d attempt(s) (%s); rejecting (fail-closed).",
+        max_attempts, last_error,
+    )
+    return False
+
+
 def assess_page_content_and_declined(
     page,
     second_page=None,
@@ -785,8 +932,9 @@ def assess_page_content_and_declined(
 
     Returns (content_issue: Optional[str], declined: bool):
     - content_issue is a human-readable reason the survey can't be trusted
-      (non-English, unreadable, or blank/unfilled on every page given), or
-      None if nothing looks wrong.
+      (unreadable, or blank/unfilled on every page given), or None if
+      nothing looks wrong. Language is NOT judged here - see
+      validate_survey_language(), a separate gate against the full page.
     - declined is True either for a large handwritten "Declined"/"Decline"/
       "Refused" word, OR for a large scribble/loop/strikethrough mark drawn
       across page 1's answer grid with no such word written (respondents
@@ -857,27 +1005,57 @@ def assess_page_content_and_declined(
         "with no individual checkbox independently selected, the answer "
         "is still BLANK.\n"
         "Step 2 (only if at least one field IS filled in/marked): OK if "
-        "the visible text is in English and the handwritten TPS number (if "
-        "visible) is legible; NON_ENGLISH if any visible text is written "
-        "in a language other than English; UNREADABLE if the content or "
-        "TPS number can't be made out at all.\n\n"
-        "Second word - whether the respondent declined: DECLINED if EITHER "
-        "of these is true - (a) you see a large handwritten word like "
-        "'Declined', 'Decline', or 'Refused' written prominently across "
-        "page 1 (not just small printed text that happens to contain a "
-        "similar word), OR (b) you see a large scribble, loop, or "
-        "strikethrough mark drawn OVER/ACROSS page 1's grid that clearly "
-        "invalidates or crosses out the respondent's answers - extra ink "
-        "on top of or independent from the normal answer marks, such as a "
-        "big X, loop, or wavy line dragged across many rows at once. Do "
-        "NOT count a respondent simply marking the SAME answer column "
-        "(e.g. 'Strongly Agree') for most or all questions - even though "
-        "each individual mark can visually line up into what looks like a "
-        "diagonal streak running down the page, every one of those marks "
-        "is a normal, separate, valid answer selection, not a "
-        "strikethrough. Only answer DECLINED for (b) when the scribble is "
-        "clearly ADDITIONAL ink drawn to cross out or invalidate the grid, "
-        "not merely the visual byproduct of consistent per-row marking. "
+        "the handwritten TPS number (if visible) and the marked answers are "
+        "legible; UNREADABLE if the content or TPS number can't be made out "
+        "at all. Do not judge language here - only legibility.\n\n"
+        "Second word - whether the respondent declined: "
+        "Before deciding DECLINED, first identify the respondent's individual "
+        "answer marks in the grid and treat those as legitimate selections. "
+        "The mental test: is this one additional connected cancellation "
+        "mark, or is it a collection of individual answer marks? Return "
+        "DECLINED ONLY when there is strong visual evidence the respondent "
+        "intentionally invalidated/crossed out the survey.\n\n"
+        "Return DECLINED if EITHER:\n"
+        "(a) A large handwritten word such as 'Declined', 'Decline', or "
+        "'Refused' is prominently written across page 1.\n"
+        "OR\n"
+        "(b) There is a clearly intentional cancellation mark consisting of "
+        "ADDITIONAL continuous ink drawn across the answer grid, visually "
+        "distinguishable from the respondent's individual answer "
+        "selections, that appears to cross out/invalidate/cancel the "
+        "survey as a whole.\n\n"
+        "The following are NOT DECLINED - do not classify the survey as "
+        "DECLINED merely because ink appears across multiple checkbox rows "
+        "or columns:\n"
+        "- An X or checkmark inside an individual checkbox, even one that "
+        "extends slightly outside it or touches an adjacent checkbox.\n"
+        "- The respondent selecting the same answer column on many "
+        "consecutive rows, or several individual answer marks that happen "
+        "to form a line, diagonal, streak, or visual pattern.\n"
+        "- A checkmark drawn with a long diagonal 'tail' or flourish - some "
+        "respondents' checkmarks continue in a diagonal stroke after the "
+        "check itself before the pen lifts, and because these tails are "
+        "long, one row's tail can visually touch or overlap the next row's "
+        "mark, creating the illusion of one continuous connected line "
+        "threading down or across the grid. This is NOT a cancellation "
+        "mark, even when it links together many rows and/or columns.\n\n"
+        "To classify a mark as DECLINED under rule (b), verify ALL of these "
+        "conditions:\n"
+        "1. The mark is continuous or forms a clearly connected scribble, "
+        "line, loop, or cross-out.\n"
+        "2. It is visually distinct from the normal checkbox selections and "
+        "does not consist simply of one deliberate answer mark per row "
+        "(including the tail-flourish case above).\n"
+        "3. Its apparent purpose is to cross out or invalidate the survey "
+        "rather than select answers, covering/crossing a substantial "
+        "portion of the answer grid as one intentional cancellation mark.\n"
+        "4. At least part of the mark can be traced back to a starting "
+        "point that is NOT any individual checkbox - e.g. the blank "
+        "margin, the header area, or free space between rows. A mark "
+        "entirely traceable to individual checkboxes' own marks is never "
+        "DECLINED, no matter how large or connected-looking it is.\n\n"
+        "If you cannot confidently distinguish an intentional cancellation "
+        "mark from legitimate answer selections, return NOT_DECLINED.\n\n"
         "Otherwise respond NOT_DECLINED.\n\n"
         "Example response: 'OK NOT_DECLINED', 'UNREADABLE DECLINED', or "
         "'BLANK NOT_DECLINED'."
@@ -902,9 +1080,7 @@ def assess_page_content_and_declined(
         content_word = parts[0] if len(parts) >= 1 else ""
         declined_word = parts[1] if len(parts) >= 2 else ""
         content_issue = None
-        if content_word == "NON_ENGLISH":
-            content_issue = "the PDF is in a language other than English"
-        elif content_word == "UNREADABLE":
+        if content_word == "UNREADABLE":
             content_issue = "Gemini could not read the page content"
         elif content_word == "BLANK":
             content_issue = "the PDF is empty - there's no data to process"
@@ -1015,6 +1191,8 @@ def split_combined_pdf(
             # WHY a source ended up with a malformed page count in the first
             # place (e.g. a single stray page scanned in isolation) and is
             # useful context for review.
+            if not validate_survey_language(source_doc[0]):
+                rejected_reason = f"{rejected_reason}; Also: the PDF is in a language other than English"
             content_issue, _declined = assess_page_content_and_declined(source_doc[0])
             if content_issue:
                 rejected_reason = f"{rejected_reason}; Also: {content_issue}"
@@ -1080,12 +1258,37 @@ def split_combined_pdf(
 
             previous_tps = tps
 
-            # Page content is checked before anything else, including a TPS
-            # collision below - a blank/unreadable/non-English survey contributes
-            # no data regardless of what its TPS number does or doesn't collide
-            # with, so it's rejected outright rather than getting pulled into a
-            # TPS dispute (which would otherwise wrongly flag it, or even an
-            # unrelated later survey, as merely needs_review instead of rejected).
+            # Language is gated FIRST, before the content/blank/declined check
+            # below and before the TPS collision check further down - same
+            # "contributes no data regardless of what else is going on"
+            # rationale as the content_issue check that follows. Checked
+            # against page 1 alone (see validate_survey_language()'s
+            # docstring for why this replaced the two earlier, weaker
+            # attempts at this same check) - this form's language is
+            # consistent across both of a survey's pages, so page 1 is
+            # sufficient without a second Gemini call for page 2 too.
+            if not validate_survey_language(source_doc[start]):
+                entry = {
+                    "source_name": source_name,
+                    "date_folder": date_folder,
+                    "output_name": None,
+                    "pdf_bytes": None,
+                    "page_start": start + 1,
+                    "page_end": start + pages_per_survey,
+                    "rejected_reason": f"the PDF is in a language other than English (TPS {tps})",
+                }
+                outputs.append(entry)
+                existing = seen_tps.get(tps)
+                if existing is None or existing["output"].get("rejected_reason") is not None:
+                    seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
+                continue
+
+            # Page content is checked before anything else remaining, including a
+            # TPS collision below - a blank/unreadable survey contributes no data
+            # regardless of what its TPS number does or doesn't collide with, so
+            # it's rejected outright rather than getting pulled into a TPS dispute
+            # (which would otherwise wrongly flag it, or even an unrelated later
+            # survey, as merely needs_review instead of rejected).
             # Page 2 is passed too (when this survey unit has one) so BLANK is
             # judged across the whole survey, not just page 1's answer grid -
             # see assess_page_content_and_declined()'s docstring for why.
@@ -1281,9 +1484,15 @@ def split_combined_pdf(
                 # Page range is included so this doesn't collide with the earlier
                 # survey's own NEEDS_REVIEW file below - both surveys share the same
                 # (disputed) TPS number, so the bare TPS number alone isn't unique here.
+                # Explicit user request: matches the prior survey's own rename
+                # template below (_TPS_{tps}_NEEDS_REVIEW_pages_{page_range}.pdf) -
+                # these two used to put "_pages_{page_range}" in different spots
+                # (before vs. after "_TPS_{tps}_NEEDS_REVIEW"), so the two output
+                # files from the SAME collision event looked like two different
+                # naming conventions instead of a matched pair.
                 review_name = (
                     f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                    f"_pages_{page_range}_TPS_{tps}_NEEDS_REVIEW.pdf"
+                    f"_TPS_{tps}_NEEDS_REVIEW_pages_{page_range}.pdf"
                 )
                 output_doc = pymupdf.open()
                 try:
@@ -1337,11 +1546,10 @@ def split_combined_pdf(
                     f"A large handwritten 'Declined' marking was detected on this "
                     f"survey page (TPS {tps}) - flagged for manual review."
                 )
-
             if review_reasons:
                 output_name = (
                     f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                    f"_TPS_{tps}_NEEDS_REVIEW.pdf"
+                    f"_TPS_{tps}_NEEDS_REVIEW_pages_{page_range}.pdf"
                 )
                 declined_reason = " ".join(review_reasons)
             else:

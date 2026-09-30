@@ -56,8 +56,10 @@ import os
 import re
 from pathlib import Path
 
+import pipeline_config
+
 RENDER_DPI = 300
-BQ_TABLE = "gcp-sapchoda-dev.ladph_tps.pdf_quality"
+BQ_TABLE = f"{pipeline_config.GCP_PROJECT_ID}.{pipeline_config.BQ_DATASET}.{pipeline_config.BQ_TABLE_QUALITY}"
 CLASSIFIER_VERSION = "notebook_2-1.0"
 
 # --- measured thresholds; see revision docs for each one's derivation ---
@@ -460,7 +462,7 @@ def profile_pdf_bytes(pdf_bytes, name="(bytes)", source=None, dpi=RENDER_DPI):
 # ==========================================================================
 # pdf_calibration_profile (notebook 1's BQ table) — PRIMARY input for measure()
 # ==========================================================================
-CALIBRATION_TABLE = "gcp-sapchoda-dev.ladph_tps.pdf_calibration_profile"
+CALIBRATION_TABLE = f"{pipeline_config.GCP_PROJECT_ID}.{pipeline_config.BQ_DATASET}.{pipeline_config.BQ_TABLE_CALIBRATION}"
 
 
 def fetch_calibration_row(file_name, table=CALIBRATION_TABLE, project=None, client=None):

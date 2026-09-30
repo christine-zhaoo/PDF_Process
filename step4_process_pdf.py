@@ -365,6 +365,7 @@ import datetime
 import difflib
 import json
 import logging
+import itertools
 import re
 import shutil
 import sys
@@ -374,21 +375,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
+import pipeline_config
+
 # ==========================================================================
-# CONFIG — edit these to point at your bucket/project, or override on the
-# command line (e.g. --bucket other-bucket). These are just the defaults.
+# CONFIG — every value below is just this file's local name for a setting
+# defined once in pipeline_config.py (the shared source of truth across
+# step1-step6); edit pipeline_config.py to change any of these, or override
+# on the command line (e.g. --bucket other-bucket) for a one-off run. See
+# pipeline_config.py's own module docstring for what's centralized there
+# and what's deliberately left as this file's own pixel-calibration code.
 # ==========================================================================
-BUCKET_NAME = "syntasa-saas"
-ROOT_PREFIX = "syn-workspace/users/christine.zhao@syntasa.com/notebooks/test_pdf/"
+BUCKET_NAME = pipeline_config.GCS_BUCKET
+ROOT_PREFIX = pipeline_config.GCS_SPLIT_PREFIX  # step4 reads step1's SPLIT output, not the raw scans
 OUTPUT_PREFIX = None  # None -> derived as "<ROOT_PREFIX>_merged/"
 # The Spark BigQuery connector's default write path (used by
 # load_rows_into_bq_via_spark(), Revision 40) stages data through a GCS bucket before loading it into BigQuery - reuses BUCKET_NAME so a separate bucket doesn't need to be created just for this.
 SPARK_BQ_STAGING_BUCKET = BUCKET_NAME
+SURVEY_LINK_BASE_URL = "http://localhost:8080/surveys/"  # survey_link column = this + file_name with ".pdf" stripped
+
+
+def _survey_link_for(file_name: str) -> str:
+    """Builds the survey_link column's value for one file - SURVEY_LINK_BASE_URL
+    plus file_name with its ".pdf" extension stripped, e.g. "http://localhost:8080/
+    surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2" for "2025_Nov_10_16_TPS_
+    4813_NEEDS_REVIEW_pages_1-2.pdf"."""
+    return SURVEY_LINK_BASE_URL + Path(file_name).stem
 
 # --- extraction (Vertex AI Gemini) ---
-VERTEX_PROJECT_ID = None  # None -> uses your application-default GCP project
-VERTEX_LOCATION = "global"
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+VERTEX_PROJECT_ID = pipeline_config.GCP_PROJECT_ID
+VERTEX_LOCATION = pipeline_config.VERTEX_LOCATION
+GEMINI_MODEL = pipeline_config.GEMINI_MODEL
 
 # --- extraction quality gates: model self-reported confidence + Cloud
 # Vision double-check for handwritten fields (added at user request to
@@ -398,7 +414,7 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"
 # flag, since they have no fixed choice list to check mark_position
 # against). See the "Model confidence + Cloud Vision double-check" module
 # docstring section above for the full design and reasoning. ---
-MODEL_CONFIDENCE_THRESHOLD = 0.8
+MODEL_CONFIDENCE_THRESHOLD = pipeline_config.MODEL_CONFIDENCE_THRESHOLD
 MAX_FILE_RETRIES = 3  # per-file extraction attempts before giving up and recording it as failed
 RETRY_BACKOFF_SECONDS = 10  # base delay between retries; doubles each attempt (10s, 20s, 40s, ...) - long enough to ride out a 429 Resource Exhausted from Vertex AI
 
@@ -414,18 +430,38 @@ RETRY_BACKOFF_SECONDS = 10  # base delay between retries; doubles each attempt (
 # backoff-and-retry) than running a bit slower. Tune upward only after
 # confirming headroom in the actual Vertex quota for vertex_project/
 # vertex_location.
-FILE_EXTRACTION_WORKERS = 4
+FILE_EXTRACTION_WORKERS = pipeline_config.FILE_EXTRACTION_WORKERS
 # model's own self-reported confidence (build_extraction_prompt() rule 15) below this -> needs_review=True. Only gates a question where no pixel-verified reading already took over (see answers_to_qa_rows()) - a confident pixel detector's own margin check already independently vouches for those.
-VISION_DOUBLE_CHECK_ENABLED = True  # set False (or pass --no-vision-check) to skip Cloud Vision calls entirely, e.g. no Vision API enabled/quota - written-text questions then fall back to model-only + confidence-threshold checking alone, same as before this feature existed.
-VISION_FREEFORM_COVERAGE_THRESHOLD = 0.75
+VISION_DOUBLE_CHECK_ENABLED = pipeline_config.VISION_DOUBLE_CHECK_ENABLED  # set False (or pass --no-vision-check) to skip Cloud Vision calls entirely, e.g. no Vision API enabled/quota - written-text questions then fall back to model-only + confidence-threshold checking alone, same as before this feature existed.
+VISION_FREEFORM_COVERAGE_THRESHOLD = pipeline_config.VISION_FREEFORM_COVERAGE_THRESHOLD
 # cross_check_written_field_with_vision()'s freeform fields (H4/H5/H6/24): word-level matching coverage (see that function - Revision 19's word-level, sum-of-all-matching-runs fix) below this -> vision_match=False, needs_review=True. Raised from 0.7 to 0.9 (explicit user request) now that the coverage score is computed correctly and can be trusted at a tighter cutoff - was 0.7 while the score itself was still unreliable (see Revision 19's project doc for the four bugs fixed there).
-VISION_PROJECT_ID = None  # None -> uses application-default GCP project, same convention as VERTEX_PROJECT_ID
+H2_CHAR_OVERLAP_THRESHOLD = pipeline_config.H2_CHAR_OVERLAP_THRESHOLD
+H4_CHAR_OVERLAP_THRESHOLD = pipeline_config.H4_CHAR_OVERLAP_THRESHOLD
+# cross_check_written_field_with_vision()'s H4 (Field Based Services: Agency)
+# fallback: when word-level matching scores below VISION_FREEFORM_COVERAGE_
+# THRESHOLD, H4 alone (not H5/H6/24) gets a second chance via character-level
+# overlap (spaces/punctuation ignored), scoped to the ANCHORED comparison
+# window only. Explicit user request, confirmed on 2025_Nov_18_2_TPS_6901.pdf
+# and several siblings in the same batch: Cloud Vision's OCR frequently drops
+# or fragments the handwritten "/" in "N/A" (reading "NA", "N/", or "A" alone)
+# because this batch's respondents draw it as a near-vertical stroke rather
+# than a typical diagonal slash - confirmed by direct crop of the actual
+# handwriting. Word-level matching can't fix this: the punctuation sits
+# INSIDE the word ("n/a" vs "na"), not at its edges, so it isn't touched by
+# the edge-punctuation stripping already applied for Q24. A lower 50%
+# threshold (vs. H2's 80%) reflects how short H4's answers typically are
+# (often literally just "N/A"), where a couple of dropped/garbled characters
+# is a much bigger fraction of the total than it would be in a longer answer.
+# cross_check_written_field_with_vision()'s H2 (Program Reporting Unit code): character-level matching coverage (difflib matching-block chars, as a fraction of the model's own answer length) below this -> vision_match=False, needs_review=True. Explicit user request: H1/26 (pure digits) and H4/H5/H6/24 (freeform) already tolerate this kind of near-miss OCR noise (digit-strip / word-coverage respectively); H2 alone required a byte-exact match, which meant Vision's own OCR noise on H2's label/value window (e.g. reading "4450WCE" as "4450 W CEN") forced needs_review=True even though the model's answer was correct. Below 1.0 exact match, falls back to this coverage check rather than failing outright.
+H6_DIGIT_COVERAGE_THRESHOLD = pipeline_config.H6_DIGIT_COVERAGE_THRESHOLD
+# cross_check_written_field_with_vision()'s H6 (Today's Date) last-resort digit-overlap check: when NONE of the exact/range-hint/spurious-separator corrections above resolved found_digits to match the model's target_digits (e.g. a genuinely DROPPED digit, not a wrong or extra one - real case: Vision read "0202025", 7 digits, for handwritten "10/20/2025" - the leading "1" box simply wasn't transcribed at all, leaving the remaining 7 digits an exact contiguous match against the model's last 7), difflib matching-block coverage (as a fraction of the LONGER of found_digits/target_digits) below this -> vision_match=False, needs_review=True; at or above -> vision_match=True (explicit user request: "as long as the digit has 50% coverage or overlapping, then think this as a pass and needs_review = false"). Deliberately looser than H2's 0.8 (H6's failure mode here is Vision dropping/missing whole digits outright, not misreading similar-looking characters, so a lower bar is safe - still requires HALF the digits to genuinely line up, not a coincidental partial match).
+VISION_PROJECT_ID = pipeline_config.VISION_PROJECT_ID  # None -> uses application-default GCP project, same convention as VERTEX_PROJECT_ID
 
 # --- extraction output (BigQuery) ---
-BQ_PROJECT_ID = None  # None -> uses your application-default GCP project
-BQ_DATASET = "ladph_tps"
-BQ_TABLE = "survey_responses"
-BQ_CORRECTIONS_TABLE = "corrections_log"  # see log_corrections() below
+BQ_PROJECT_ID = pipeline_config.GCP_PROJECT_ID
+BQ_DATASET = pipeline_config.BQ_DATASET
+BQ_TABLE = pipeline_config.BQ_TABLE_SURVEY_RESPONSES
+BQ_CORRECTIONS_TABLE = pipeline_config.BQ_TABLE_CORRECTIONS  # see log_corrections() below
 
 # --- upstream QC routing (Revision 37) ---
 # `classify_pdf_quality.py` is a SEPARATE script that runs before this one
@@ -444,9 +480,10 @@ BQ_CORRECTIONS_TABLE = "corrections_log"  # see log_corrections() below
 # row for the file being processed, and adjust pixel-detection/Vision-check
 # behavior for THIS file according to its own recommended_route, rather than
 # treating every file identically regardless of known scan quality.
-PDF_QUALITY_TABLE = "pdf_quality"  # classify_pdf_quality.py's output table, same bq_project/BQ_DATASET as everything else in this file unless overridden
-PDF_QUALITY_ROUTING_ENABLED = True  # set False (or pass --no-quality-routing) to skip the lookup entirely and process every file identically (pixel + optional Vision per VISION_DOUBLE_CHECK_ENABLED, same as before this feature existed) - e.g. if PDF_QUALITY_TABLE hasn't been populated yet for this bucket/folder.
-PDF_CALIBRATION_TABLE = "pdf_calibration_profile"  # step2_pdf_calibration.py's (notebook 1's) per-file registration/ink profiling output table
+PDF_QUALITY_TABLE = pipeline_config.BQ_TABLE_QUALITY  # classify_pdf_quality.py's output table, same bq_project/BQ_DATASET as everything else in this file unless overridden
+PDF_QUALITY_ROUTING_ENABLED = pipeline_config.PDF_QUALITY_ROUTING_ENABLED  # set False (or pass --no-quality-routing) to skip the lookup entirely and process every file identically (pixel + optional Vision per VISION_DOUBLE_CHECK_ENABLED, same as before this feature existed) - e.g. if PDF_QUALITY_TABLE hasn't been populated yet for this bucket/folder.
+PDF_CALIBRATION_TABLE = pipeline_config.BQ_TABLE_CALIBRATION  # step2_pdf_calibration.py's (notebook 1's) per-file registration/ink profiling output table
+PDF_MANIFEST_TABLE = pipeline_config.BQ_TABLE_MANIFEST  # step1_merge_pdf.py's per-survey-unit manifest table - looked up for a NEEDS_REVIEW file's needs_review_reason (see query_pdf_manifest_row() and _build_needs_review_row())
 # Explicit user request, after a real accuracy investigation (2025_Nov_23_7_
 # TPS_2969.pdf's Q20/23/25/29 pixel errors) traced both failures back to
 # information this table ALREADY measures per file but step4 never
@@ -483,8 +520,8 @@ PDF_CALIBRATION_ROUTING_ENABLED = True  # set False (or pass --no-calibration-pr
 # CHOICE_LISTS_BY_NUMBER, QUESTION_TEXT_BY_NUMBER, etc.) and operational
 # config (BUCKET_NAME, BQ_* table/dataset names, GEMINI_MODEL, etc.) -
 # those rarely change and aren't really "calibration".
-PIPELINE_CONFIG_TABLE = "pipeline_config"
-PIPELINE_CONFIG_ENABLED = True  # set False (or pass --no-pipeline-config) to always run with this file's built-in calibration defaults only, ignoring PIPELINE_CONFIG_TABLE entirely - this also skips the auto-create-and-seed-if-missing check (see ensure_and_maybe_seed_pipeline_config())
+PIPELINE_CONFIG_TABLE = pipeline_config.BQ_TABLE_PIPELINE_CONFIG
+PIPELINE_CONFIG_ENABLED = pipeline_config.PIPELINE_CONFIG_ENABLED  # set False (or pass --no-pipeline-config) to always run with this file's built-in calibration defaults only, ignoring PIPELINE_CONFIG_TABLE entirely - this also skips the auto-create-and-seed-if-missing check (see ensure_and_maybe_seed_pipeline_config())
 # ==========================================================================
 
 logging.basicConfig(
@@ -740,6 +777,63 @@ def query_pdf_calibration_profile(
         except (TypeError, ValueError) as e:
             err("[CALIBRATION] question_rects_json for %s did not parse cleanly - ignoring it: %s", gcs_uri, e)
     return profile
+
+
+def query_pdf_manifest_row(
+    bq_client, bq_project: str, bq_dataset: str, gcs_uri: str,
+    manifest_table: str = PDF_MANIFEST_TABLE,
+    fallback_gcs_uris: Optional[list] = None,
+) -> Optional[dict]:
+    """Looks up step1_merge_pdf.py's manifest row for ONE already-uploaded
+    file by its exact destination_gcs_uri (same join key convention as
+    query_pdf_quality_route()/query_pdf_calibration_profile()). Returns a
+    dict with at least needs_review_reason and source_page_range, or None
+    if no row exists yet for this file, or the query fails for any reason -
+    a soft, optional dependency like this file's other manifest-adjacent
+    lookups, never something to raise on.
+
+    fallback_gcs_uris, when given, are tried in order if the exact gcs_uri
+    finds nothing - for a NEEDS_REVIEW file renamed to move its
+    "_pages_{range}" token to the end of the name (two real, confirmed
+    naming schemes existed before that fix: "..._TPS_{tps}_NEEDS_REVIEW.pdf"
+    with no page token at all, and "..._pages_{range}_TPS_{tps}_NEEDS_
+    REVIEW.pdf" with it up front), this lets the caller pass the file's
+    possible pre-rename names and still find its manifest row."""
+    from google.cloud import bigquery
+
+    def _run(candidate_uri: str):
+        query = f"""
+            SELECT needs_review_reason, source_page_range
+            FROM `{bq_project}.{bq_dataset}.{manifest_table}`
+            WHERE destination_gcs_uri = @gcs_uri
+            ORDER BY moved_at DESC
+            LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("gcs_uri", "STRING", candidate_uri)]
+        )
+        return list(bq_client.query(query, job_config=job_config).result())
+
+    try:
+        rows = _run(gcs_uri)
+        if not rows:
+            for candidate in fallback_gcs_uris or []:
+                if candidate == gcs_uri:
+                    continue
+                rows = _run(candidate)
+                if rows:
+                    status(
+                        "[MANIFEST] No pdf_manifest_list row matched %s exactly - fell back to "
+                        "its pre-rename name %s.",
+                        gcs_uri, candidate,
+                    )
+                    break
+    except Exception as e:  # noqa: BLE001 - soft dependency, see docstring
+        err("[MANIFEST] Could not query %s.%s.%s for %s: %s", bq_project, bq_dataset, manifest_table, gcs_uri, e)
+        return None
+    if not rows:
+        return None
+    return dict(rows[0].items())
 
 
 def _calibrated_rects_for_question(
@@ -1155,69 +1249,17 @@ def ensure_and_maybe_seed_pipeline_config(bq_client, project: str, dataset: str,
 # needed; not implemented here since only one production template has been
 # confirmed so far.
 # ==========================================================================
-GROUP_HEADERS = {}  # no grouped "big question -> lettered sub-items" structure in this template
-
-_SIX_POINT_SCALE = "Strongly Agree / Agree / I am Neutral / Disagree / Strongly Disagree / Not Applicable"
-# Q23 uses the same 6-point scale but the form prints its last choice as the
-# abbreviation "N/A" (like Q20 already did), NOT the spelled-out "Not
-# Applicable" used by the Q1-18 grid's column header. Confirmed against the
-# real Nov10_1.pdf scan - this was a real data bug: the wrong reference label
-# here caused the model to answer "Not Applicable" (matching our WRONG prompt
-# text) even when it correctly identified the mark's position (6).
-_SIX_POINT_SCALE_NA = "Strongly Agree / Agree / I am Neutral / Disagree / Strongly Disagree / N/A"
-_MULTI_SELECT_NOTE = " (mark all that apply — more than one choice may be marked)"
-
-# (question_number, group_key_or_None, question_text, choices)
-SURVEY_QUESTIONS = [
-    # --- form header / admin fields (not numbered on the form itself) ---
-    ("H1", None, "Home Unit CalOMS Provider ID", "written ID number"),
-    ("H2", None, "Program Reporting Unit (Address) code", "written alphanumeric code"),
-    ("H3", None, "Setting", "Early Intervention / OP/IOP / Residential / OTP/NTP / Detox/WM / Recovery Services"),
-    ("H4", None, "Field Based Services: Agency", "written agency name, if filled in"),
-    ("H5", None, "Field Based Services: Address", "written address, if filled in"),
-    ("H6", None, "Today's Date (the respondent's own written completion date on the form, MM/DD/YYYY)", "written date"),
-    # --- Q1-18: single-select 6-point agreement scale ---
-    ("1", None, "The location was convenient (public transportation, distance, parking, etc.).", _SIX_POINT_SCALE),
-    ("2", None, "Services were available when I needed them.", _SIX_POINT_SCALE),
-    ("3", None, "I chose the early intervention/treatment/recovery goals with my provider's help.", _SIX_POINT_SCALE),
-    ("4", None, "Staff gave me enough time in my early intervention/treatment/recovery sessions.", _SIX_POINT_SCALE),
-    ("5", None, "Staff treated me with respect.", _SIX_POINT_SCALE),
-    ("6", None, "Staff spoke to me in a way I understood.", _SIX_POINT_SCALE),
-    ("7", None, "Staff were sensitive to my cultural background (race/ethnicity, religion, language, etc.).", _SIX_POINT_SCALE),
-    ("8", None, "I felt welcomed here.", _SIX_POINT_SCALE),
-    ("9", None, "As a direct result of the services I am receiving, I am better able to do things that I want to do.", _SIX_POINT_SCALE),
-    ("10", None, "As a direct result of the services I am receiving, I feel less craving for drugs and alcohol.", _SIX_POINT_SCALE),
-    ("11", None, "Staff here work with my physical health care providers to support my wellness.", _SIX_POINT_SCALE),
-    ("12", None, "Staff here work with my mental health care providers to support my wellness.", _SIX_POINT_SCALE),
-    ("13", None, "Staff here helped me to connect with other services as needed (social services, housing, etc.).", _SIX_POINT_SCALE),
-    ("14", None, "Overall, I am satisfied with the services I received.", _SIX_POINT_SCALE),
-    ("15", None, "I was able to get all the help/services that I needed.", _SIX_POINT_SCALE),
-    ("16", None, "I would recommend this agency to a friend or family member.", _SIX_POINT_SCALE),
-    ("17", None, "I feel comfortable discussing any lapses or return to substance use with my provider.", _SIX_POINT_SCALE),
-    ("18", None, "I began substance use treatment services with the goal of achieving either complete abstinence or reduction in use.", _SIX_POINT_SCALE),
-    ("19", None, "Now thinking about the services you received, how much of it was by telehealth (by telephone or video-conferencing)?", "None / Very little / About half / Almost all / All"),
-    ("20", None, "How helpful were your telehealth visits compared to traditional in-person visits?", "Much better / Somewhat better / About the same / Somewhat worse / N/A"),
-    ("21", None, "When you entered the treatment program, did the program staff offer you a copy of the patient handbook or show you where you can find it?", "Yes / No"),
-    ("22", None, "Did the program staff show you the patient orientation video?", "Yes / No"),
-    ("23", None, "Watching the patient orientation video helped me with information I can use to access all available substance use disorder services.", _SIX_POINT_SCALE_NA),
-    ("24", None, "Comment: What was most helpful about this program? What would you change about this program?", "open text (respondent instructed not to identify themselves)"),
-    ("25", None, "How long have you received services here?", "First visit/day / 2 weeks or less / More than 2 weeks but less than 4 weeks / 4 weeks or more"),
-    ("26", None, "Age", "written number"),
-    ("27", None, "Are you homeless?", "Yes / No"),
-    ("28", None, "Have you ever received Contingency Management services?", "Yes, I am currently receiving Contingency Management services / Yes, I received Contingency Management services in the past / No, I have never received Contingency Management services"),
-    ("29", None, "What is your current gender identity (this is how the respondent identifies themselves, which may not match sex assigned at birth)?", "Male / Female / Female-to-Male (FTM)/Transgender Male/Trans Man / Male-to-Female (MTF)/Transgender Female/Trans Woman / Gender Queer/Gender Non-Conforming / Other (specify) / Prefer not to state"),
-    ("30", None, "What was your sex at birth?", "Female / Male / Other (specify) / Prefer not to state"),
-    ("31", None, "What is your sexual orientation?", "Heterosexual/Straight / Lesbian (Female) / Gay (Male) / Bisexual / Unsure/Questioning/Don't know / Pansexual / Asexual / Queer / Other (specify) / Prefer not to state"),
-    ("32", None, "Are you of Mexican/Hispanic/Latino/a descent?", "Yes / No / Unknown"),
-    ("33", None, "Race/Ethnicity" + _MULTI_SELECT_NOTE, "American Indian/Alaskan Native / Asian / Black/African American / Native Hawaiian/Pacific Islander / White/Caucasian / Other (specify) / Prefer not to state"),
-    ("34", None, "Disability Status" + _MULTI_SELECT_NOTE, "Physically Disabled / Visually Impaired/Blind / Hearing Impaired/Deaf / Co-occurring Mental Health Condition / Developmentally or Intellectually Disabled / Other (specify) / None"),
-    ("35", None, "What is your criminal justice involvement status?", "Post-release Community Supervision (AB109) or on Probation from any federal, state, or local jurisdiction / Awaiting trial, charges or sentencing / On parole from any other jurisdiction / Any other criminal justice involvement / No criminal justice involvement"),
-]
+# The survey's questions, answer choices, and answer-checking rules now live
+# in pipeline_config.py (the shared source of truth across step1-step6) -
+# this is the one place to edit when porting to a different survey PDF. See
+# pipeline_config.py's own comments for what each of these means.
+GROUP_HEADERS = pipeline_config.GROUP_HEADERS
+SURVEY_QUESTIONS = pipeline_config.SURVEY_QUESTIONS
 
 # Questions where more than one choice can legitimately be marked at once —
 # used both in the extraction prompt and available for any downstream
 # validation that expects everything else to be single-valued.
-MULTI_SELECT_QUESTION_NUMBERS = {"33", "34"}
+MULTI_SELECT_QUESTION_NUMBERS = pipeline_config.MULTI_SELECT_QUESTION_NUMBERS
 
 # Q31-34 (sexual orientation, Mexican/Hispanic/Latino descent, race/ethnicity,
 # disability status): the model's own reading is kept as authoritative over
@@ -1253,10 +1295,7 @@ MULTI_SELECT_QUESTION_NUMBERS = {"33", "34"}
 # bugs, to extend the same "surface disagreement via needs_review instead
 # of auto-applying the pixel reading" policy across the whole range rather
 # than question-by-question as each new failure gets reported.
-MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS = {
-    "19", "20", "21", "22", "23", "25", "27", "28", "29", "30",
-    "31", "32", "33", "34", "35",
-}
+MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS = pipeline_config.MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS
 
 # --------------------------------------------------------------------------
 # CHOICE_LISTS_BY_NUMBER: for every question whose `choices` field is a fixed
@@ -1329,8 +1368,27 @@ WRITTEN_TEXT_QUESTION_NUMBERS = {
 # open comment) can legitimately span multiple words/lines, so they're
 # compared against Vision's FULL page transcription as a whole instead,
 # looking for the model's answer as a close contiguous match anywhere in it.
-_VISION_TOKEN_FIELDS = {"H1", "H2", "26"}
-_VISION_FREEFORM_FIELDS = {"H4", "H5", "H6", "24"}
+_VISION_TOKEN_FIELDS = pipeline_config._VISION_TOKEN_FIELDS
+_VISION_FREEFORM_FIELDS = pipeline_config._VISION_FREEFORM_FIELDS
+
+# Explicit user request ("what about I tell cloud vision that question 26
+# has 2 digits"): Cloud Vision is a plain OCR API with no prompt input, so
+# there's no way to literally steer its handwriting recognition ahead of
+# time the way build_extraction_prompt() steers the model. What CAN be
+# done instead is telling THIS module, after the fact, how many boxed
+# digit cells this field's own printed layout has - confirmed directly
+# against two real scans (2025_Nov_23_5_TPS_4034.pdf/TPS_4036.pdf): Q26
+# ("Age") always prints exactly 2 boxed digit cells. Both real files
+# showed Cloud Vision's OCR simply FAILING to transcribe one or both
+# handwritten digits at all (0 or 1 word tokens found near the label,
+# never a wrong digit - a genuine handwriting-recognition miss, not a
+# misread), so found_digits in cross_check_written_field_with_vision()
+# came back shorter than this known cell count. That's not meaningful
+# signal to disagree with the model on - it's Cloud Vision failing to
+# read the field at all, not reading it differently - so a found_digits
+# count below this known minimum is treated as "no independent signal"
+# (match=None) rather than "disagree" (match=False).
+_WRITTEN_FIELD_EXPECTED_DIGITS = {"26": 2}
 
 # Revision 29 follow-up (explicit user request: "H4 and H5 doesn't need to
 # be marked as need review if it's blank"). H4 (agency/program name) and H5
@@ -1339,7 +1397,7 @@ _VISION_FREEFORM_FIELDS = {"H4", "H5", "H6", "24"}
 # blank-answer-always-needs-review backstop in answers_to_qa_rows() only;
 # every other check (format validation, vision disagreement, etc.) still
 # applies to them normally.
-_BLANK_ANSWER_EXEMPT_FIELDS = {"H4", "H5"}
+_BLANK_ANSWER_EXEMPT_FIELDS = pipeline_config._BLANK_ANSWER_EXEMPT_FIELDS
 
 # Revision 29 (explicit user request: "H2 and H6 should have the Vision OCR
 # rule over the Vision model, because I think Vision OCR has been capturing
@@ -1358,7 +1416,18 @@ _BLANK_ANSWER_EXEMPT_FIELDS = {"H4", "H5"}
 # H5 added in this revision (explicit user request: "H5. Field Based
 # Services: Address (This one should have vision OCR rule over model)") -
 # same rationale as H2/H6, extended to the third header-row written field.
-_VISION_AUTHORITATIVE_FIELDS = {"H2", "H5", "H6"}
+#
+# H6 REMOVED (explicit user request, later revision): H6's boxed-digit grid
+# is exactly the layout Vision's own OCR struggles with (adjacent single-
+# digit boxes get merged/split/dropped), and a real case surfaced this -
+# Vision's anchored reading came back "10212015" (an extra/dropped digit)
+# while the model's own reading, "10/21/2025", was correct per the model's
+# stated account of the handwriting. H6 is now model-authoritative again,
+# like every other written-text field: the model's answer is kept, and
+# Vision is only consulted for the ordinary cross-check/disagreement flag
+# (see cross_check_written_field_with_vision()), not to overrule it
+# outright.
+_VISION_AUTHORITATIVE_FIELDS = pipeline_config._VISION_AUTHORITATIVE_FIELDS
 
 
 def _format_vision_authoritative_value(question_number: str, anchored_value: str) -> Optional[str]:
@@ -1391,6 +1460,12 @@ def _format_vision_authoritative_value(question_number: str, anchored_value: str
         digits = "".join(ch for ch in anchored_value if ch.isdigit())
         if len(digits) != 8:
             return None
+        # Explicit user request: month can't be >12, day can't be >31 - an
+        # impossible MM/DD means the digit-box reconstruction itself
+        # misread/misaligned a box, so decline rather than format garbage
+        # into a fake-valid-looking date (see _is_plausible_mmdd()).
+        if not _is_plausible_mmdd(digits[0:2], digits[2:4]):
+            return None
         return f"{digits[0:2]}/{digits[2:4]}/{digits[4:8]}"
     return None
 
@@ -1405,7 +1480,7 @@ def _format_vision_authoritative_value(question_number: str, anchored_value: str
 # page 1" - true for five of the seven, but not 24/26, so Vision's page-1-only
 # OCR could never contain either of their answers, guaranteeing a false
 # "no matching token/text found" disagreement on every single file for both.
-_WRITTEN_TEXT_QUESTION_PAGE = {"H1": 0, "H2": 0, "H4": 0, "H5": 0, "H6": 0, "24": 1, "26": 1}
+_WRITTEN_TEXT_QUESTION_PAGE = pipeline_config._WRITTEN_TEXT_QUESTION_PAGE
 
 # Deterministic format validation for the two written-text fields with a
 # well-defined, unambiguous printed format: H1 (Home Unit CalOMS Provider
@@ -1467,6 +1542,19 @@ def _validate_written_field_format(number: str, answer: str) -> Optional[str]:
             return (
                 f"H6 (Today's Date) should be a date in MM/DD/YYYY format, but the "
                 f"reported answer {answer!r} doesn't parse as one - re-check the "
+                "respondent's own written completion date on the form."
+            )
+        # Every form in this batch was filled out in REPORT_YEAR (see that
+        # constant's own comment) - a parsed year that doesn't match is
+        # guaranteed to be either a misread digit (most likely) or a
+        # genuinely unusual form, either way worth a human glance. This is
+        # a SEPARATE check from the parseability check above: a date can be
+        # perfectly well-formed (e.g. "10/21/2015") and still fail this one.
+        if str(parsed.year) != REPORT_YEAR:
+            return (
+                f"H6 (Today's Date) parsed as {answer!r}, but the year "
+                f"{parsed.year} doesn't match this batch's expected year "
+                f"({REPORT_YEAR}) - likely a misread digit, re-check the "
                 "respondent's own written completion date on the form."
             )
     return None
@@ -1842,6 +1930,35 @@ class QARow:
     # "quality route forced this file for review" branch below), so this column lets a BigQuery
     # query distinguish "flagged because the upstream classifier already knew this scan was
     # questionable" from every other, question-specific reason recorded in review_note.
+    destination_gcs_uri: str = ""  # this file's own gs:// URI - the same value step1_merge_pdf.py
+    # recorded as destination_gcs_uri in pdf_manifest_list for this file, repeated here so a survey_
+    # responses row can be joined back to its manifest row (and its source PDF) without a separate lookup.
+    source_page_range: str = ""  # e.g. "5-6" - which pages inside this survey's ORIGINAL combined
+    # source PDF this file's survey unit occupies. "" when unknown. Parsed from the file name's
+    # trailing "_pages_{range}.pdf" (see step1_merge_pdf.py's split_combined_pdf()) when present,
+    # else looked up from pdf_manifest_list's source_page_range for this file - see
+    # _build_needs_review_row().
+    survey_link: str = ""  # SURVEY_LINK_BASE_URL + file_name with its ".pdf" extension stripped
+    # (e.g. "http://localhost:8080/surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2") -
+    # a direct link to this survey in the review UI. Populated on every row.
+    # NOTE: correct_answer/updated_with_feedback/feedback_updated_time are NOT columns here -
+    # they only exist in BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK (see BQ_SURVEY_RESPONSES_
+    # WITH_FEEDBACK_SCHEMA and sync_survey_responses_with_feedback()), which is kept in sync
+    # FROM this table (by step6_load_feedback.py) rather than this table carrying feedback
+    # state itself.
+
+
+# The calendar year this survey batch was collected in (explicit user
+# request, after H6 - "Today's Date" - was misread with the wrong year on a
+# real scan: Cloud Vision's own boxed-digit OCR read "10212015" where the
+# actual handwriting was "10/21/2025", a plausible single-digit OCR slip in
+# the last box). Every date the respondent could plausibly have written on
+# this batch of forms falls in this year, so it's fed to the model as a
+# known anchor for reading H6 (see rule 16 below) rather than something the
+# model has to infer purely from ambiguous handwriting. Change this between
+# batches if a future run covers forms filled out in a different year -
+# nothing else in this module derives the year from anywhere else.
+REPORT_YEAR = "2025"
 
 
 def build_extraction_prompt() -> str:
@@ -1861,7 +1978,36 @@ def build_extraction_prompt() -> str:
         "mark bleeding over from a neighboring row or question, or handwriting "
         "that belongs to a different question. If you cannot point to actual ink "
         "touching or inside that specific choice's own box/circle, it is not "
-        "marked.",
+        "marked. The STANDARD for counting is presence of ink, not how bold it "
+        "is: a thin, light, or faint pen stroke - even a single quick diagonal "
+        "line barely touching the box - counts exactly the same as a heavy, "
+        "dark X, as long as it is clearly an intentional mark shape (an X, "
+        "checkmark, slash, or circle-fill) and not a smudge, shadow, or stray "
+        "line. Different respondents press harder or lighter with the same pen; "
+        "a real answer drawn lightly is still a real answer. Do not require a "
+        "mark to look as dark or thick as marks on other questions on the same "
+        "page before counting it. Some respondents draw a CHECKMARK whose "
+        "long upstroke overshoots well past its own box, continuing through "
+        "one or more of the NEXT choices' boxes in that same row (and "
+        "sometimes into the row above) before it ends - this reads as ink "
+        "in more than one box, but it is still ONE mark for ONE choice. The "
+        "checkmark's short hook/corner stroke (the small 'v' bend where the "
+        "line changes direction) sits INSIDE the box of the choice actually "
+        "being marked; the long trailing line after that bend is only the "
+        "pen's follow-through and does NOT mark whatever box it happens to "
+        "cross afterward. When you see this pattern, report the choice whose "
+        "box contains the hook/bend, never a choice whose box the tail "
+        "merely passes through on its way out. One more exception to the "
+        "bleed-over exclusion above: a single diagonal line/slash that "
+        "clearly passes THROUGH one specific choice's own box, but then "
+        "continues past the "
+        "box's edge into that choice's own label text (not into a DIFFERENT "
+        "row or question), is still a real mark for that box, not bleed-over "
+        "- a respondent's single stroke commonly overshoots past the box into "
+        "its own label. Before applying this exception, check every other "
+        "choice in the SAME question for its own separate, contained mark; "
+        "if none of them has one, mark this box as the answer instead of "
+        "treating the overshooting line as ink to ignore.",
         "2. For single-select checkbox questions, look at every choice listed for "
         "that question and report exactly one that satisfies rule 1.",
         "3. Do NOT default to the last-listed choice (e.g. \"Not Applicable\", "
@@ -1961,13 +2107,40 @@ def build_extraction_prompt() -> str:
         "to whatever else \"reasoning\" already says - this is what your "
         "\"confidence\" score in rule 15 should be based on, so naming the "
         "actual condition (rather than just a low number) is what lets a human "
-        "reviewer know exactly what to look for on the page.",
+        "reviewer know exactly what to look for on the page. When you conclude "
+        "NO box/circle is marked, a one-line \"No box is marked\" is NOT enough "
+        "- go through EVERY choice in that question one at a time in "
+        "\"reasoning\" and say what you saw at each one, e.g. \"checked all 5 "
+        "boxes: Post-release/Awaiting trial/On parole/No criminal justice all "
+        "have clean empty outlines with no ink; the box for 'Any other...' has "
+        "a faint gray diagonal line crossing through it that continues past "
+        "the box into the label text, which I judged as bleed-over/stray ink "
+        "rather than an intentional mark for that box\" - even if you decide "
+        "that faint or stray-looking ink doesn't count as a mark, SAY that "
+        "you saw it and why you excluded it, rather than omitting it. A "
+        "reviewer reading \"nothing marked\" needs to be able to tell whether "
+        "you looked at every box and genuinely found none of them inked, or "
+        "whether you noticed something ambiguous and discounted it.",
         "12. Report \"mark_position\": for a single-select question, the one "
         "number decided in rule 10 (as a string, e.g. \"6\"). For a multi-select "
         f"question ({multi_select_list}), every marked position, comma-separated "
         'in the same order as your "answer" choices (e.g. "1,5"). Use "" for '
         "open-text/write-in questions (no choices list) or when nothing is "
-        "marked. Count positions using ONLY the choices listed for that "
+        "marked. When a question's own (choices: ...) list below is already "
+        "NUMBERED (e.g. \"choices: 1=Much better, 2=Somewhat better, ..., "
+        "5=N/A\"), that number IS mark_position - look up the number printed "
+        "next to whichever choice text matches your \"answer\", and report "
+        "that number exactly. Do NOT re-derive the position by counting "
+        "boxes/circles on the page image yourself - a real, confirmed "
+        "failure mode reported an answer of \"N/A\" (correctly matching the "
+        "5th and LAST listed choice, 5=N/A) together with mark_position "
+        "\"6\", on a question with only 5 printed boxes total, because the "
+        "position was counted visually from the image instead of read from "
+        "the given numbering - counting boxes on a scan is exactly the kind "
+        "of miscount (an extra phantom box, a neighboring question's row "
+        "bleeding into the count) this numbered list exists to avoid. Only "
+        "for the rare choices list that is NOT pre-numbered do you count "
+        "positions yourself, using ONLY the choices listed for that "
         "question in the (choices: ...) list below, in that exact order - "
         "position 1 is the first listed choice, position 2 the second, and "
         "so on, with no gaps. An \"(specify)\" choice's own blank "
@@ -1978,7 +2151,19 @@ def build_extraction_prompt() -> str:
         "page.",
         "13. \"answer\" and \"mark_position\" must describe the SAME choice - "
         "double-check them against each other, and against \"reasoning\", before "
-        "responding.",
+        "responding. If the question's (choices: ...) list is numbered, this "
+        "check is simple: the number next to your \"answer\" choice IN THAT "
+        "LIST must equal \"mark_position\" exactly (rule 12) - if it doesn't, "
+        "you counted the position yourself instead of reading it from the "
+        "list; fix \"mark_position\" to match the list's own number, never "
+        "the other way around. \"answer\" and \"mark_position\" are two "
+        "DIFFERENT things and must never hold the same kind of value: "
+        "\"mark_position\" is always the bare number (e.g. \"4\"); \"answer\" "
+        "is always the choice's actual TEXT as printed on the form (e.g. "
+        "\"Almost all\"), never a number, even for a question whose (choices: "
+        "...) list happens to be numbered. If you catch yourself about to "
+        "write a plain digit into \"answer\", that is always wrong - go back "
+        "and write that choice's real printed text instead.",
         "14. Return ONLY a JSON array, one object per question, with exactly "
         'these keys in this order: "question_number", "reasoning", '
         '"mark_position", "answer", "confidence". No extra commentary outside '
@@ -2004,12 +2189,20 @@ def build_extraction_prompt() -> str:
         "wrote: H1 (Home Unit CalOMS Provider ID) must be exactly 6 digits, "
         "read digit-by-digit from its 6 boxed cells, with no letters, spaces, "
         "or punctuation (e.g. \"196697\"). H6 (Today's Date) must be a calendar "
-        "date in MM/DD/YYYY format (e.g. \"09/04/2026\"). If, after a careful "
-        "second look, the handwriting genuinely does not support the expected "
-        "format (e.g. fewer than 6 digits are actually legible, or part of the "
-        "date is missing/illegible), report exactly what you can actually read "
-        "and lower \"confidence\" (rule 15) accordingly - never invent an extra "
-        "digit or a date component just to force the format to match.",
+        f"date in MM/DD/YYYY format (e.g. \"09/04/{REPORT_YEAR}\"), and the YYYY "
+        f"component should almost always read as {REPORT_YEAR} - every form in "
+        f"this batch was filled out in {REPORT_YEAR}. Use {REPORT_YEAR} as a "
+        "known anchor when the written year digits are ambiguous (e.g. a "
+        "handwritten digit that could be a 5 or an 8/0/6): prefer the reading "
+        f"that produces {REPORT_YEAR} over one that doesn't, UNLESS the ink "
+        f"clearly and unambiguously spells out a different year - never force "
+        f"{REPORT_YEAR} over genuinely clear handwriting that says otherwise. "
+        "If, after a careful second look, the handwriting genuinely does not "
+        "support the expected format (e.g. fewer than 6 digits are actually "
+        "legible, or part of the date is missing/illegible), report exactly "
+        "what you can actually read and lower \"confidence\" (rule 15) "
+        "accordingly - never invent an extra digit or a date component just to "
+        "force the format to match.",
         "",
         "Questions:",
     ]
@@ -2041,6 +2234,53 @@ def get_extraction_prompt() -> str:
     if _EXTRACTION_PROMPT is None:
         _EXTRACTION_PROMPT = build_extraction_prompt()
     return _EXTRACTION_PROMPT
+
+
+def build_calibration_reference_note(calibration_profile: Optional[dict]) -> str:
+    """Turns THIS file's own measured ink-density calibration (ink_blank_hi/
+    ink_mark_lo/ink_gap/ink_quality - see step2_pdf_calibration.py's per-file
+    ink clustering, query_pdf_calibration_profile()'s docstring) into a short
+    per-file addendum to the extraction prompt, so the model has a concrete,
+    file-specific standard for "how faint can a real mark be on THIS scan"
+    instead of only the generic rule 1 guidance (which applies the same way
+    to every file regardless of how lightly or heavily this particular
+    respondent's pen inked the page).
+
+    ink_blank_hi/ink_mark_lo are both on the SAME 0-1 ink-coverage scale the
+    pixel detectors themselves use (fraction of a checkbox's interior that's
+    dark ink) - genuinely blank boxes on this file topped out at ink_blank_hi,
+    genuinely marked boxes started at ink_mark_lo. Telling the model both
+    numbers directly grounds "faint mark" in this file's own real ink
+    measurements rather than a comparison to how bold OTHER marks on the same
+    page happen to look - the actual failure mode that missed a real, but
+    thin, mark: an X/checkmark right at or below ink_mark_lo can still look
+    unmarked next to a bold neighboring X, even though it's well inside this
+    file's own real marked-choice range.
+
+    Returns "" (no addendum) when calibration_profile is None or is missing
+    both floors - same soft-hint convention as every other calibration_
+    profile consumer in this file: never required, never itself a source of
+    needs_review."""
+    if not calibration_profile:
+        return ""
+    blank_hi = calibration_profile.get("ink_blank_hi")
+    mark_lo = calibration_profile.get("ink_mark_lo")
+    if blank_hi is None and mark_lo is None:
+        return ""
+    parts = [
+        "CALIBRATION REFERENCE FOR THIS SPECIFIC SCAN: an automated pixel measurement of "
+        "this file's own checkbox ink levels (0.0 = pure white, 1.0 = fully solid black) found:"
+    ]
+    if blank_hi is not None:
+        parts.append(f"- boxes this respondent left BLANK on this scan measured up to {blank_hi:.2f} ink coverage.")
+    if mark_lo is not None:
+        parts.append(f"- boxes this respondent actually MARKED on this scan measured at least {mark_lo:.2f} ink coverage.")
+    parts.append(
+        "Use this as a per-file reference standard, not just a comparison to other marks on this same "
+        "page: a mark at or above the measured marked-floor above is a real, intentional mark under rule "
+        "1 even if it looks much lighter or thinner than other marks elsewhere on this scan."
+    )
+    return " ".join(parts)
 
 
 _VERTEX_INITIALIZED = False
@@ -2284,7 +2524,9 @@ def _group_consecutive_positions(positions: list, max_gap: int = 3) -> list:
     return [int(sum(g) / len(g)) for g in groups]
 
 
-def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) -> dict:
+def detect_checkbox_grid_answers(
+    page_png_bytes: bytes, dpi: int = _RENDER_DPI, calibration_profile: Optional[dict] = None
+) -> dict:
     """Deterministic, non-LLM reading of the Treatment Perceptions Survey's
     main checkbox grid (questions 1-18, the 6-point agreement scale table on
     page 1) directly from the rendered page image, using OpenCV to find the
@@ -2408,6 +2650,16 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
     H, W = img.shape
     _, binary = cv2.threshold(img, _INK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
 
+    cal_dx = 0.0
+    cal_dy = 0.0
+    if calibration_profile:
+        raw_dx = calibration_profile.get("offset_dx_p1")
+        raw_dy = calibration_profile.get("offset_dy_p1")
+        if isinstance(raw_dx, (int, float)):
+            cal_dx = float(raw_dx)
+        if isinstance(raw_dy, (int, float)):
+            cal_dy = float(raw_dy)
+
     # --- 1. full-width horizontal lines -> row candidates ---
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(int(60 * scale), 10), 1))
     h_lines = cv2.dilate(cv2.erode(binary, h_kernel), h_kernel)
@@ -2506,6 +2758,19 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
     if len(best_run) < 19:
         peaks48 = [y for y in range(H) if row_sums[y] > W * 0.48]
         lines48 = _group_consecutive_positions(peaks48) if peaks48 else []
+
+        # Multi-line faint line gap recovery: find a chain of faint lines c_1..c_k between curr_y and target_y
+        def _find_gap_chain(curr_y, target_y, remaining):
+            if low <= (target_y - curr_y) <= high:
+                return []
+            for idx, c in enumerate(remaining):
+                step = c - curr_y
+                if low <= step <= high:
+                    sub = _find_gap_chain(c, target_y, remaining[idx + 1:])
+                    if sub is not None:
+                        return [c] + sub
+            return None
+
         if len(lines48) >= 2:
             augmented = [lines48[0]]
             for y in lines48[1:]:
@@ -2516,10 +2781,10 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
                         yy for yy in range(int(prev) + 10, int(y) - 10)
                         if row_sums[yy] > W * _GRID_FAINT_LINE_FLOOR
                     ]
-                    for candidate in (_group_consecutive_positions(faint_peaks) if faint_peaks else []):
-                        if low <= (candidate - prev) <= high and low <= (y - candidate) <= high:
-                            augmented.append(candidate)
-                            break
+                    candidates = (_group_consecutive_positions(faint_peaks) if faint_peaks else [])
+                    chain = _find_gap_chain(prev, y, candidates)
+                    if chain:
+                        augmented.extend(chain)
                 augmented.append(y)
             recovered_run = []
             best3, cur3 = [], [augmented[0]]
@@ -2535,6 +2800,31 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
             recovered_run = best3
             if len(recovered_run) >= 19:
                 best_run = recovered_run
+
+        # If lines48 still didn't reach 19 lines (e.g. scans where almost all lines were faint or lines48 ended early),
+        # forward-chain directly through all detected lines at faint floors
+        if len(best_run) < 19:
+            for floor in (_GRID_FAINT_LINE_FLOOR, 0.20):
+                start_cands = [y for y in range(int(850 * scale), int(960 * scale)) if row_sums[y] > W * (floor + 0.05)]
+                start_lines = _group_consecutive_positions(start_cands) if start_cands else []
+                all_peaks = [y for y in range(H) if row_sums[y] > W * floor]
+                all_lines = _group_consecutive_positions(all_peaks) if all_peaks else []
+                best_chain = []
+                for s in start_lines:
+                    chain = [s]
+                    curr = s
+                    while True:
+                        cands = [y for y in all_lines if low <= y - curr <= high]
+                        if not cands:
+                            break
+                        best_cand = max(cands, key=lambda y: row_sums[y])
+                        chain.append(best_cand)
+                        curr = best_cand
+                    if len(chain) > len(best_chain):
+                        best_chain = chain
+                if len(best_chain) >= 19:
+                    best_run = best_chain
+                    break
 
     # --- 2c. checkbox-glyph row anchoring (Revision 36). Reported on 3 real
     # files from a newer print run (footer reads "Revised 9/16/25, (Adult) -
@@ -2656,6 +2946,45 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
     fallback_half = max(int(20 * scale), 6)
     size_tolerance = 14 * scale
 
+    # Explicit user request: same "tight ink_gap" relaxation already applied
+    # to the yesno list-anchor shift-corroboration check (see that function's
+    # calibration_profile comment, 2025_Nov_23_7_TPS_2969.pdf) - this file's
+    # OWN measured ink_blank_hi/ink_mark_lo/ink_gap, when its calibration
+    # profile flags "tight", is a stronger, file-specific signal than the
+    # fixed global _GRID_BLANK_INK_FLOOR (0.15) for deciding whether a grid
+    # row's best column is genuinely blank. Only ever LOWERS the floor (never
+    # raises it above the module default), and only when this file's own
+    # ink_blank_hi is measurably below that default - a lighter-inked mark on
+    # a tight-gap scan can otherwise read as "blank" here even though the
+    # respondent did mark it. None (no profile, or ink_quality isn't
+    # "tight") keeps the exact original global-constant behavior.
+    grid_blank_floor = _GRID_BLANK_INK_FLOOR
+    if calibration_profile and calibration_profile.get("ink_quality") == "tight":
+        ink_blank_hi = calibration_profile.get("ink_blank_hi")
+        if ink_blank_hi is not None:
+            grid_blank_floor = min(_GRID_BLANK_INK_FLOOR, max(0.08, ink_blank_hi + 0.03))
+
+    # Explicit user request (2025_Nov_23_5_TPS_4051.pdf's Q2: model correctly
+    # read "Strongly Agree" - a real checkmark was drawn - but pixel called
+    # the row blank): grid_blank_floor above was validated against rows that
+    # are GENUINELY blank (measured 0.0548-0.0608 - see _GRID_BLANK_INK_
+    # FLOOR's own docstring) and confirmed instances where treating anything
+    # under it as blank is safe. TPS_4051's Q2 instead measured 0.1165 -
+    # visually confirmed to be a real checkmark whose long upstroke was
+    # drawn escaping the box's own printed border, leaving only its short
+    # initial tick inside the measured window - much closer to
+    # grid_blank_floor itself than to a genuine blank's near-zero reading,
+    # not the same "confidently nothing here" signal. Splitting the single
+    # floor in two: a row only auto-overrides to blank when it clears this
+    # STRICTER, validated-blank sub-floor (still forces needs_review either
+    # way, same as every other pixel-blank override here); a row between
+    # this and the original grid_blank_floor is genuinely ambiguous (could
+    # be a real, imprecisely-drawn mark, same spirit as detect_yesno_box_
+    # answers()'s own ambiguous flag) - it keeps the model's own reading and
+    # is flagged for a human to confirm, rather than silently overridden.
+    # Never guess either way.
+    grid_confident_blank_floor = max(0.05, grid_blank_floor - 0.05)
+
     results = {}
     for i in range(18):
         ry0, ry1 = grid_rows[i] + 3, grid_rows[i + 1] - 3  # skip past the row's own ruled boundary lines
@@ -2664,9 +2993,9 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
         found_boxes = []  # one entry per column: a located (x0,x1,y0,y1) box, or None
         offsets = []  # (located center - calibrated center) for columns that WERE located
         for cx in _GRID_COLUMN_CENTERS:
-            cx = cx * scale
+            cx_cal = (cx + cal_dx) * scale
             found = _locate_checkbox(
-                binary, ry0, ry1, int(cx - pad), int(cx + pad),
+                binary, ry0, ry1, int(cx_cal - pad), int(cx_cal + pad),
                 scale=scale, expected_w=exp_size, expected_h=exp_size,
             )
             if found is not None:
@@ -2674,7 +3003,7 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
                 if abs((fx1 - fx0) - exp_size) > size_tolerance or abs((fy1 - fy0) - exp_size) > size_tolerance:
                     found = None
             if found is not None:
-                offsets.append(((found[0] + found[1]) / 2) - cx)
+                offsets.append(((found[0] + found[1]) / 2) - cx_cal)
             found_boxes.append(found)
 
         # This row's own consistent x-offset from the shared calibration (0.0 if every
@@ -2694,9 +3023,9 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
                 # the border to be traceable, and a mark heavy enough to defeat
                 # border-tracing reads unambiguously high in it regardless of the
                 # window being a few px off from the box's true edges.
-                fcx = cx * scale + row_offset
+                fcx = (cx + cal_dx) * scale + row_offset
                 boxes.append((int(fcx - fallback_half), int(fcx + fallback_half), int(cy - fallback_half), int(cy + fallback_half)))
-                borders.append(max(int(4 * scale), 2))  # wider exclusion - this window isn't guaranteed tightly centered
+                borders.append(max(int(6 * scale), 3))  # wider exclusion - this window isn't guaranteed tightly centered
 
         densities = [_checkbox_ink_ratio(binary, b, border=bd) for b, bd in zip(boxes, borders)]
 
@@ -2763,7 +3092,7 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
             non_overdense_order = sorted(non_overdense, key=lambda k: -densities[k])
             has_real_alternative = (
                 len(non_overdense_order) >= 2
-                and densities[non_overdense_order[0]] >= _GRID_BLANK_INK_FLOOR
+                and densities[non_overdense_order[0]] >= grid_blank_floor
                 and (densities[non_overdense_order[0]] - densities[non_overdense_order[1]]) >= _GRID_CONFIDENCE_MARGIN
             )
             if not has_real_alternative:
@@ -2780,12 +3109,26 @@ def detect_checkbox_grid_answers(page_png_bytes: bytes, dpi: int = _RENDER_DPI) 
         order = sorted(candidates, key=lambda k: -densities[k])
         best, second = order[0], order[1]
         margin = round(densities[best] - densities[second], 4)
-        if densities[best] < _GRID_BLANK_INK_FLOOR and margin < _GRID_BLANK_MARGIN_CEILING:
+        if densities[best] < grid_confident_blank_floor and margin < _GRID_BLANK_MARGIN_CEILING:
             # Positively blank - see _GRID_BLANK_INK_FLOOR's comment. Same
             # {"position": None, "margin": ..., "blank": True} shape
             # detect_yesno_box_answers() already uses, so
             # answers_to_qa_rows() can treat both the same way.
             results[str(i + 1)] = {"position": None, "margin": margin, "blank": True}
+        elif densities[best] < grid_blank_floor and margin < _GRID_BLANK_MARGIN_CEILING:
+            # Near-floor, NOT confidently blank - see grid_confident_blank_
+            # floor's comment (TPS_4051's Q2). Report the best candidate's
+            # position (it's still this row's own strongest reading) but
+            # flag it ambiguous rather than silently overriding to blank -
+            # answers_to_qa_rows() keeps the model's own answer in this case
+            # and only forces review when the model has no answer of its
+            # own either, same convention as detect_yesno_box_answers()'s
+            # ambiguous flag.
+            results[str(i + 1)] = {
+                "position": best + 1,
+                "margin": margin,
+                "grid_ambiguous": True,
+            }
         else:
             results[str(i + 1)] = {
                 "position": best + 1,
@@ -3566,6 +3909,16 @@ _MULTISELECT_OVERFLOW_EXPAND_Y = 4  # vertical - kept small: rows are only ~15-1
 # to the RIGHT of its box (confirmed on a real file), so expanding rightward reads that label's own
 # ink as "overflow" on every row - the left side, by contrast, is genuinely blank margin on this form.
 _MULTISELECT_OVERFLOW_RATIO = 0.15  # expanded-region ink at/above this, with a blank in-box ratio, = overflow
+# Additional UPWARD-only expansion on top of _MULTISELECT_OVERFLOW_EXPAND_Y, for a mark whose stroke
+# approaches the box from above-left rather than straight from the left - real, confirmed case
+# (2025_Nov_18_1_TPS_6963.pdf's Q34 "None": a checkmark-style diagonal that starts well above the box,
+# clips its top-left corner, and exits through the label to the lower-right - measured 0.0889 in the
+# plain left-margin strip, well under _MULTISELECT_OVERFLOW_RATIO, but 0.155 once the same left-margin
+# strip's top edge is extended this far upward). Safe up to just under the real inter-row gap measured
+# on that same file (~26px between one choice's box bottom and the next's box top) - comfortably clears
+# this without ever reaching into the PREVIOUS row's own box or margin ink, unlike a symmetric expansion
+# of _MULTISELECT_OVERFLOW_EXPAND_Y itself would risk (see that constant's own comment).
+_MULTISELECT_OVERFLOW_EXPAND_UP = 22
 
 
 # A band-to-band gap below this fraction of that SAME pair's calibrated
@@ -3858,7 +4211,32 @@ def detect_multiselect_ink_ratios(
     # calibration row can only fail to validate here, never force a wrong
     # shift through unchecked.
     seeded = rects_confirmed  # boxes is already this file's own confirmed rects - no shift needed
-    if not rects_confirmed and calibration_profile:
+    if rects_confirmed:
+        # Explicit user request, confirmed directly (2025_Nov_18_1_TPS_6943/
+        # 6945/6946.pdf's Q33): anchor_found is what the band[0]-vs-anchor
+        # cross-check just below uses to catch a spurious leading text band
+        # (e.g. this question's own printed header text getting swept in as
+        # a fake "row 0" - see that check's own docstring for the full
+        # mechanism). It used to stay None on this exact (rects_confirmed)
+        # path, since the `if not seeded:` shape-search below - the only
+        # other place that sets it - never runs once seeded is already
+        # True here. That silently disabled the ONE safety net that would
+        # have caught a real, confirmed failure: a respondent's checkmark
+        # whose diagonal upstroke visually bridged two adjacent rows'
+        # printed text into one merged band, which combined with the
+        # spurious header band to net out at exactly the right band COUNT
+        # (7 bands for 7 choices) - so the "more bands than choices" rescue
+        # never fired either. The result: every choice from "Asian" onward
+        # silently read the PREVIOUS choice's box, reporting "White/
+        # Caucasian" as blank (0.0 ink) when "Native Hawaiian/Pacific
+        # Islander"'s own real, genuinely-blank box was measured instead -
+        # while the actual mark, clearly on "White/Caucasian", went
+        # uncounted. This file's own confirmed rects already give the TRUE
+        # first choice's box with no shift needed (that's what "confirmed"
+        # means), so it can seed the cross-check directly - no shape search
+        # required, unlike the non-confirmed path below.
+        anchor_found = (int(fx0 * scale), int(fx1 * scale), int(fy0 * scale), int(fy1 * scale))
+    elif calibration_profile:
         dx_key, dy_key = (
             ("offset_dx_p1", "offset_dy_p1") if page_idx == 0
             else ("offset_dx_p2", "offset_dy_p2")
@@ -3967,12 +4345,38 @@ def detect_multiselect_ink_ratios(
         found = _locate_checkbox(
             binary, sy0, sy1, sx0, sx1, scale=scale, expected_w=(x1 - x0), expected_h=(y1 - y0)
         )
+        if found is not None:
+            fx0, fx1, fy0, fy1 = found
+            expected_w, expected_h = (x1 - x0) * scale, (y1 - y0) * scale
+            if abs((fx1 - fx0) - expected_w) > 14 * scale or abs((fy1 - fy0) - expected_h) > 14 * scale:
+                found = None
         if found is None:
-            continue
-        fx0, fx1, fy0, fy1 = found
-        expected_w, expected_h = (x1 - x0) * scale, (y1 - y0) * scale
-        if abs((fx1 - fx0) - expected_w) > 14 * scale or abs((fy1 - fy0) - expected_h) > 14 * scale:
-            continue
+            # Explicit user request, confirmed directly (2025_Nov_18_1_
+            # TPS_6952.pdf's Q34: "Physically Disabled" had a real, clear
+            # X mark, but its own stroke visually crossed the box's
+            # printed border - exactly the kind of ink that breaks
+            # _locate_checkbox()'s border-SHAPE recognition, since it's
+            # looking for a clean rectangular outline, not one overlapped
+            # by handwriting. The choice was silently dropped from
+            # `ratios` entirely as a result, leaving the model's correct
+            # answer with no pixel corroboration at all). When this
+            # file's own pdf_calibration_profile already CONFIRMED this
+            # exact box's position via the page's printed REGISTRATION
+            # marks (rects_confirmed - a fundamentally different, more
+            # reliable measurement than step4's own shape-guess search),
+            # a failed shape re-confirmation here is much more likely to
+            # mean "ink is disrupting the border" than "the box isn't
+            # really there" - fall back to measuring ink directly at the
+            # already-confirmed rect (no pad, no shift - rects_confirmed
+            # implies x_shift=y_shift=0, see `seeded` above) rather than
+            # dropping the choice. Never applies when the box position
+            # itself was only a guess (text-band/shift-anchor search) -
+            # there, a failed shape search still means "not confidently
+            # located" and the choice is correctly skipped.
+            if rects_confirmed:
+                found = (int(x0 * scale), int(x1 * scale), int(y0 * scale), int(y1 * scale))
+            else:
+                continue
         found_by_label[label] = found
 
     # Generic row-pitch consistency check (real user report, Nov9_3_TPS_
@@ -4034,6 +4438,7 @@ def detect_multiselect_ink_ratios(
 
     ratios = {}
     ambiguous = []
+    overflow_candidates = []  # labels whose Signal 2 (below) found bleed - see the "exactly one" gate after this loop
     for label in labels_in_order:
         found = found_by_label.get(label)
         if found is None:
@@ -4073,15 +4478,32 @@ def detect_multiselect_ink_ratios(
                 # first attempt here got burned by: sampling a box-plus-
                 # margin rectangle with no border exclusion put every
                 # blank box's own outline into the ratio, well past
-                # _MULTISELECT_OVERFLOW_RATIO on every single row.
+                # _MULTISELECT_OVERFLOW_RATIO on every single row. The top
+                # edge is extended further upward than the bottom (see
+                # _MULTISELECT_OVERFLOW_EXPAND_UP's comment) to also catch a
+                # mark approaching from above-left, not just straight left.
                 expand_left = max(int(_MULTISELECT_OVERFLOW_EXPAND_LEFT * scale), 6)
                 expand_y = max(int(_MULTISELECT_OVERFLOW_EXPAND_Y * scale), 2)
-                margin_box = (fx0 - expand_left, fx0, fy0 - expand_y, fy1 + expand_y)
+                expand_up = max(int(_MULTISELECT_OVERFLOW_EXPAND_UP * scale), expand_y)
+                margin_box = (fx0 - expand_left, fx0, fy0 - expand_up, fy1 + expand_y)
                 expanded_ratio = _checkbox_ink_ratio(binary, margin_box, border=0)
                 if expanded_ratio >= _MULTISELECT_OVERFLOW_RATIO:
-                    ambiguous.append(label)
-                    ratios[label] = _MULTISELECT_UNMARKED_CEILING + 0.01  # see the boost comment above
+                    overflow_candidates.append(label)
     if include_diagnostics:
+        # Explicit user request: only actually TRUST a Signal-2 overflow read when
+        # it's the ONLY choice in this question showing bleed - if a respondent's
+        # mark partially missed its box (this signal's whole reason for existing:
+        # 2025_Nov_18_1_TPS_6963.pdf's Q34 "None"), every OTHER choice should still
+        # read cleanly blank, both in-box and in its own margin. More than one
+        # candidate at once is more likely mutual bleed-through between adjacent
+        # rows/labels than two independent real marks, and isn't safe to resolve
+        # automatically either way - leave those alone rather than guess which
+        # (or whether both) is real; the ordinary "all blank" handling downstream
+        # still applies to them.
+        if len(overflow_candidates) == 1:
+            label = overflow_candidates[0]
+            ambiguous.append(label)
+            ratios[label] = _MULTISELECT_UNMARKED_CEILING + 0.01  # see the Signal 1 boost comment above
         return ratios, ambiguous
     return ratios
 
@@ -4651,19 +5073,21 @@ def _border_coverage_ok(binary_img, box, min_frac: float = 0.6) -> bool:
     H, W = binary_img.shape
     if not (0 <= y0 < y1 <= H and 0 <= x0 < x1 <= W):
         return False
-    top = binary_img[y0, x0:x1]
-    bottom = binary_img[y1 - 1, x0:x1]
-    left = binary_img[y0:y1, x0]
-    right = binary_img[y0:y1, x1 - 1]
-
-    def frac(arr) -> float:
-        return float((arr > 0).sum()) / max(len(arr), 1)
 
     border_cov_min = _CURRENT_QUALITY_HINTS.get().get("border_cov_min")
     if isinstance(border_cov_min, (int, float)) and border_cov_min < min_frac:
         min_frac = max(border_cov_min - 0.05, 0.3)
 
-    return all(frac(side) >= min_frac for side in (top, bottom, left, right))
+    def frac(arr) -> float:
+        return float((arr > 0).sum()) / max(len(arr), 1)
+
+    # Check each side with a +/- 1px tolerance band around detected coordinates to protect against single-pixel discretization
+    top_cov = max(frac(binary_img[y, x0:x1]) for y in range(max(0, y0 - 1), min(H, y0 + 2)))
+    bot_cov = max(frac(binary_img[y, x0:x1]) for y in range(max(0, y1 - 2), min(H, y1 + 1)))
+    left_cov = max(frac(binary_img[y0:y1, x]) for x in range(max(0, x0 - 1), min(W, x0 + 2)))
+    right_cov = max(frac(binary_img[y0:y1, x]) for x in range(max(0, x1 - 2), min(W, x1 + 1)))
+
+    return all(cov >= min_frac for cov in (top_cov, bot_cov, left_cov, right_cov))
 
 
 def _find_full_width_lines(binary_img, min_width_frac: float = 0.5) -> list:
@@ -4784,6 +5208,62 @@ def detect_yesno_box_answers(
         # validate against THIS file's real scan - never a guess, and never
         # silently mixing a box from one candidate with a box from another.
         candidates = raw_candidates if isinstance(raw_candidates, list) else [raw_candidates]
+
+        # Explicit user request: same "tight ink_gap" relaxation as the grid
+        # detector's own grid_blank_floor and the list-anchor shift-
+        # corroboration check above - this question's blank-vs-marked call
+        # below (ratios[best] < _YESNO_BLANK_INK_FLOOR) should also prefer
+        # this file's OWN measured ink_blank_hi over the fixed global 0.25
+        # floor when its calibration profile flags "tight", so a genuinely
+        # marked-but-light box on a low-ink-separation scan doesn't misread
+        # as blank. Only ever lowers the floor, never raises it.
+        yesno_blank_floor = _YESNO_BLANK_INK_FLOOR
+        if calibration_profile and calibration_profile.get("ink_quality") == "tight":
+            ink_blank_hi = calibration_profile.get("ink_blank_hi")
+            if ink_blank_hi is not None:
+                candidate_floor = max(0.12, ink_blank_hi + 0.03)
+                # Bug fix (explicit user request, after a real reported
+                # case: TPS_4047 measured ink_blank_hi=0.1264/ink_mark_lo=
+                # 0.144/ink_gap=0.0176 - the flat +0.03 pad above pushed
+                # the floor to 0.1564, HIGHER than this file's own step2-
+                # confirmed lowest genuine mark (0.144). Whenever a file's
+                # own ink_gap is narrower than the flat pad (both real
+                # files checked here: 0.0176 and 0.0208, both < 0.03),
+                # that overshoot means a mark reading as low as this
+                # file's own ink_mark_lo would STILL fail to clear its own
+                # "blank" floor - exactly backwards from the point of
+                # calibrating per-file at all. Cap the floor so it can
+                # never reach or exceed ink_mark_lo (mirrors
+                # genuine_mark_floor's own ink_mark_lo - 0.03 margin a few
+                # lines up, which anchors from the marked side instead of
+                # the blank side).
+                ink_mark_lo = calibration_profile.get("ink_mark_lo")
+                if ink_mark_lo is not None:
+                    candidate_floor = min(candidate_floor, ink_mark_lo - 0.01)
+                yesno_blank_floor = min(_YESNO_BLANK_INK_FLOOR, candidate_floor)
+
+        # Per-file light-mark promotion floor (explicit user request,
+        # follow-up to the yesno_blank_floor fix above): the generic
+        # _YESNO_LIGHT_MARK_FLOOR (0.06) is tuned as a rough global noise
+        # floor, but a real, confirmed case - TPS_4047's Q29 - showed it's
+        # too permissive on its own. That file's OWN step2 measurement
+        # (once _split_clusters()'s plausible-count-window bug was fixed)
+        # showed its blank cluster tops out at ink_blank_hi=0.149 and its
+        # genuinely marked cluster doesn't start until ink_mark_lo=0.3557
+        # - yet Q29's "Female-to-Male..." choice measured only 0.144
+        # (comfortably INSIDE the blank cluster, nowhere near a real mark)
+        # and still got promoted, because 0.144 clears the generic 0.06
+        # floor and had enough margin from its runner-up. Never promote a
+        # candidate whose own ink ratio doesn't even clear THIS file's own
+        # confirmed blank-cluster ceiling - only ever RAISES the effective
+        # floor above the generic constant, never lowers it, so this can't
+        # make a real light mark on a genuinely low-ink file harder to
+        # promote than before.
+        light_mark_floor = _YESNO_LIGHT_MARK_FLOOR
+        if calibration_profile:
+            file_blank_hi = calibration_profile.get("ink_blank_hi")
+            if file_blank_hi is not None:
+                light_mark_floor = max(_YESNO_LIGHT_MARK_FLOOR, file_blank_hi)
 
         for cand_idx, (page_idx, boxes) in enumerate(candidates):
             if page_idx >= len(page_images):
@@ -5171,7 +5651,7 @@ def detect_yesno_box_answers(
                     for i in range(len(ratios))
                 ):
                     multiple_marks_detected = True
-            if ratios[best] < _YESNO_BLANK_INK_FLOOR and margin < _YESNO_BLANK_MARGIN_CEILING:
+            if ratios[best] < yesno_blank_floor and margin < _YESNO_BLANK_MARGIN_CEILING:
                 # A real ("light checkmark", not full X - see Revision 21's
                 # matching multiselect fix) mark can measure just enough ink
                 # to separate from a genuinely blank box, without clearing
@@ -5209,7 +5689,7 @@ def detect_yesno_box_answers(
                 # noise floor.
                 promotable = [
                     i for i in order
-                    if "(specify)" not in labels[i].lower() and ratios[i] > _YESNO_LIGHT_MARK_FLOOR
+                    if "(specify)" not in labels[i].lower() and ratios[i] > light_mark_floor
                     and margin >= _YESNO_LIGHT_MARK_MIN_SEPARATION
                 ]
                 if promotable:
@@ -5826,6 +6306,25 @@ def _extract_q24_comment_text(full_text: str) -> str:
     return compare_text
 
 
+def _q24_vision_text_looks_like_a_real_comment(text: str) -> bool:
+    """Explicit user request: Vision's OCR of the Q24 comment box sometimes
+    picks up stray noise there instead of an actual written comment - e.g.
+    the survey's own printed TPS number bleeding through/into that region
+    of the page (confirmed directly on a real scan: a faint "1801"-like
+    stamp artifact sitting in an otherwise-blank comment box), or a
+    scattering of disconnected characters with no real word content.
+    That's not a genuine disagreement with the model's blank reading - the
+    model was right, Vision just found something that isn't a comment.
+
+    True only when the text looks like an actual continuous, written
+    sentence: at least two real (2+ letter) words. False for pure digits/
+    punctuation, or for a single stray word - the caller treats False as
+    "trust the model's blank reading instead of Vision's", not as
+    evidence of a real disagreement."""
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    return len(words) >= 2
+
+
 def cross_check_written_field_with_vision(question_number: str, model_answer: str, vision_result: dict):
     """Compares a handwritten/write-in question's model answer against an
     independent Cloud Vision OCR reading of the same page (see
@@ -5942,7 +6441,29 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                 return True, "", 1.0, ""
         elif question_number in _WRITTEN_FIELD_ANCHORS:
             if vision_result.get("full_text") or vision_result.get("tokens") or vision_result.get("words"):
-                if _extract_anchored_field_value(question_number, vision_result) == "":
+                anchored_value = _extract_anchored_field_value(question_number, vision_result)
+                if anchored_value == "":
+                    return True, "", 1.0, ""
+                # Explicit user request (Q26/Age specifically): the branch
+                # above only counts as corroborated-blank when Vision's value
+                # window came back LITERALLY empty. A real-world variant of
+                # the same outcome previously fell through with no signal at
+                # all: the label WAS located (anchored_value is not None) but
+                # its value window picked up only stray non-digit noise -
+                # confirmed directly, 2025_Nov_23_5_TPS_3996.pdf's Q26: the
+                # anchored value came back ':', the printed label's own
+                # trailing punctuation bleeding into the window, not a
+                # written age. Since a real age answer is always digits, a
+                # located-but-digit-free value window is just as strong a
+                # "nothing written here" signal as a literally empty one.
+                # Deliberately NOT extended to "anchor not located at all"
+                # (anchored_value is None): tried a whole-page fallback scan
+                # for a plausible age-like digit token in that case, but this
+                # form prints several OTHER digits everywhere on the same
+                # page (question numbers, "2 weeks"/"4 weeks" choice text),
+                # so it almost always found a false-positive match and could
+                # never actually confirm blank - worse than no signal at all.
+                if question_number == "26" and anchored_value is not None and not re.search(r"\d", anchored_value):
                     return True, "", 1.0, ""
         return None, "", None, ""  # nothing written according to the model - nothing to cross-check
 
@@ -5967,6 +6488,35 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                 found_digits = re.sub(r"\D", "", anchored_value)
                 if found_digits == target_digits:
                     return True, "", 1.0, anchored_value
+                # See _WRITTEN_FIELD_EXPECTED_DIGITS's comment: when this
+                # field's own known boxed-cell count is more digits than
+                # Vision actually found, Vision didn't read something
+                # DIFFERENT from the model - it failed to read one or more
+                # digits at all (a real, confirmed handwriting-recognition
+                # miss, not a misread). Explicit user request/follow-up:
+                # rather than treating this as bare "no signal" (silently
+                # dropped, no trace in the output), report it as an
+                # AGREEMENT - defaulting to the model's own number, since
+                # there's nothing else to trust it against - while still
+                # recording a note explaining why, so the file remains
+                # auditable without needlessly costing a human review. Only
+                # applies when the model's OWN answer actually has at least
+                # the expected digit count too (if the model's answer is
+                # itself short, this isn't the "Vision under-read a good
+                # model answer" case this exists for, so it falls through
+                # to the ordinary disagreement check below instead).
+                expected_digits = _WRITTEN_FIELD_EXPECTED_DIGITS.get(question_number)
+                if (
+                    expected_digits is not None
+                    and len(found_digits) < expected_digits
+                    and len(target_digits) >= expected_digits
+                ):
+                    return True, (
+                        f"Cloud Vision found no matching {expected_digits}-digit number that could "
+                        f"be an age for {question_number} ({anchored_value!r} near this field's own "
+                        f"printed label, only {len(found_digits)} digit(s)) - defaulting to the "
+                        f"model's own answer {model_answer!r}."
+                    ), 1.0, anchored_value
                 return False, (
                     f"model read {model_answer!r} for {question_number}, but the text Cloud "
                     f"Vision found near this field's own printed label reads {anchored_value!r} "
@@ -5977,11 +6527,22 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                 compact_target = re.sub(r"\s+", "", model_answer.lower())
                 if compact_value == compact_target:
                     return True, "", 1.0, anchored_value
+                # Explicit user request: don't require a byte-exact match here -
+                # Vision's own OCR of this field's label/value window can add or
+                # drop a character or two (e.g. "4450WCE" read back as "4450WCEN")
+                # without the model's answer actually being wrong. Score character-
+                # level overlap (difflib matching-block chars / model answer length)
+                # and only flag needs_review when it's a genuine, low-overlap miss.
+                matcher = difflib.SequenceMatcher(None, compact_target, compact_value)
+                matched_chars = sum(block.size for block in matcher.get_matching_blocks())
+                coverage = (matched_chars / len(compact_target)) if compact_target else 0.0
+                if coverage >= H2_CHAR_OVERLAP_THRESHOLD:
+                    return True, "", coverage, anchored_value
                 return False, (
                     f"model read {model_answer!r} for {question_number}, but the text Cloud "
                     f"Vision found near this field's own printed label reads {anchored_value!r} "
                     "- possible OCR noise, or a genuine model misread."
-                ), 0.0, anchored_value
+                ), coverage, anchored_value
 
         # FALLBACK: this field's own label couldn't be located (or this
         # vision_result predates "words") - compare against every word
@@ -6008,12 +6569,24 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
             for tok in tokens:
                 if _normalize_for_match(tok) == target:
                     return True, "", 1.0, token_snippet
+            # Same char-overlap tolerance as the anchored H2 path above (explicit
+            # user request) - take the best-overlapping single token on the page
+            # rather than requiring a byte-exact match against any of them.
+            best_coverage = 0.0
+            if question_number == "H2" and target:
+                for tok in tokens:
+                    compact_tok = _normalize_for_match(tok)
+                    matcher = difflib.SequenceMatcher(None, target, compact_tok)
+                    matched_chars = sum(block.size for block in matcher.get_matching_blocks())
+                    best_coverage = max(best_coverage, matched_chars / len(target))
+                if best_coverage >= H2_CHAR_OVERLAP_THRESHOLD:
+                    return True, "", best_coverage, token_snippet
             return False, (
                 f"model read {model_answer!r} for {question_number}, but no individual "
                 "word Cloud Vision OCR'd from this page matches it exactly - possible "
                 "hallucinated/concatenated text (this field's own label couldn't be "
                 "located on the page, so this fell back to a whole-page check)."
-            ), 0.0, token_snippet
+            ), best_coverage, token_snippet
 
     elif question_number in _VISION_FREEFORM_FIELDS:
         if anchored_value is not None:
@@ -6066,36 +6639,167 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         # since full_text there is normal running OCR text, not a digit grid.
         if question_number == "H6" and anchored_value is not None:
             target_digits = re.sub(r"\D", "", model_answer)
-            found_digits = re.sub(r"\D", "", anchored_value)
-            # Display only the DATE-SHAPED tokens from the reconstructed
-            # value (digits and date separators only: 0-9, "/", "-", "."),
-            # not the raw joined string - defense in depth against any
-            # stray word still making it into the window (e.g. the window's
-            # row-grouping tolerance overlapping a nearby line on a real
-            # scan where the vertical gap is tighter than assumed, or
-            # Vision returning the whole date as one already-joined token
-            # like "10/23/2025" rather than one digit per box). Matched
-            # against a real report where the snippet still carried "Agree
-            # am Not" even after the window was row-scoped: Vision had
-            # returned the date as a single slash-formatted token, which an
-            # earlier, stricter tok.isdigit() filter would have rejected
-            # too (a "/" makes isdigit() False), leaving the pollution in
-            # place. found_digits above already strips ALL non-digit
-            # characters from the full anchored_value regardless, so this
-            # can only ever change what's DISPLAYED, never the match
-            # verdict.
+            # Only DATE-SHAPED tokens from the reconstructed value (digits
+            # and date separators only: 0-9, "/", "-", ".") ever feed the
+            # comparison below - not a blind digit-strip of the whole raw
+            # anchored_value. Matched against a real report where the
+            # window pulled in "Agree am Not" from a neighboring question's
+            # own checkbox row (the row-grouping tolerance overlapping a
+            # nearby line on a real scan): that's pure text contamination,
+            # zero digits of its own, so it's excluded from found_digits
+            # entirely rather than silently contributing digits it doesn't
+            # have (or, if it sat alongside a genuine digit token, keeping
+            # false digits out of the comparison).
             date_shaped = re.compile(r"^[0-9/.\-]+$")
             digit_tokens = [tok for tok in anchored_value.split() if date_shaped.match(tok)]
-            text_snippet = " ".join(digit_tokens) if digit_tokens else anchored_value.strip()
+            raw_snippet = " ".join(digit_tokens) if digit_tokens else anchored_value.strip()
+            # Explicit user request: "if cloud vision reads non date
+            # formatted question at all, for example: 'Agree am Not', then
+            # use model's answer" - when NOTHING date-shaped was found in
+            # the window at all (every token is ordinary text, not digits/
+            # separators), this isn't a date reading gone wrong, it's not a
+            # date reading AT ALL - almost always contamination from a
+            # neighboring question's text bleeding into the window. Treat
+            # this the same as "no independent signal" (match=None, this
+            # module's existing convention for "nothing sound to compare"
+            # a few lines below) rather than reporting a disagreement
+            # against a comparison that was never meaningful to begin with
+            # - trusts the model's answer without flagging it.
+            if not digit_tokens:
+                return None, "", None, ""
+            found_digits = re.sub(r"\D", "", "".join(digit_tokens))
+            # Explicit user request: Vision's reading must come out as a
+            # well-formed MM/DD/YYYY date, not something like "0/20/2025",
+            # "10/20/", "1012112025", or "21/10/2025" - those "don't make
+            # sense" as dates and shouldn't be shown as if they were a
+            # clean, directly-comparable reading. Prefer the canonical
+            # MM/DD/YYYY reformatting (_format_mmddyyyy_or_none()) whenever
+            # the digit shape supports it; otherwise fall back to the raw
+            # snippet AND say plainly that it isn't a valid MM/DD/YYYY
+            # shape, so a reviewer isn't misled into treating it as one.
+            formatted = _format_mmddyyyy_or_none(found_digits)
+            if formatted is not None:
+                text_snippet = formatted
+                shape_note = ""
+            else:
+                text_snippet = raw_snippet
+                shape_note = (
+                    f" Cloud Vision's reconstructed digits ({found_digits!r}, "
+                    f"{len(found_digits)} digits) don't form a valid MM/DD/YYYY "
+                    "date (expected exactly 8 digits with month 01-12 and day "
+                    "01-31), so this reading doesn't make sense as a date on "
+                    "its own."
+                )
             if not target_digits:
                 return None, "", None, ""  # model's date answer wasn't actually numeric - nothing sound to compare
             if found_digits == target_digits:
                 return True, "", 1.0, text_snippet
+
+            # Range-hint re-read (explicit user request: "if the vision
+            # answer doesn't match with the correct date format, have it
+            # read again with the hint of what the number range needs to
+            # be and get the closest one"). Cloud Vision has no prompt to
+            # steer it (it's plain OCR, not a model), so instead of a
+            # prompt hint this re-interprets Vision's OWN boxed reading
+            # against each field's known valid range/anchor -
+            # _range_hint_correct_date() for a single-digit MM/DD/YYYY slip
+            # (real cases: 2025_Nov_23_5_TPS_3995.pdf's year "2015"->"2025",
+            # a later file's day "72"->"22"), and
+            # _remove_spurious_separator_ones() for the DIFFERENT failure
+            # of Vision misreading a "/" separator as an extra digit "1",
+            # inflating the digit count above 8 (explicit user request,
+            # real case: Vision read "1012312025" - 10 digits - for
+            # handwritten "10/23/2025"; the two extra "1"s sit exactly
+            # where the "/" separators are). Tries every 8-digit candidate
+            # this produces - the raw reading itself when it's already 8
+            # digits, or every "remove N spurious 1s" candidate when it's
+            # longer - first for an exact match, then through the MM/DD/
+            # YYYY range-hint correction on top (a file can have BOTH
+            # problems at once: extra separator digits AND a genuine
+            # single-digit slip in what's left).
+            #
+            # The corrected reading is only ever used to decide the
+            # vision_cross_check VERDICT (agree/disagree) - it does NOT
+            # change survey_answer, since H6 is model-authoritative
+            # (REPORT_YEAR removed from _VISION_AUTHORITATIVE_FIELDS).
+            # "Agree" is reported ONLY when a candidate - possibly after
+            # its own range-hint correction - exactly equals the model's
+            # own target_digits; this can only ever flip a genuine
+            # agreement that Vision's own OCR noise obscured back into
+            # "agree", never manufacture one out of a reading that still
+            # doesn't match the model after every correction this module
+            # knows how to try.
+            corrected_note = ""
+            if len(found_digits) == 8:
+                date_candidates = [(found_digits, [])]
+            elif len(found_digits) > 8:
+                date_candidates = [
+                    (cand, [f"removed {len(found_digits) - 8} spurious '1' digit(s) (likely misread '/' separators)"])
+                    for cand in _remove_spurious_separator_ones(found_digits, target_len=8)
+                ]
+            else:
+                date_candidates = []
+
+            for candidate_digits, candidate_notes in date_candidates:
+                if candidate_digits == target_digits:
+                    change_desc = ", ".join(candidate_notes)
+                    suffix = f" ({change_desc} via range-hint re-read)" if change_desc else ""
+                    return True, "", 1.0, f"{text_snippet}{suffix}"
+                fixed = _range_hint_correct_date(candidate_digits)
+                if fixed is None:
+                    continue
+                fixed_digits, fixed_changes = fixed
+                if not fixed_changes:
+                    continue  # candidate was already fully valid but didn't match target - nothing more to try here
+                if fixed_digits == target_digits:
+                    change_desc = ", ".join(candidate_notes + fixed_changes)
+                    return True, "", 1.0, f"{text_snippet} ({change_desc} via range-hint re-read)"
+                if not corrected_note:
+                    corrected_note = (
+                        f" Closest valid re-read via range hint (month 01-12, day 01-31, "
+                        f"year {REPORT_YEAR}): {fixed_digits[0:2]}/{fixed_digits[2:4]}/{fixed_digits[4:8]} - "
+                        "still doesn't match the model's answer."
+                    )
+
+            # Last-resort digit-overlap check (explicit user request: "as
+            # long as the digit has 50% coverage or overlapping, then
+            # think this as a pass and needs_review = false") - for when
+            # none of the exact/range-hint/spurious-separator corrections
+            # above could resolve found_digits to the model's target_
+            # digits. Covers a genuinely DROPPED digit (real case: Vision
+            # read "0202025" - 7 digits - for handwritten "10/20/2025";
+            # the leading "1" box wasn't transcribed at all, but the
+            # remaining 7 digits are an exact contiguous match against the
+            # model's own last 7) - a different failure shape from the
+            # single-digit-SLIP cases _range_hint_correct_date() targets
+            # (right digit count, one digit wrong) and the extra-digit
+            # case _remove_spurious_separator_ones() targets (too MANY
+            # digits). Character-level (not word-level) difflib matching,
+            # same style as H2_CHAR_OVERLAP_THRESHOLD's check, since digit
+            # ORDER matters for a date the way it doesn't for free text.
+            digit_matcher = difflib.SequenceMatcher(None, target_digits, found_digits, autojunk=False)
+            matched_digits = sum(block.size for block in digit_matcher.get_matching_blocks())
+            digit_coverage = matched_digits / max(len(target_digits), len(found_digits))
+            if digit_coverage >= H6_DIGIT_COVERAGE_THRESHOLD:
+                return True, "", round(digit_coverage, 4), (
+                    f"{text_snippet} ({digit_coverage:.0%} digit overlap with model's answer)"
+                )
+
+            # shape_note (from the MM/DD/YYYY formatting check above) already
+            # covers both an impossible month/day AND a wrong total digit
+            # count - either way, it's strong, self-evident proof that
+            # Vision's reading - not necessarily the model's - is the one
+            # that's wrong, which matters to a reviewer deciding which
+            # source to trust. This never changes the verdict itself: H6 is
+            # model-authoritative (REPORT_YEAR removed from _VISION_
+            # AUTHORITATIVE_FIELDS), so there's nothing to correct a bad
+            # Vision reading INTO here, unlike the range-hint re-read above
+            # which had known-good ranges/an anchor year to correct toward.
             return False, (
                 f"model read {model_answer!r} for H6, but the digits Cloud Vision found near "
                 f"this field's own printed label read {found_digits!r} - possible OCR noise/"
-                "dropped digit, or a genuine model misread."
-            ), 0.0, text_snippet
+                f"dropped digit, or a genuine model misread.{shape_note}{corrected_note}"
+            ), round(digit_coverage, 4), text_snippet
 
         norm_full = _normalize_for_match(compare_text)
         norm_answer = _normalize_for_match(model_answer)
@@ -6117,8 +6821,22 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         if re.sub(r"\s+", "", norm_full) == re.sub(r"\s+", "", norm_answer):
             return True, "", 1.0, compare_text.strip()
 
-        words_full = [w for w in norm_full.split(" ") if w]
-        words_answer = [w for w in norm_answer.split(" ") if w]
+        # Explicit user request (2025_Nov_23_5_TPS_4067.pdf's Q24: model wrote
+        # "Hoped alot." - trailing period - while Cloud Vision's OCR word list
+        # returned "alot" with no punctuation; the model's own answer and
+        # Vision's OCR otherwise agree completely, but comparing whole words
+        # made "alot." != "alot", halving the coverage score and forcing
+        # needs_review=True over a punctuation-only difference): strip
+        # leading/trailing punctuation off each word before comparing. Still
+        # word-granularity, not character-granularity - the fragment-stitching
+        # problem word-matching was introduced to fix (see below) is about
+        # comparing WHOLE tokens instead of raw characters; trimming a word's
+        # own leading/trailing punctuation doesn't reopen that, since a
+        # "word" here is still exactly one OCR/model token, just without the
+        # sentence punctuation stuck to its edge.
+        _WORD_EDGE_PUNCTUATION = ".,!?;:\"'()[]"
+        words_full = [w for w in (w.strip(_WORD_EDGE_PUNCTUATION) for w in norm_full.split(" ")) if w]
+        words_answer = [w for w in (w.strip(_WORD_EDGE_PUNCTUATION) for w in norm_answer.split(" ")) if w]
         # Matching happens at WORD granularity, not character granularity -
         # this is the second of two fixes needed to make this score mean
         # anything, on top of autojunk=False below (both found while
@@ -6197,6 +6915,20 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         text_snippet = _snippet_around_match(compare_text, matched_phrase)
         if coverage >= VISION_FREEFORM_COVERAGE_THRESHOLD:
             return True, "", round(coverage, 4), text_snippet
+
+        # H4 character-overlap fallback - see H4_CHAR_OVERLAP_THRESHOLD's
+        # comment. Scoped to the anchored path only (never the whole-page
+        # fallback, where a short answer's characters could trivially
+        # "match" somewhere in unrelated printed page text).
+        if question_number == "H4" and anchored_value is not None:
+            compact_answer = re.sub(r"[^a-z0-9]", "", norm_answer)
+            compact_full = re.sub(r"[^a-z0-9]", "", norm_full)
+            if compact_answer:
+                char_matcher = difflib.SequenceMatcher(None, compact_full, compact_answer)
+                char_coverage = sum(b.size for b in char_matcher.get_matching_blocks()) / len(compact_answer)
+                if char_coverage >= H4_CHAR_OVERLAP_THRESHOLD:
+                    return True, "", round(char_coverage, 4), text_snippet
+
         return False, (
             f"model read {model_answer!r} for {question_number}, but {source_desc} "
             f"doesn't contain a close match (matching text covered only "
@@ -6204,6 +6936,165 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         ), round(coverage, 4), text_snippet
 
     return None, "", None, ""  # not a written-text question this mechanism covers
+
+
+def _format_mmddyyyy_or_none(digits: str) -> Optional[str]:
+    """Formats an all-digits string into strict "MM/DD/YYYY" (explicit user
+    request: Cloud Vision's H6 reading must come out looking like a real
+    date - not "0/20/2025" (a dropped leading zero), "10/20/" (an
+    incomplete year), "1012112025" (extra/misaligned digits - too many
+    total), or "21/10/2025" (month/day out of range) - "these numbers
+    don't make sense"). Returns the canonical two-digit-month/two-digit-
+    day/four-digit-year string only when `digits` is EXACTLY 8 characters,
+    all 0-9, and _is_plausible_mmdd() accepts the first four as MM/DD;
+    returns None for anything else (wrong digit count, non-digit
+    characters, or an impossible month/day) rather than ever emitting a
+    malformed or nonsensical date string."""
+    if not digits or len(digits) != 8 or not digits.isdigit():
+        return None
+    mm, dd, yyyy = digits[0:2], digits[2:4], digits[4:8]
+    if not _is_plausible_mmdd(mm, dd):
+        return None
+    return f"{mm}/{dd}/{yyyy}"
+
+
+def _is_plausible_mmdd(mm_str: str, dd_str: str) -> bool:
+    """Cheap, format-only sanity check for a 2-digit month + 2-digit day
+    pulled out of Cloud Vision's H6 boxed-digit reconstruction (explicit
+    user request: "month cannot larger than 12 and days cannot be larger
+    than 31"). Deliberately simple/lenient - a plain 1-12 / 1-31 bounds
+    check, not a real calendar validator (e.g. this accepts "02/31", a date
+    that doesn't exist) - the goal here is only to catch digit-box misreads
+    that produce an outright IMPOSSIBLE month/day (a strong, unambiguous
+    signal Vision's OCR slipped a digit), not to second-guess a
+    borderline-but-possible one. Returns False on anything unparseable."""
+    try:
+        mm, dd = int(mm_str), int(dd_str)
+    except (TypeError, ValueError):
+        return False
+    return 1 <= mm <= 12 and 1 <= dd <= 31
+
+
+def _closest_valid_two_digit(raw: str, lo: int, hi: int) -> Optional[str]:
+    """Given a 2-digit numeral string that's out of [lo, hi] (an impossible
+    month or day from Cloud Vision's H6 boxed-digit reconstruction),
+    returns the closest value reachable by changing exactly ONE of its two
+    digits, or the string unchanged if it's already in range. Explicit
+    user request: "if the vision answer doesn't match with the correct
+    date format, have it read again with the hint of what the number
+    range needs to be and get the closest one" - e.g. Vision reading day
+    "72" (impossible: no month has a 72nd day) should be re-read as "22"
+    (changing just the tens digit 7->2), not thrown away outright, since
+    single-digit-box misreads are the dominant failure mode already
+    documented throughout this module's H1/H2/H6/26 handling.
+
+    "Closest" means the smallest absolute numeric difference from the
+    ORIGINAL (invalid) reading among every single-digit-edit candidate
+    that lands in range - not the nearest boundary. For "72"/range 1-31,
+    changing the TENS digit yields 02/12/22/32 (32 still invalid, so
+    02/12/22 are candidates) while changing the UNITS digit yields
+    70/71/73.../79 (all still invalid, contributing nothing) - among
+    02/12/22, "22" is numerically closest to 72, so that's what's
+    returned. This deliberately does NOT just clamp to the nearest valid
+    boundary (31) - a clamped guess has no basis in what was actually
+    read, whereas a single-digit-edit candidate is grounded in Vision's
+    own reconstructed digits.
+
+    Returns None (no guess) when NO single-digit edit reaches a valid
+    value at all - never invents a value more than one digit removed from
+    what Vision actually reported, matching this module's "never guess"
+    convention everywhere else."""
+    if not raw or len(raw) != 2 or not raw.isdigit():
+        return None
+    value = int(raw)
+    if lo <= value <= hi:
+        return raw
+    candidates = []
+    for pos in range(2):
+        for digit in "0123456789":
+            if digit == raw[pos]:
+                continue
+            candidate = raw[:pos] + digit + raw[pos + 1:]
+            cv = int(candidate)
+            if lo <= cv <= hi:
+                candidates.append(candidate)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: abs(int(c) - value))
+    return candidates[0]
+
+
+def _range_hint_correct_date(digits8: str) -> Optional[Tuple[str, list]]:
+    """Given an 8-digit MMDDYYYY string, independently corrects the month
+    (01-12), day (01-31, via _closest_valid_two_digit()) and year (anchored
+    to REPORT_YEAR, allowing a single-digit slip) portions. Returns
+    (corrected_digits, changes) - changes is a list of human-readable
+    "field raw->fixed" strings, empty if nothing needed correcting (the
+    input was already fully valid) - or None if any one of the three
+    fields couldn't be confidently corrected (e.g. the year is more than
+    one digit off REPORT_YEAR). Pulled out of cross_check_written_field_
+    with_vision()'s H6 branch into its own function so it can be applied
+    to more than one candidate reading (the original 8-digit Vision
+    reconstruction, AND any 8-digit candidate produced by
+    _remove_spurious_separator_ones() below) without duplicating the
+    three-field correction logic."""
+    if len(digits8) != 8:
+        return None
+    mm_raw, dd_raw, yyyy_raw = digits8[0:2], digits8[2:4], digits8[4:8]
+    mm_fixed = _closest_valid_two_digit(mm_raw, 1, 12)
+    dd_fixed = _closest_valid_two_digit(dd_raw, 1, 31)
+    if yyyy_raw == REPORT_YEAR:
+        yyyy_fixed = yyyy_raw
+    elif len(REPORT_YEAR) == 4 and sum(1 for a, b in zip(yyyy_raw, REPORT_YEAR) if a != b) == 1:
+        yyyy_fixed = REPORT_YEAR
+    else:
+        yyyy_fixed = None  # more than one digit off REPORT_YEAR - not a confident single-slip fix
+    if mm_fixed is None or dd_fixed is None or yyyy_fixed is None:
+        return None
+    corrected = mm_fixed + dd_fixed + yyyy_fixed
+    changes = [
+        f"{name} {raw}->{fixed}"
+        for name, raw, fixed in (("month", mm_raw, mm_fixed), ("day", dd_raw, dd_fixed), ("year", yyyy_raw, yyyy_fixed))
+        if raw != fixed
+    ]
+    return corrected, changes
+
+
+def _remove_spurious_separator_ones(found_digits: str, target_len: int = 8) -> list:
+    """Cloud Vision's H6 digit-box reconstruction sometimes misreads the
+    printed "/" separator BETWEEN a boxed date's digit groups as an extra
+    digit "1" - a "/" and a "1" look similar as an isolated glyph, and
+    Vision has no context here to tell them apart (explicit user request,
+    real case: Vision read "1012312025" - 10 digits - for handwritten
+    "10/23/2025"; removing the two extra "1"s that sit exactly where the
+    two "/" separators are recovers the correct 8-digit "10232025": "10" +
+    <spurious 1> + "23" + <spurious 1> + "2025"). This is a DIFFERENT
+    failure mode from a genuinely dropped/misread digit (which
+    _closest_valid_two_digit()/_range_hint_correct_date() already handle)
+    - the digit COUNT itself is inflated, not just individual digits
+    wrong.
+
+    Returns every distinct target_len-digit string reachable by deleting
+    exactly (len(found_digits) - target_len) "1" characters - never any
+    other digit, and never a positional guess about WHERE a separator
+    "should" fall; every combination of "1" positions is tried and left
+    for the caller to validate against something known-good (e.g. the
+    model's own answer), same as every other correction in this module -
+    never guessed on its own authority. Returns [] when found_digits is
+    already target_len or shorter (nothing to remove - not this failure
+    mode) or when there aren't enough "1" digits present to remove that
+    many."""
+    if len(found_digits) <= target_len:
+        return []
+    n_remove = len(found_digits) - target_len
+    one_positions = [i for i, ch in enumerate(found_digits) if ch == "1"]
+    if len(one_positions) < n_remove:
+        return []
+    candidates = set()
+    for combo in itertools.combinations(one_positions, n_remove):
+        remove_set = set(combo)
+        candidates.add("".join(ch for i, ch in enumerate(found_digits) if i not in remove_set))
+    return sorted(candidates)
 
 
 def _parse_confidence(raw) -> Optional[float]:
@@ -6349,9 +7240,14 @@ def extract_qa_from_pdf(
     page_images = render_pdf_to_images(pdf_bytes)
     image_parts = [Part.from_data(data=img, mime_type="image/png") for img in page_images]
 
+    prompt_parts = [get_extraction_prompt()]
+    calibration_note = build_calibration_reference_note(calibration_profile)
+    if calibration_note:
+        prompt_parts.append(calibration_note)
+
     model = GenerativeModel(model_name)
     response = model.generate_content(
-        [get_extraction_prompt(), *image_parts],
+        [*prompt_parts, *image_parts],
         generation_config=GenerationConfig(temperature=0, response_mime_type="application/json"),
     )
     raw_text = response.text
@@ -6384,7 +7280,9 @@ def extract_qa_from_pdf(
     # above for the full reasoning).
     if page_images and not skip_pixel:
         try:
-            grid_results = detect_checkbox_grid_answers(page_images[0])
+            grid_results = detect_checkbox_grid_answers(
+                page_images[0], calibration_profile=calibration_profile
+            )
             for qnum, info in grid_results.items():
                 if qnum in answers:
                     answers[qnum]["pixel_position"] = info["position"]
@@ -6396,6 +7294,8 @@ def extract_qa_from_pdf(
                         answers[qnum]["pixel_correction_detected_at"] = info.get("correction_detected_at")
                     if info.get("multiple_marks_detected"):
                         answers[qnum]["pixel_multiple_marks_detected"] = True
+                    if info.get("grid_ambiguous"):
+                        answers[qnum]["pixel_grid_ambiguous"] = True
             if not grid_results:
                 err(
                     "[GRID] Pixel-based checkbox-grid detection found nothing on this file's "
@@ -6523,12 +7423,27 @@ def extract_qa_from_pdf(
                 # keeping the model's (already non-blank) answer as-is and
                 # forcing review through the existing check 4b path with no
                 # separate handling needed.
+                # Further exception (explicit user request): the override
+                # above is only warranted when Vision found an actual
+                # WRITTEN COMMENT - a continuous sentence - not when it
+                # merely picked up stray noise sitting in the comment box
+                # (e.g. the survey's own printed TPS number bleeding into
+                # that region, or a scattering of disconnected characters).
+                # In that noise case the model's blank reading was correct
+                # all along, so it's kept as-is and treated the same as a
+                # genuine corroborated blank (needs_review=False) - see
+                # _q24_vision_text_looks_like_a_real_comment()'s docstring.
                 if qnum == "24" and not (answers[qnum].get("answer") or "").strip():
                     found_comment_text = _extract_q24_comment_text(vision_result.get("full_text", ""))
-                    if found_comment_text:
+                    if found_comment_text and _q24_vision_text_looks_like_a_real_comment(found_comment_text):
                         answers[qnum]["model_answer_before_vision_override"] = answers[qnum].get("answer", "")
                         answers[qnum]["answer"] = found_comment_text
                         answers[qnum]["vision_filled_blank"] = True
+                    elif found_comment_text:
+                        answers[qnum]["vision_match"] = True
+                        answers[qnum]["vision_note"] = ""
+                        answers[qnum]["vision_score"] = 1.0
+                        answers[qnum]["vision_snippet"] = found_comment_text
 
                 match, detail, score, snippet = cross_check_written_field_with_vision(
                     qnum, answers[qnum].get("model_answer_before_vision_override", answers[qnum].get("answer", "")), vision_result
@@ -6673,6 +7588,8 @@ def answers_to_qa_rows(
     answers: dict,
     report_date: Optional[datetime.date],
     refreshed_at: datetime.datetime,
+    gcs_uri: str = "",
+    source_page_range: str = "",
 ) -> list:
     """Turns a {question_number: {"answer":..., "mark_position":...,
     "confidence":..., [optionally] "pixel_position":..., "pixel_margin":...,
@@ -6756,6 +7673,7 @@ def answers_to_qa_rows(
             pixel_multiselect_ratios = entry.get("pixel_multiselect_ratios")
             pixel_multiselect_ambiguous = entry.get("pixel_multiselect_ambiguous")
             pixel_yesno_ambiguous = entry.get("pixel_yesno_ambiguous", False)
+            pixel_grid_ambiguous = entry.get("pixel_grid_ambiguous", False)
             pixel_grid_totally_missing = entry.get("pixel_grid_totally_missing", False)
             pixel_multiple_marks_detected = entry.get("pixel_multiple_marks_detected", False)
             pixel_yesno_multiple_marks_detected = entry.get("pixel_yesno_multiple_marks_detected", False)
@@ -6784,6 +7702,7 @@ def answers_to_qa_rows(
             pixel_multiselect_ratios = None
             pixel_multiselect_ambiguous = None
             pixel_yesno_ambiguous = False
+            pixel_grid_ambiguous = False
             pixel_grid_totally_missing = False
             pixel_multiple_marks_detected = False
             pixel_yesno_multiple_marks_detected = False
@@ -6840,10 +7759,8 @@ def answers_to_qa_rows(
             if model_answer.strip().lower() != pixel_label.strip().lower():
                 needs_review = True
                 review_reasons.append(
-                    f"pixel {source_name} detector found the mark in position {pixel_position} "
-                    f"({pixel_label!r}), disagreeing with the model's reading {model_answer!r} - "
-                    f"the model's reading is kept for Q{number} (pixel detector overruled per "
-                    "MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS); needs review to confirm."
+                    f"{source_name} found {pixel_label!r} (pos {pixel_position}), model read "
+                    f"{model_answer!r} - model kept (policy: model wins here)."
                 )
         elif (
             choices is not None
@@ -6882,11 +7799,8 @@ def answers_to_qa_rows(
                 # behind it anywhere is a materially different, rarer
                 # situation worth a human look.)
                 review_reasons.append(
-                    f"model read {model_answer!r} but {source_name} "
-                    f"detector found the mark in position {pixel_position} ({pixel_label!r}) "
-                    "for this fixed-layout question - auto-corrected to the pixel reading "
-                    "(this disagreement alone is not grounds for needs_review; see any other "
-                    "reason listed here if this row is still flagged)."
+                    f"model read {model_answer!r}, {source_name} found {pixel_label!r} (pos "
+                    f"{pixel_position}) - corrected to pixel reading (not by itself grounds for review)."
                 )
             if pixel_correction_detected:
                 # A cross-out/correction was detected on this row (see
@@ -6903,12 +7817,9 @@ def answers_to_qa_rows(
                     choices[p - 1] for p in corrected_positions if 1 <= p <= len(choices)
                 ]
                 review_reasons.append(
-                    f"{source_name} detector found an implausibly dense mark at "
-                    f"position(s) {corrected_positions} ({corrected_labels!r}) in addition to "
-                    f"the normal mark at position {pixel_position} ({pixel_label!r}) - likely "
-                    "the respondent crossed out an earlier answer and marked a different one; "
-                    f"using position {pixel_position} ({pixel_label!r}), but this correction "
-                    "should be verified by a human."
+                    f"possible crossed-out correction: extra dense mark(s) at {corrected_positions} "
+                    f"({corrected_labels!r}) alongside {pixel_label!r} (pos {pixel_position}) - using "
+                    f"{pixel_label!r}."
                 )
         elif (
             pixel_source in ("grid", "yesno_box", "h3_circle")
@@ -6917,14 +7828,21 @@ def answers_to_qa_rows(
             and number in MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS
         ):
             # Q31/32: keep the model's non-empty answer instead of trusting
-            # the pixel "blank" reading - flag for a human look instead.
-            needs_review = True
-            review_reasons.append(
-                f"model read {model_answer!r} but {source_name} detector found "
-                "no box confidently marked - the model's reading is kept for "
-                f"Q{number} (pixel detector overruled per "
-                "MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS); needs review to confirm."
-            )
+            # the pixel "blank" reading. Same rule as the ambiguous-pixel
+            # exceptions above, extended here (explicit user request, real
+            # case: Q30) - only skip needs_review when the model's own
+            # confidence clears MODEL_CONFIDENCE_THRESHOLD, so a low-
+            # confidence guess still gets flagged.
+            if model_confidence is not None and model_confidence >= MODEL_CONFIDENCE_THRESHOLD:
+                review_reasons.append(
+                    f"pixel found nothing confidently marked - kept model's confident reading {model_answer!r}."
+                )
+            else:
+                needs_review = True
+                review_reasons.append(
+                    f"model read {model_answer!r}, pixel found nothing marked - model kept "
+                    "(policy: model wins here)."
+                )
         elif pixel_source in ("grid", "yesno_box", "h3_circle") and pixel_blank and model_answer.strip():
             # The pixel detector positively found NOTHING marked - not just
             # "unsure which box", but the WINNING box itself doesn't look
@@ -6934,9 +7852,8 @@ def answers_to_qa_rows(
             detection_method = method_label
             needs_review = True
             review_reasons.append(
-                f"model read {model_answer!r} but {source_name} detector found "
-                "no box confidently marked (this question appears to have been "
-                "left blank on the scan) - using the pixel reading."
+                f"model read {model_answer!r}, but pixel found nothing marked (appears blank) - "
+                "using pixel reading."
             )
             answer, mark_position = "", ""
 
@@ -6977,50 +7894,36 @@ def answers_to_qa_rows(
                     needs_review = True
                     if removed and added:
                         review_reasons.append(
-                            f"pixel detector found {removed!r} blank (model claimed marked) "
-                            f"and {added!r} marked (model missed) - model's answer {answer!r} "
-                            f"is kept for Q{number} (pixel detector overruled per "
-                            "MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS); needs review to confirm."
+                            f"pixel found {removed!r} blank and {added!r} marked (model disagreed) - "
+                            f"model's answer {answer!r} kept (policy: model wins here)."
                         )
                     elif removed:
                         review_reasons.append(
-                            f"model claimed {removed!r} marked, but the pixel detector found "
-                            f"{'that choice' if len(removed) == 1 else 'those choices'} confidently blank - "
-                            f"model's answer {answer!r} is kept for Q{number} (pixel detector overruled "
-                            "per MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS); needs review to confirm."
+                            f"model claimed {removed!r} marked, pixel found it blank - model's answer "
+                            f"{answer!r} kept (policy: model wins here)."
                         )
                     elif added:
                         review_reasons.append(
-                            f"pixel detector found {added!r} confidently marked but the model didn't "
-                            f"claim {'it' if len(added) == 1 else 'them'} - model's answer {answer!r} is "
-                            f"kept for Q{number} (pixel detector overruled per "
-                            "MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS); needs review to confirm."
+                            f"pixel found {added!r} marked but model didn't claim it - model's answer "
+                            f"{answer!r} kept (policy: model wins here)."
                         )
                 else:
                     answer = new_answer
                     mark_position = _positions_for_multiselect_answer(number, answer)
                     if removed and added:
                         review_reasons.append(
-                            f"model claimed {removed!r} marked (but pixel found blank) "
-                            f"and missed {added!r} marked (pixel found them) - "
-                            f"reconciled to {answer!r} (this disagreement alone is not grounds "
-                            "for needs_review; see any other reason listed here if this row is "
-                            "still flagged)."
+                            f"pixel found {removed!r} blank and {added!r} marked - reconciled to "
+                            f"{answer!r} (not by itself grounds for review)."
                         )
                     elif removed:
                         review_reasons.append(
-                            f"model additionally claimed {removed!r} marked, but the pixel detector found "
-                            f"{'that choice' if len(removed) == 1 else 'those choices'} confidently blank on "
-                            "this scan - removed from the answer (this disagreement alone is not grounds "
-                            "for needs_review; see any other reason listed here if this row is still "
-                            "flagged)."
+                            f"model claimed {removed!r} marked, pixel found it blank - removed "
+                            "(not by itself grounds for review)."
                         )
                     elif added:
                         review_reasons.append(
-                            f"model missed {added!r} marked, but the pixel detector found "
-                            f"{'that choice' if len(added) == 1 else 'those choices'} confidently marked on "
-                            "this scan - added to the answer (this disagreement alone is not grounds for "
-                            "needs_review; see any other reason listed here if this row is still flagged)."
+                            f"model missed {added!r} marked, pixel found it marked - added "
+                            "(not by itself grounds for review)."
                         )
 
         # Ambiguous-mark backstop (explicit user request): even when the
@@ -7052,15 +7955,12 @@ def answers_to_qa_rows(
             if unresolved_ambiguous:
                 needs_review = True
                 review_reasons.append(
-                    f"pixel detector found {unresolved_ambiguous!r}'s mark unclear or exceeding its "
-                    "own checkbox area on this scan - needs review to confirm the true answer."
+                    f"pixel mark unclear/out-of-box for {unresolved_ambiguous!r}."
                 )
             else:
                 review_reasons.append(
-                    f"pixel detector found {pixel_multiselect_ambiguous!r}'s mark unclear or exceeding "
-                    "its own checkbox area on this scan, but the model's own answer already, "
-                    "independently, includes that choice - this ambiguity alone is not grounds for "
-                    "needs_review; see any other reason listed here if this row is still flagged."
+                    f"pixel mark unclear/out-of-box for {pixel_multiselect_ambiguous!r}, but model "
+                    "already includes it (not by itself grounds for review)."
                 )
 
         # Same ambiguous-mark backstop as above, for the single-select
@@ -7097,17 +7997,58 @@ def answers_to_qa_rows(
         # answer - the ambiguity/ink-quality issue alone is not reason
         # enough to flag for review when the model already gave a confident
         # account of what's marked.
+        # Explicit user request: "if the pixel was unclear and model
+        # confirms no box marked OR have a confident answer, then use
+        # vertex model" - the `bool(model_answer.strip())` term below only
+        # ever covered the SECOND half of that ("a confident answer"). A
+        # model that confidently determined NOTHING is marked reports an
+        # EMPTY answer (there's no choice text for "blank" - rule 6 in
+        # build_extraction_prompt()), so model_answer.strip() is falsy for
+        # that case too, and the flag fired anyway - a real, confirmed gap
+        # (reported directly: Q35, "model notes: No box is marked" still
+        # needs_review=True). A model-confirmed-blank
+        # reading is just as much an independent, confident account as a
+        # model-confirmed-marked one - only require model_confidence to
+        # clear the same MODEL_CONFIDENCE_THRESHOLD already used elsewhere
+        # in this function (check 4a, a few lines up) as evidence the
+        # "nothing marked" account is itself trustworthy, not a shrug.
+        model_confident_blank = (
+            not model_answer.strip()
+            and model_confidence is not None
+            and model_confidence >= MODEL_CONFIDENCE_THRESHOLD
+        )
         yesno_ambiguous_agrees_with_model = (
             pixel_position is not None
             and answer.strip()
             and model_answer.strip().lower() == answer.strip().lower()
-        ) or bool(model_answer.strip())
+        ) or bool(model_answer.strip()) or model_confident_blank
         if pixel_yesno_ambiguous and not yesno_ambiguous_agrees_with_model:
             needs_review = True
             review_reasons.append(
-                "pixel detector located this question but a choice's mark was unclear or exceeded its "
-                "own checkbox area on this scan (likely ink bleeding from an adjacent choice) - needs "
-                "review to confirm the true answer."
+                "a choice's mark was unclear or exceeded its own checkbox area (likely ink bleed)."
+            )
+
+        # Same near-floor ambiguous flag for the Q1-18 checkbox grid (see
+        # grid_confident_blank_floor's comment, 2025_Nov_23_5_TPS_4051.pdf's
+        # Q2: a real checkmark drawn escaping its own box read too low to
+        # trust as either a confident mark or a confident blank). Same
+        # agrees-with-model exception as the yesno case just above - once
+        # the model has a confident, non-empty account of its own, an ink-
+        # quality/mark-placement observation alone isn't grounds to flag -
+        # and the SAME model_confident_blank gap that check had (a
+        # confident "nothing marked" account has an empty answer, so
+        # bool(model_answer.strip()) alone never covered it) applies here
+        # too, for the same reason.
+        grid_ambiguous_agrees_with_model = (
+            pixel_position is not None
+            and answer.strip()
+            and model_answer.strip().lower() == answer.strip().lower()
+        ) or bool(model_answer.strip()) or model_confident_blank
+        if pixel_grid_ambiguous and not grid_ambiguous_agrees_with_model:
+            needs_review = True
+            review_reasons.append(
+                "mark too close to the blank/marked threshold to trust either way (possibly drawn "
+                "outside its checkbox border)."
             )
 
         # Explicit user request (Revision 28): when detect_checkbox_grid_
@@ -7122,9 +8063,8 @@ def answers_to_qa_rows(
         if pixel_grid_totally_missing:
             needs_review = True
             review_reasons.append(
-                "the pixel-based checkbox-grid detector could not locate ANY of the 18 grid rows on "
-                "this file's page 1 (0 of 18) - this question is running on the vision model's reading "
-                "alone, with no independent pixel verification at all - needs review."
+                "checkbox-grid detector found 0 of 18 rows on page 1 - running on model reading alone, "
+                "no pixel verification."
             )
 
         # General "two marks in the same single-select row" backstop
@@ -7143,18 +8083,43 @@ def answers_to_qa_rows(
             # _pixel_agrees_with_model()'s docstring.
             if _pixel_agrees_with_model(pixel_position, choices, model_answer):
                 review_reasons.append(
-                    "the pixel detector found two boxes on this row both confidently marked (e.g. one "
-                    "crossed out and a different one marked instead), but its own winning choice "
-                    f"already agrees with the model's answer {model_answer!r} - no review needed for "
-                    "this ambiguity alone."
+                    f"two boxes confidently marked on this row (likely a crossed-out correction), but "
+                    f"pixel's own pick agrees with model's answer {model_answer!r} (not by itself "
+                    "grounds for review)."
                 )
             else:
                 needs_review = True
-                review_reasons.append(
-                    "the pixel detector found two boxes on this row both confidently marked (e.g. one "
-                    "crossed out and a different one marked instead) - needs review to confirm the true "
-                    "answer."
-                )
+                # Real, confirmed case (2025_Nov_18_1_TPS_6958.pdf Q13/Q15): a
+                # respondent's checkmark whose long upstroke overshoots into
+                # the NEXT box reads as "two boxes marked" here, and the model
+                # repeatedly misattributed the mark to the wrong (tail) box
+                # even after prompt rules explained the hook-vs-tail
+                # distinction - a genuine vision-perception miss no prompt
+                # wording fixed. But the checkmark's actual hook/bend is a
+                # denser, more concentrated blob of ink than the thin trailing
+                # line, so it's exactly why pixel_position (this row's own
+                # highest-ink column - see "best" in detect_checkbox_grid_
+                # answers()) already correctly lands on the hook's box even
+                # here, whether this two-marks case is a genuine crossed-out
+                # correction (pixel_position already reflects that correction
+                # - see the overdense-ceiling logic above) or a checkmark-tail
+                # overshoot like this one. Prefer it over the model's answer -
+                # always still needs_review regardless, so a human confirms
+                # either way; this only changes the interim recorded guess.
+                if choices is not None and pixel_position is not None and 1 <= pixel_position <= len(choices):
+                    pixel_label = choices[pixel_position - 1]
+                    review_reasons.append(
+                        f"two boxes confidently marked on this row (likely a crossed-out correction, or "
+                        f"a checkmark's tail overshooting into the next box) - using pixel's higher-ink "
+                        f"pick {pixel_label!r} over model's {model_answer!r}."
+                    )
+                    answer = pixel_label
+                    mark_position = str(pixel_position)
+                    detection_method = method_label
+                else:
+                    review_reasons.append(
+                        "two boxes confidently marked on this row (likely a crossed-out correction)."
+                    )
 
         # Same "two marks" backstop for yesno_box questions (19,20,21,22,23,
         # 25,27,28,29,30,32,35) - set by detect_yesno_box_answers() using the
@@ -7173,10 +8138,8 @@ def answers_to_qa_rows(
             # stronger signal than a merely-high self-reported confidence.
             if _pixel_agrees_with_model(pixel_position, choices, model_answer):
                 review_reasons.append(
-                    "the pixel detector found two boxes on this question both confidently marked "
-                    "(e.g. one crossed out and a different one marked instead), but its own winning "
-                    f"choice already agrees with the model's answer {model_answer!r} - no review "
-                    "needed for this ambiguity alone."
+                    f"two boxes confidently marked (likely a crossed-out correction), but pixel's own "
+                    f"pick agrees with model's answer {model_answer!r} (not by itself grounds for review)."
                 )
             else:
                 needs_review = True
@@ -7198,19 +8161,14 @@ def answers_to_qa_rows(
                     and model_answer.strip()
                 ):
                     review_reasons.append(
-                        "the pixel detector found two boxes on this question both confidently marked "
-                        "(e.g. one crossed out and a different one marked instead), but the model "
-                        f"reported high self-reported confidence ({model_confidence:.2f}) in its own "
-                        f"answer {model_answer!r} - using the model's reading instead of the pixel "
-                        "detector's ambiguous pick; still needs review to confirm the true answer."
+                        f"two boxes confidently marked; model's confidence ({model_confidence:.2f}) is "
+                        f"high, using its reading {model_answer!r} instead of pixel's ambiguous pick."
                     )
                     answer, mark_position = model_answer, model_position
                     detection_method = "model"
                 else:
                     review_reasons.append(
-                        "the pixel detector found two boxes on this question both confidently marked (e.g. "
-                        "one crossed out and a different one marked instead) - needs review to confirm the "
-                        "true answer."
+                        "two boxes confidently marked (likely a crossed-out correction)."
                     )
 
         # H2/H6 Vision-OCR-authoritative override (Revision 29, explicit
@@ -7223,9 +8181,8 @@ def answers_to_qa_rows(
         # needs_review by itself.
         if vision_overrode_model:
             review_reasons.append(
-                f"Cloud Vision's own anchored OCR reading of this field's printed label disagreed with "
-                f"the model's answer ('{model_answer_before_vision_override}') and was used instead, "
-                f"per policy - Vision OCR is treated as authoritative for this field."
+                f"Vision OCR disagreed with model's answer ('{model_answer_before_vision_override}') - "
+                "Vision used (authoritative for this field)."
             )
 
         # Explicit user request: Q24 blank-vs-non-blank disagreement - the
@@ -7240,9 +8197,8 @@ def answers_to_qa_rows(
         if vision_filled_blank:
             needs_review = True
             review_reasons.append(
-                f"model reported this question blank, but Cloud Vision's own OCR of the comment box "
-                f"found text ({answer!r}) - using Vision's non-blank reading instead of the model's "
-                "blank one; needs review to confirm against the actual handwriting."
+                f"model reported blank, but Cloud Vision OCR found text ({answer!r}) - using Vision's "
+                "reading."
             )
 
         # NEW check 4a: model self-reported confidence gate. Only meaningful
@@ -7291,6 +8247,18 @@ def answers_to_qa_rows(
             pixel_confirms_blank = not any(
                 ratio >= _MULTISELECT_UNMARKED_CEILING for ratio in pixel_multiselect_ratios.values()
             )
+        elif pixel_position is None and not pixel_blank:
+            # Explicit user request: no pixel detector ran for this question
+            # at all (pixel_position was never set - not a positive "checked
+            # every box and found none marked" result, which is what
+            # pixel_blank=True actually means). That's most of the written-
+            # text fields (H1/H2/H4/H5/H6/24/26 have no pixel detector) plus
+            # any question a pixel detector simply didn't cover this file.
+            # With no independent reading to disagree with the model's own
+            # blank answer, there's nothing to be suspicious of - treat this
+            # the same as a genuine two-source agreement on blank, not an
+            # unverified guess.
+            pixel_confirms_blank = True
         else:
             pixel_confirms_blank = pixel_blank
         both_agree_blank = not model_answer.strip() and pixel_confirms_blank
@@ -7316,6 +8284,17 @@ def answers_to_qa_rows(
         # runs the Vision comparison for them.
         if vision_match is True:
             vision_cross_check = "agree"
+            # Explicit user request (Q26/_WRITTEN_FIELD_EXPECTED_DIGITS'
+            # "default to model's number" case): an "agree" verdict can
+            # still carry an explanatory note (e.g. Vision under-read the
+            # expected digit count and this defaulted to the model) -
+            # surface it in review_note for auditability WITHOUT setting
+            # needs_review, unlike the vision_note appended in the
+            # disagree branch just below. Every OTHER "agree" return in
+            # cross_check_written_field_with_vision() uses an empty detail
+            # string, so this is a no-op for every other question/case.
+            if vision_note:
+                review_reasons.append(vision_note)
         elif vision_match is False:
             vision_cross_check = "disagree"
             needs_review = True
@@ -7349,7 +8328,7 @@ def answers_to_qa_rows(
         # True for some other reason - this is descriptive context for a
         # human to use while triaging, never itself a trigger for review.
         if needs_review and model_reasoning:
-            review_reasons.append(f"model's own account of the scan: {model_reasoning}")
+            review_reasons.append(f"model notes: {model_reasoning}")
 
         # General "blank output always needs review" backstop (Revision 29,
         # explicit user request, reiterated twice: a BigQuery row that shows
@@ -7384,10 +8363,7 @@ def answers_to_qa_rows(
         # replacement for them.
         if quality_route_forces_review:
             needs_review = True
-            review_reasons.append(
-                f"upstream pdf_quality classifier recommended_route={pdf_quality_route!r} for this "
-                "file - routed for review regardless of this question's own signals."
-            )
+            review_reasons.append(f"pdf_quality route={pdf_quality_route!r} - file routed for review.")
 
         # Explicit user request: every written-text field (H1/H2/H4/H5/H6/
         # 24/26) is exempt from this generic "it's blank" backstop too, but
@@ -7400,7 +8376,12 @@ def answers_to_qa_rows(
         # above): ANY question where the pixel detector independently ran
         # and agrees with the model that nothing was marked is exempt the
         # same way - two independent sources agreeing on blank is not
-        # itself grounds for a human to confirm "yes, blank."
+        # itself grounds for a human to confirm "yes, blank." Further
+        # generalized (explicit user request): a question where NO pixel
+        # detector ran at all for this question is exempt too - with no
+        # independent reading to disagree with the model's own blank
+        # answer, there's no actual signal to review, just an unverified
+        # (but uncontradicted) blank.
         if (
             not answer.strip()
             and number not in _BLANK_ANSWER_EXEMPT_FIELDS
@@ -7413,10 +8394,7 @@ def answers_to_qa_rows(
                     model_answer, choices, pixel_position, pixel_blank,
                     pixel_multiselect_ratios, vision_match, vision_snippet,
                 )
-                review_reasons.append(
-                    "this question's final answer is blank - needs review to confirm this is a "
-                    f"genuine skip and not a missed/dropped answer. ({readings})"
-                )
+                review_reasons.append(f"answer is blank - confirm genuine skip. ({readings})")
 
         review_note = "; ".join(review_reasons)
 
@@ -7445,6 +8423,9 @@ def answers_to_qa_rows(
                 vision_match_score=(vision_score if vision_cross_check else None),
                 vision_ocr_snippet=(vision_snippet if vision_cross_check else ""),
                 pdf_quality_route=pdf_quality_route,
+                destination_gcs_uri=gcs_uri,
+                survey_link=_survey_link_for(file_name),
+                source_page_range=source_page_range,
             )
         )
     return rows
@@ -7470,6 +8451,23 @@ BQ_SURVEY_RESPONSES_SCHEMA = [
     ("vision_match_score", "FLOAT", "The numeric agreement score behind vision_cross_check: 1.0/0.0 for the token fields' exact-match check (H1/H2/26), or the actual difflib longest-contiguous-match coverage fraction (0.0-1.0) for the freeform fields' fuzzy-match check (H4/H5/H6/24). Populated whenever vision_cross_check is 'agree' or 'disagree' (even on agreement, so a narrow pass is visible); NULL when vision_cross_check is empty."),
     ("vision_ocr_snippet", "STRING", "What Cloud Vision actually read that survey_answer was compared against for the Vision double-check - a handful of individual word tokens for the token fields (H1/H2/26), or a truncated excerpt of the page's full OCR text for the freeform fields (H4/H5/H6/24). Populated whenever vision_cross_check is 'agree' or 'disagree'; empty when vision_cross_check is empty. Lets you eyeball the model's answer against Vision's independent reading directly."),
     ("pdf_quality_route", "STRING", "This file's 'recommended_route' ('pixel'/'vision'/'fallback') from classify_pdf_quality.py's upstream pdf_quality table at extraction time, or NULL if no quality row was found / routing was disabled for this run. 'vision'/'fallback' force needs_review=TRUE on every question for this file regardless of that question's own signals - see review_note for the specific note when that happened."),
+    ("destination_gcs_uri", "STRING", "This file's own gs:// URI - the same value step1_merge_pdf.py recorded as destination_gcs_uri in pdf_manifest_list for this file, so a row here can be joined back to its manifest row without a separate lookup."),
+    ("source_page_range", "STRING", "e.g. '5-6' - which pages inside this survey's ORIGINAL combined source PDF this file's survey unit occupies. Parsed from the file name's trailing '_pages_{range}.pdf', or looked up from pdf_manifest_list's source_page_range when the file name doesn't carry it. Empty if unknown."),
+    ("survey_link", "STRING", "SURVEY_LINK_BASE_URL + file_name with its '.pdf' extension stripped - a direct link to this survey in the review UI, e.g. 'http://localhost:8080/surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2'. Populated on every row."),
+]
+# BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK's schema: every BQ_SURVEY_RESPONSES_SCHEMA column,
+# plus the three feedback-loop columns that only exist on THIS table (survey_responses
+# itself carries no feedback state - see sync_survey_responses_with_feedback()'s docstring
+# for why the with-feedback table is kept in sync FROM survey_responses instead of the
+# other way around). folder_name/file_name/question_number is the join key sync_survey_
+# responses_with_feedback()'s MERGE and step6_load_feedback.py's ingest MERGE both use.
+# The export (to Excel, for a human reviewer) lives HERE, in export_needs_review_
+# feedback(); the ingest (back from Excel) lives in step6_load_feedback.py.
+BQ_SURVEY_RESPONSES_WITH_FEEDBACK_SCHEMA = BQ_SURVEY_RESPONSES_SCHEMA + [
+    ("correct_answer", "STRING", "The human reviewer's answer from the latest export_needs_review_feedback() Excel export, ingested back by step6_load_feedback.py. NULL until step6 ingests feedback covering this row."),
+    ("updated_with_feedback", "BOOLEAN", "NULL until step6_load_feedback.py ingests a feedback file covering this row, then TRUE. export_needs_review_feedback() only exports needs_review=TRUE rows where this is still NULL, so a row is never re-exported for review once its feedback has been ingested."),
+    ("feedback_updated_time", "TIMESTAMP", "When step6_load_feedback.py last ingested feedback for this row. NULL until then."),
+    ("ingested_from", "STRING", "gs:// URI of the tps_feedback_{datetime}.xlsx file step6_load_feedback.py ingested this row's feedback from. NULL until then."),
 ]
 # Column names that are REPEATED (arrays of STRING) rather than scalar, for
 # both BigQuery SchemaField construction and the Spark ArrayType mapping in
@@ -7499,7 +8497,10 @@ def _normalize_bq_type(field_type: str) -> str:
     return aliases.get(field_type, field_type)
 
 
-def ensure_bq_table(bq_client, project: str, dataset: str, table: str, allow_schema_recreate: bool = False):
+def ensure_bq_table(
+    bq_client, project: str, dataset: str, table: str, allow_schema_recreate: bool = False,
+    schema_rows: list = BQ_SURVEY_RESPONSES_SCHEMA,
+):
     from google.api_core.exceptions import NotFound
     from google.cloud import bigquery
 
@@ -7517,7 +8518,7 @@ def ensure_bq_table(bq_client, project: str, dataset: str, table: str, allow_sch
             mode="REPEATED" if name in _BQ_REPEATED_COLUMNS else "NULLABLE",
             description=desc,
         )
-        for name, typ, desc in BQ_SURVEY_RESPONSES_SCHEMA
+        for name, typ, desc in schema_rows
     ]
     try:
         bq_table = bq_client.get_table(table_ref)
@@ -7613,6 +8614,57 @@ def delete_existing_rows_for_folder(bq_client, table_ref, folder: str) -> None:
     bq_client.query(query, job_config=job_config).result()
 
 
+def _warn_about_stale_folder_names(bq_client, table_ref, folder: str, file_name: str) -> None:
+    """Explicit user request (2025_Nov_23_5_TPS_4062.pdf: reloading it under
+    folder_name="Nov 23 2025/Nov23_5" left 41 OLD rows behind under
+    folder_name="Nov 23 2025" from before the source GCS layout grew a batch
+    subfolder - delete_existing_rows_for_file() only deletes the exact
+    (folder_name, file_name) pair it was called with, so those stale rows
+    silently survived and doubled this file's row count).
+
+    Since file_name isn't guaranteed unique across folders (see
+    delete_existing_rows_for_file()'s own docstring), this can't safely
+    auto-delete every other folder_name carrying the same file_name - a
+    genuine same-named file in a different, unrelated batch would be
+    wrongly wiped. Instead, this just SURFACES the situation loudly right
+    when it happens (rather than it only being discoverable later via a
+    manual GROUP BY query, as happened here) so a human can decide whether
+    it's the same reorganized file (stale rows to clean up) or a real
+    same-named-file collision (leave alone)."""
+    from google.cloud import bigquery
+
+    full_table_id = f"{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}"
+    query = (
+        f"SELECT folder_name, COUNT(*) AS n_rows FROM `{full_table_id}` "
+        "WHERE file_name = @file_name AND folder_name != @folder "
+        "GROUP BY folder_name"
+    )
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("file_name", "STRING", file_name),
+            bigquery.ScalarQueryParameter("folder", "STRING", folder),
+        ]
+    )
+    try:
+        stale = list(bq_client.query(query, job_config=job_config).result())
+    except Exception as e:  # noqa: BLE001 - purely a diagnostic check, never fatal to the actual load
+        err("[BQ] Stale-folder_name check for file_name=%r skipped: %s", file_name, e)
+        return
+    if stale:
+        err(
+            "[BQ] WARNING: file_name=%r also has %d row(s) in %s under a DIFFERENT folder_name "
+            "than this run's %r: %s. If this file was moved/reorganized in GCS since it was last "
+            "loaded, those are stale leftovers under its old folder_name and this run will NOT "
+            "delete them (only the exact folder_name it was called with is deleted) - clean them "
+            "up manually, e.g.: DELETE FROM `%s` WHERE file_name = %r AND folder_name = <stale value>. "
+            "If it's instead a genuine, unrelated file that happens to share this name in another "
+            "batch, no action needed.",
+            file_name, sum(r["n_rows"] for r in stale), full_table_id, folder,
+            ", ".join(f"{r['folder_name']!r} ({r['n_rows']} rows)" for r in stale),
+            full_table_id, file_name,
+        )
+
+
 def delete_existing_rows_for_file(bq_client, table_ref, folder: str, file_name: str) -> None:
     """DELETEs any rows already loaded for this exact (folder_name, file_name)
     pair, so re-running extraction against a single file replaces just that
@@ -7621,10 +8673,15 @@ def delete_existing_rows_for_file(bq_client, table_ref, folder: str, file_name: 
     alone) since file_name isn't guaranteed unique across different survey
     folders - see the same caveat on the corrections-log lookup above. A
     no-op (deletes 0 rows) the first time this file is loaded. Uses a query
-    job (DML), same reasoning as delete_existing_rows_for_folder()."""
+    job (DML), same reasoning as delete_existing_rows_for_folder().
+
+    Also checks for (and loudly warns about, but does not delete) rows
+    under a DIFFERENT folder_name for this same file_name - see
+    _warn_about_stale_folder_names()."""
     from google.cloud import bigquery
 
     full_table_id = f"{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}"
+    _warn_about_stale_folder_names(bq_client, table_ref, folder, file_name)
     query = f"DELETE FROM `{full_table_id}` WHERE folder_name = @folder AND file_name = @file_name"
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -8086,6 +9143,106 @@ def query_corrections(
     return [dict(row) for row in bq_client.query(query, job_config=job_config).result()]
 
 
+_TPS_NUMBER_RE = re.compile(r"_TPS_(\d+)_NEEDS_REVIEW")
+_SOURCE_PAGE_RANGE_RE = re.compile(r"_pages_(\d+-\d+)\.pdf$", re.IGNORECASE)
+# Splits a current-style "..._TPS_{tps}_NEEDS_REVIEW_pages_{range}.pdf" name into the
+# pieces needed to reconstruct BOTH pre-fix naming schemes real files were uploaded
+# under (see _build_needs_review_row()'s legacy_gcs_uris) - no page token at all, or
+# the page token up front instead of at the end.
+_NEEDS_REVIEW_NAME_RE = re.compile(
+    r"^(?P<prefix>.*)_TPS_(?P<tps>\d+)_NEEDS_REVIEW_pages_(?P<range>\d+-\d+)\.pdf$", re.IGNORECASE
+)
+
+
+def _build_needs_review_row(
+    folder: str,
+    file_name: str,
+    gcs_uri: str,
+    report_date: Optional[datetime.date],
+    refreshed_at: datetime.datetime,
+    bq_client,
+    resolved_bq_project: str,
+    bq_dataset: str,
+    manifest_table: str = PDF_MANIFEST_TABLE,
+) -> QARow:
+    """Builds the single QARow recorded for a file whose name contains
+    NEEDS_REVIEW - step1_merge_pdf.py's split_combined_pdf() names a survey
+    unit this way when its TPS number couldn't be read at all, couldn't be
+    read confidently, collided with another survey's number, or the page
+    was marked declined. There's no reliable TPS number to key a normal
+    per-question extraction's rows to for a file like this, so instead of
+    running it through Gemini this records ONE row flagging exactly what's
+    known: the TPS number reading is unrecognized/uncertain, and which
+    page(s) of the original combined source PDF it's on.
+
+    The TPS number and page range are parsed straight from the file name
+    (e.g. "..._TPS_5204_NEEDS_REVIEW_pages_5-6.pdf" - see split_combined_
+    pdf()'s naming) since both are always present there for a file uploaded
+    after that naming was fixed; source_page_range falls back to pdf_
+    manifest_list's own source_page_range column (keyed on this exact
+    destination_gcs_uri) for any older file uploaded before the fix. The
+    review_note itself always comes from pdf_manifest_list's needs_review_
+    reason for this file - the file name alone never carries WHY the survey
+    was flagged, only the manifest row step1 wrote does."""
+    report_date_str = report_date.isoformat() if report_date else None
+    refreshed_at_str = refreshed_at.isoformat()
+    refreshed_date_str = refreshed_at.date().isoformat()
+
+    tps_match = _TPS_NUMBER_RE.search(file_name)
+    tps_number = tps_match.group(1) if tps_match else ""
+
+    page_match = _SOURCE_PAGE_RANGE_RE.search(file_name)
+    source_page_range = page_match.group(1) if page_match else ""
+
+    # A NEEDS_REVIEW file uploaded before the "_pages_{range}" naming fix, then
+    # renamed in GCS afterward, still has its OLD (pre-rename) name recorded as
+    # destination_gcs_uri in pdf_manifest_list - so also try both pre-fix
+    # naming schemes if the current name finds nothing (see query_pdf_
+    # manifest_row()'s fallback_gcs_uris docstring).
+    legacy_gcs_uris = []
+    name_match = _NEEDS_REVIEW_NAME_RE.match(file_name)
+    if name_match:
+        prefix, tps, page_range = name_match.group("prefix", "tps", "range")
+        legacy_dir = gcs_uri.rsplit("/", 1)[0]
+        legacy_gcs_uris = [
+            f"{legacy_dir}/{prefix}_TPS_{tps}_NEEDS_REVIEW.pdf",  # no page token at all
+            f"{legacy_dir}/{prefix}_pages_{page_range}_TPS_{tps}_NEEDS_REVIEW.pdf",  # page token up front
+        ]
+
+    manifest_row = None
+    if bq_client is not None:
+        manifest_row = query_pdf_manifest_row(
+            bq_client, resolved_bq_project, bq_dataset, gcs_uri, manifest_table,
+            fallback_gcs_uris=legacy_gcs_uris,
+        )
+    if manifest_row is None:
+        status("[MANIFEST] No pdf_manifest_list row found for %s - review_note will be generic.", gcs_uri)
+    review_note = (manifest_row or {}).get("needs_review_reason") or (
+        f"TPS number is unrecognized/uncertain (file name contains NEEDS_REVIEW); "
+        f"no matching pdf_manifest_list row found to explain why."
+    )
+    if not source_page_range:
+        source_page_range = (manifest_row or {}).get("source_page_range") or ""
+
+    return QARow(
+        folder_name=folder,
+        file_name=file_name,
+        survey_question="TPS Number",
+        survey_answer=tps_number,
+        question_number="TPS",
+        report_date=report_date_str,
+        refreshed_at=refreshed_at_str,
+        refreshed_date=refreshed_date_str,
+        mark_position=None,
+        needs_review=True,
+        review_note=review_note,
+        detection_method="needs_review_flag",
+        destination_gcs_uri=gcs_uri,
+        source_page_range=source_page_range,
+        survey_link=_survey_link_for(file_name),
+    )
+
+
 def _extract_one_pdf_with_retries(
     blob, bucket_name, folder, report_date, refreshed_at,
     vertex_project, vertex_location, gemini_model,
@@ -8101,9 +9258,23 @@ def _extract_one_pdf_with_retries(
     from Vertex AI). Returns (rows, True) on success, or ([], False) once
     every attempt has failed - the caller decides what "still failed after
     every attempt" means (extract_to_bigquery() itself does a further
-    whole-folder retry pass before giving up for good)."""
+    whole-folder retry pass before giving up for good).
+
+    A file whose name contains NEEDS_REVIEW is short-circuited entirely -
+    no Gemini call, no pixel detection, no download even - straight to a
+    single _build_needs_review_row() row, since step1_merge_pdf.py already
+    determined this survey's TPS number can't be trusted, so there's
+    nothing meaningful for this file's own per-question extraction to key
+    its rows to."""
     gcs_uri = f"gs://{bucket_name}/{blob.name}"
     file_name = Path(blob.name).name
+    if "NEEDS_REVIEW" in file_name:
+        row = _build_needs_review_row(
+            folder, file_name, gcs_uri, report_date, refreshed_at,
+            bq_client, resolved_bq_project, bq_dataset,
+        )
+        status("[GCS] %s is flagged NEEDS_REVIEW - recording 1 TPS-number review row instead of extracting.", file_name)
+        return [row], True
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -8148,6 +9319,11 @@ def _extract_one_pdf_with_retries(
                         file_name, calibration_profile.get("ink_quality"),
                         calibration_profile.get("offset_dx_p2"), calibration_profile.get("offset_dy_p2"),
                     )
+            source_page_range = ""
+            if bq_client is not None:
+                manifest_row = query_pdf_manifest_row(bq_client, resolved_bq_project, bq_dataset, gcs_uri)
+                if manifest_row is not None:
+                    source_page_range = manifest_row.get("source_page_range") or ""
             answers = extract_qa_from_pdf(
                 pdf_bytes, vertex_project, vertex_location, gemini_model,
                 vision_project=vision_project, vision_enabled=vision_enabled,
@@ -8155,7 +9331,10 @@ def _extract_one_pdf_with_retries(
                 calibration_profile=calibration_profile,
                 quality_hints=quality_hints,
             )
-            rows = answers_to_qa_rows(folder, file_name, answers, report_date, refreshed_at)
+            rows = answers_to_qa_rows(
+                folder, file_name, answers, report_date, refreshed_at,
+                gcs_uri=gcs_uri, source_page_range=source_page_range,
+            )
             n_flagged = sum(1 for r in rows if r.needs_review)
             status(
                 "[GCS] Loaded + extracted %s from %s (%d question rows, %d flagged needs_review)%s",
@@ -8452,6 +9631,218 @@ def extract_to_bigquery(
     )
 
 
+def extract_needs_review_files_to_bigquery(
+    bucket_name: str,
+    root_prefix: str,
+    folders: Optional[list],
+    bq_project: Optional[str],
+    bq_dataset: str,
+    bq_table: str,
+    spark_staging_bucket: Optional[str] = None,
+    allow_schema_recreate: bool = False,
+) -> None:
+    """Scans every folder (or just `folders`, if given) for files whose name
+    contains NEEDS_REVIEW and loads ONE 'TPS Number' row per such file into
+    bq_table, via _build_needs_review_row() - no Gemini call, no pixel
+    detection, no PDF download even, for these files or any other file in
+    the same folder. Only these NEEDS_REVIEW files' own existing rows (keyed
+    on folder_name + file_name, via delete_existing_rows_for_file()) are
+    deleted-then-reloaded; every other already-loaded file in the same
+    folder - including ones with real Q&A rows - is left completely
+    untouched, unlike extract_to_bigquery()'s normal whole-folder replace."""
+    root_prefix = root_prefix if root_prefix.endswith("/") else root_prefix + "/"
+    bucket = connect_gcs_bucket(bucket_name)
+    folders = folders or list_date_folders(bucket, root_prefix)
+    if not folders:
+        err("[GCS] No date folders found under gs://%s/%s", bucket_name, root_prefix)
+        sys.exit(1)
+
+    bq_client = connect_bigquery(bq_project)
+    resolved_bq_project = bq_project or bq_client.project
+    bq_table_ref = ensure_bq_table(bq_client, resolved_bq_project, bq_dataset, bq_table, allow_schema_recreate=allow_schema_recreate)
+    bq_full_table_id = f"{resolved_bq_project}.{bq_dataset}.{bq_table}"
+    refreshed_at = datetime.datetime.now(datetime.timezone.utc)
+    status(
+        "[BQ] Scanning %d folder(s) under gs://%s/%s for NEEDS_REVIEW files, refreshing %s at %s (UTC)",
+        len(folders), bucket_name, root_prefix, bq_full_table_id, refreshed_at.isoformat(),
+    )
+
+    all_rows = []
+    for folder in folders:
+        pdf_blobs = list_pdfs_in_folder(bucket, root_prefix, folder)
+        review_blobs = [b for b in pdf_blobs if "NEEDS_REVIEW" in Path(b.name).name]
+        if not review_blobs:
+            continue
+        report_date = parse_report_date(folder)
+        status("[GCS] Folder %r: %d NEEDS_REVIEW file(s) found.", folder, len(review_blobs))
+        for blob in review_blobs:
+            file_name = Path(blob.name).name
+            gcs_uri = f"gs://{bucket_name}/{blob.name}"
+            all_rows.append(
+                _build_needs_review_row(
+                    folder, file_name, gcs_uri, report_date, refreshed_at,
+                    bq_client, resolved_bq_project, bq_dataset,
+                )
+            )
+
+    if not all_rows:
+        status("[BQ] No NEEDS_REVIEW files found under gs://%s/%s - nothing to load.", bucket_name, root_prefix)
+        return
+
+    status("[BQ] Deleting any existing rows for these %d NEEDS_REVIEW file(s) before reloading...", len(all_rows))
+    for row in all_rows:
+        delete_existing_rows_for_file(bq_client, bq_table_ref, row.folder_name, row.file_name)
+
+    json_rows = [row.__dict__ for row in all_rows]
+    try:
+        n_loaded = load_rows_into_bq_via_spark(
+            json_rows, BQ_SURVEY_RESPONSES_SCHEMA, resolved_bq_project, bq_dataset, bq_table,
+            staging_bucket=spark_staging_bucket or SPARK_BQ_STAGING_BUCKET,
+        )
+    except Exception as spark_error:  # noqa: BLE001 - fall back to a direct BQ client load job below
+        err(
+            "[BQ] Spark load into %s failed (%s); falling back to a direct BigQuery client load job.",
+            bq_full_table_id, spark_error,
+        )
+        n_loaded = load_rows_into_bq(bq_client, bq_table_ref, json_rows)
+
+    status(
+        "[BQ] Done. %d NEEDS_REVIEW file(s) found across %d folder(s), %d row(s) loaded into %s (refreshed_at=%s).",
+        len(all_rows), len(folders), n_loaded, bq_full_table_id, refreshed_at.isoformat(),
+    )
+
+
+def sync_survey_responses_with_feedback(
+    bq_client, project: str, dataset: str, survey_table: str, feedback_table: str,
+) -> None:
+    """Creates feedback_table (BQ_SURVEY_RESPONSES_WITH_FEEDBACK_SCHEMA) if it
+    doesn't exist yet, then MERGEs every row of survey_table into it, keyed
+    on (folder_name, file_name, question_number):
+
+      - a row already in feedback_table has its extraction columns (every
+        BQ_SURVEY_RESPONSES_SCHEMA column) refreshed from survey_table, but
+        its four feedback-only columns (correct_answer, updated_with_
+        feedback, feedback_updated_time, ingested_from) are left completely
+        untouched - this is what lets survey_table (survey_responses) stay
+        the single source of truth for extraction, re-run as often as
+        needed, WITHOUT ever silently wiping out human feedback already
+        ingested here.
+      - a row not yet in feedback_table is INSERTed with all four feedback
+        columns NULL (not yet reviewed).
+
+    Both this file's export_needs_review_feedback() (--export-needs-review-
+    feedback) and step6_load_feedback.py's ingest call this first, so the
+    with-feedback table is always caught up with survey_responses before
+    either side of the loop touches it."""
+    ensure_bq_table(
+        bq_client, project, dataset, feedback_table,
+        schema_rows=BQ_SURVEY_RESPONSES_WITH_FEEDBACK_SCHEMA,
+    )
+
+    survey_columns = [name for name, _typ, _desc in BQ_SURVEY_RESPONSES_SCHEMA]
+    update_set = ", ".join(f"T.{c} = S.{c}" for c in survey_columns)
+    feedback_columns = ["correct_answer", "updated_with_feedback", "feedback_updated_time", "ingested_from"]
+    insert_cols = ", ".join(survey_columns + feedback_columns)
+    insert_vals = ", ".join([f"S.{c}" for c in survey_columns] + ["NULL"] * len(feedback_columns))
+
+    query = f"""
+        MERGE `{project}.{dataset}.{feedback_table}` T
+        USING `{project}.{dataset}.{survey_table}` S
+        ON T.folder_name = S.folder_name AND T.file_name = S.file_name AND T.question_number = S.question_number
+        WHEN MATCHED THEN UPDATE SET {update_set}
+        WHEN NOT MATCHED BY TARGET THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+    """
+    status("[FEEDBACK] Syncing %s.%s.%s from %s.%s.%s ...", project, dataset, feedback_table, project, dataset, survey_table)
+    bq_client.query(query).result()
+
+
+# Columns from survey_responses_with_feedback actually shown to a human
+# reviewer in export_needs_review_feedback()'s Excel file - everything else
+# on that row (model_confidence, vision_cross_check, pdf_quality_route,
+# etc.) is internal extraction detail a reviewer doesn't need to answer
+# "what's the correct value here". "correct_answer" itself isn't listed -
+# it's appended separately, blank, as the very last column.
+EXPORT_FEEDBACK_COLUMNS = [
+    "folder_name", "file_name", "question_number", "survey_question", "survey_answer",
+    "needs_review", "review_note", "survey_link", "report_date",
+]
+
+
+def export_needs_review_feedback(
+    bq_project: Optional[str],
+    bq_dataset: str,
+    bq_table: str,
+    feedback_table: str = pipeline_config.BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK,
+    feedback_bucket: str = pipeline_config.GCS_FEEDBACK_BUCKET,
+    feedback_prefix: str = pipeline_config.GCS_FEEDBACK_PREFIX,
+) -> Optional[str]:
+    """Syncs feedback_table (survey_responses_with_feedback) from bq_table
+    (survey_responses - see sync_survey_responses_with_feedback()), then
+    exports every row that still needs a human's answer there - needs_
+    review = TRUE and updated_with_feedback IS NULL - as one Excel file to
+    gs://{feedback_bucket}/{feedback_prefix}tps_feedback_{datetime}.xlsx.
+    Only EXPORT_FEEDBACK_COLUMNS are included (feedback_table itself still
+    carries every column; this trims only what goes into the spreadsheet),
+    plus a blank "correct_answer" column at the end for the reviewer to
+    fill in.
+
+    step6_load_feedback.py picks up the LATEST such file (the datetime
+    suffix sorts lexicographically, so "latest by name" == "latest export
+    run") and ingests it: a row whose correct_answer was filled in gets
+    survey_answer overwritten there; a row left blank keeps its survey_
+    answer unchanged. EVERY newly-ingested row gets updated_with_feedback=
+    TRUE + feedback_updated_time=now - which is what keeps a row from ever
+    being exported here a second time.
+
+    Returns the gs:// URI written, or None if there was nothing to export
+    (every needs_review row already has feedback ingested)."""
+    import io
+
+    bq_client = connect_bigquery(bq_project)
+    resolved_bq_project = bq_project or bq_client.project
+    sync_survey_responses_with_feedback(bq_client, resolved_bq_project, bq_dataset, bq_table, feedback_table)
+
+    full_feedback_table_id = f"{resolved_bq_project}.{bq_dataset}.{feedback_table}"
+    status("[FEEDBACK] Querying %s for needs_review row(s) not yet covered by ingested feedback...", full_feedback_table_id)
+    select_columns = ", ".join(EXPORT_FEEDBACK_COLUMNS)
+    query = f"""
+        SELECT {select_columns}
+        FROM `{full_feedback_table_id}`
+        WHERE needs_review = TRUE AND updated_with_feedback IS NULL
+    """
+    df = bq_client.query(query).to_dataframe()
+    if df.empty:
+        status("[FEEDBACK] No needs_review row(s) pending feedback in %s - nothing to export.", full_feedback_table_id)
+        return None
+
+    df["correct_answer"] = None  # blank - the reviewer fills this in themselves
+
+    # Excel can't hold a timezone-aware datetime (BigQuery TIMESTAMP/DATE columns
+    # can come back from to_dataframe() as tz-aware) - strip the tzinfo (values
+    # stay the same instant, just displayed without an explicit offset) so
+    # to_excel() below doesn't raise on them.
+    for col in df.select_dtypes(include=["datetimetz"]).columns:
+        df[col] = df[col].dt.tz_localize(None)
+
+    file_name = f"tps_feedback_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    blob_name = f"{feedback_prefix.rstrip('/')}/{file_name}"
+
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False)
+    buffer.seek(0)
+
+    bucket = connect_gcs_bucket(feedback_bucket)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_file(
+        buffer,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    gcs_uri = f"gs://{feedback_bucket}/{blob_name}"
+    status("[FEEDBACK] Exported %d row(s) needing review feedback to %s.", len(df), gcs_uri)
+    return gcs_uri
+
+
 def extract_one_file_to_bigquery(
     bucket_name: str,
     root_prefix: str,
@@ -8617,7 +10008,10 @@ def verify_pdf(
     )
     report_date = None  # not needed for a standalone audit; report_date isn't shown in this table
     refreshed_at = datetime.datetime.now(datetime.timezone.utc)
-    rows = answers_to_qa_rows("(verify_pdf)", Path(blob_name).name, answers, report_date, refreshed_at)
+    rows = answers_to_qa_rows(
+        "(verify_pdf)", Path(blob_name).name, answers, report_date, refreshed_at,
+        gcs_uri=f"gs://{bucket_name}/{blob_name}",
+    )
 
     header = (
         f"{'#':<5} {'answer':<40} {'pos':<5} {'conf':<5} {'thresh':<6} "
@@ -8799,6 +10193,45 @@ def main():
         "--only-file \"Nov 23 2025/2025_Nov_23_5_TPS_3996.pdf\".",
     )
     ap.add_argument(
+        "--needs-review-only",
+        action="store_true",
+        help="[extract] Instead of a normal extraction run, scan every folder (or just "
+        "--folders, if given) for files whose name contains NEEDS_REVIEW and load ONE "
+        "'TPS Number' row per such file into --bq-table (see _build_needs_review_row()) - "
+        "no Gemini/pixel extraction runs at all, for these files or any other. Only these "
+        "files' own existing rows are deleted-then-reloaded; every other file already "
+        "loaded in the same folder is left untouched.",
+    )
+    ap.add_argument(
+        "--export-needs-review-feedback",
+        action="store_true",
+        help="[feedback] Instead of a normal extraction run, sync --feedback-table (survey_"
+        "responses_with_feedback) from --bq-table (survey_responses), then export every "
+        "needs_review=TRUE row there not yet covered by ingested feedback (updated_with_"
+        "feedback IS NULL) to a new gs://<feedback-bucket>/<feedback-prefix>tps_feedback_"
+        "{datetime}.xlsx file, with a blank 'correct_answer' column for a reviewer to fill "
+        "in - see export_needs_review_feedback(). step6_load_feedback.py ingests the LATEST "
+        "such file back into --feedback-table.",
+    )
+    ap.add_argument(
+        "--feedback-table",
+        default=pipeline_config.BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK,
+        help="[feedback] BigQuery table --export-needs-review-feedback syncs from --bq-table "
+        "and exports needs_review rows from (uses --bq-project/--bq-dataset for the "
+        "project/dataset). This is the table step6_load_feedback.py ingests feedback into.",
+    )
+    ap.add_argument(
+        "--feedback-bucket",
+        default=pipeline_config.GCS_FEEDBACK_BUCKET,
+        help="[feedback] GCS bucket --export-needs-review-feedback writes its Excel file to.",
+    )
+    ap.add_argument(
+        "--feedback-prefix",
+        default=pipeline_config.GCS_FEEDBACK_PREFIX,
+        help="[feedback] GCS prefix (folder) --export-needs-review-feedback writes its "
+        "tps_feedback_{datetime}.xlsx file under.",
+    )
+    ap.add_argument(
         "--corrections-table",
         default=BQ_CORRECTIONS_TABLE,
         help="[corrections log] BigQuery table name for logged wrong-answer reports. "
@@ -8906,6 +10339,28 @@ def main():
             pipeline_config_enabled=not args.no_pipeline_config,
             spark_staging_bucket=args.spark_staging_bucket,
             allow_schema_recreate=args.allow_schema_recreate,
+        )
+        return
+    if args.needs_review_only:
+        extract_needs_review_files_to_bigquery(
+            bucket_name=args.bucket,
+            root_prefix=args.root_prefix,
+            folders=args.folders,
+            bq_project=args.bq_project,
+            bq_dataset=args.bq_dataset,
+            bq_table=args.bq_table,
+            spark_staging_bucket=args.spark_staging_bucket,
+            allow_schema_recreate=args.allow_schema_recreate,
+        )
+        return
+    if args.export_needs_review_feedback:
+        export_needs_review_feedback(
+            bq_project=args.bq_project,
+            bq_dataset=args.bq_dataset,
+            bq_table=args.bq_table,
+            feedback_table=args.feedback_table,
+            feedback_bucket=args.feedback_bucket,
+            feedback_prefix=args.feedback_prefix,
         )
         return
     extract_to_bigquery(

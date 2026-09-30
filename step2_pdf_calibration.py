@@ -20,8 +20,13 @@ import re
 import pprint
 from pathlib import Path
 
+import pipeline_config
+
 RENDER_DPI = 300
-BQ_TABLE = "ladph_tps.pdf_calibration_profile"
+# "<dataset>.<table>" (project is added separately - see to_bigquery()'s own
+# hardcoded table_project below) - both pulled from pipeline_config.py, the
+# shared source of truth across step1-step6.
+BQ_TABLE = f"{pipeline_config.BQ_DATASET}.{pipeline_config.BQ_TABLE_CALIBRATION}"
 
 # ==========================================================================
 # calibration baseline — measured box geometry
@@ -1065,15 +1070,59 @@ def render_pages(pdf_bytes, dpi=RENDER_DPI):
 def _split_clusters(ratios):
     """Splits measured ink ratios into a blank cluster and a marked cluster.
     See classify_measured() callers for why the split is constrained to a
-    plausible marked-box count rather than taken as the plain widest gap."""
+    plausible marked-box count rather than taken as the plain widest gap -
+    EXCEPT when a genuinely clear (>= CLEAR_GAP) separation exists anywhere
+    in the full sorted array, in which case that real gap is used even if
+    it falls outside the [MIN_PLAUSIBLE_MARKED, MAX_PLAUSIBLE_MARKED]
+    window (bug fix, explicit user request: confirmed on a real file,
+    2025_Nov_23_5_TPS_4047.pdf, where only 6 of this file's 72 confirmed
+    boxes were genuinely marked - well under MIN_PLAUSIBLE_MARKED=8 - with
+    an unmistakable 0.2067 gap separating them from every blank box. The
+    old windowed-only search could never see that gap (index 66 sits past
+    hi_k=64), so it was forced to pick the best gap it COULD find inside
+    the artificial [47, 64] window - a mere 0.0176, which mislabeled 3
+    genuinely blank boxes as "marked" just to satisfy the >=8 floor, and
+    reported threshold=0.1352 sitting in the middle of the blank
+    population instead of near the true ~0.25 boundary. A real, wide gap
+    is strong evidence on its own regardless of how many boxes end up on
+    either side of it - the plausible-count window exists to avoid
+    over-trusting a NARROW, noise-sized gap at an implausible split point,
+    not to override an unambiguous one. Only falls back to the original
+    windowed search when no gap anywhere in the full array reaches
+    CLEAR_GAP, preserving the prior "tight"/forced-split behavior for
+    files that genuinely have no clean separation at all."""
     import numpy as np
     r = np.array(sorted(ratios), float)
     n = len(r)
     if n < 12:
         return None
+
+    # First pass: look for a genuinely clear gap ANYWHERE in the full
+    # array (k from 1 to n-1, i.e. every possible split point) - not
+    # confined to the plausible-count window. Prefer the WIDEST such gap;
+    # among ties, the one closest to the plausible window (so a genuinely
+    # ambiguous file with two similarly-wide clear gaps still prefers the
+    # more plausible split point, rather than an arbitrary earliest-match).
     lo_k = max(1, n - MAX_PLAUSIBLE_MARKED)
-    hi_k = max(lo_k + 1, n - MIN_PLAUSIBLE_MARKED)
-    hi_k = min(hi_k, n - 1)
+    hi_k = min(max(lo_k + 1, n - MIN_PLAUSIBLE_MARKED), n - 1)
+    clear_candidates = []
+    for k in range(1, n):
+        gap = float(r[k] - r[k - 1])
+        if gap >= CLEAR_GAP:
+            in_window = lo_k <= k <= hi_k
+            clear_candidates.append((gap, in_window, k))
+    if clear_candidates:
+        # Sort by (widest gap first, in-window preferred as tiebreaker).
+        clear_candidates.sort(key=lambda c: (-c[0], not c[1]))
+        best_gap, _in_window, best_k = clear_candidates[0]
+        blank_hi, mark_lo = float(r[best_k - 1]), float(r[best_k])
+        n_marked = n - best_k
+        return {"threshold": round((blank_hi + mark_lo) / 2.0, 4),
+                "blank_hi": round(blank_hi, 4), "mark_lo": round(mark_lo, 4),
+                "gap": round(best_gap, 4), "n_marked": n_marked, "quality": "clear"}
+
+    # Fallback: no clear gap anywhere - original windowed-best-gap search,
+    # unchanged from before this fix.
     if hi_k < lo_k:
         return None
     best_gap, best_k = -1.0, lo_k
@@ -1398,7 +1447,7 @@ def to_bigquery(results_or_df, table=BQ_TABLE, project=None, client=None,
     # embedded one, producing "Invalid resource name projects/<ambient>". Explicit DatasetReference(project, dataset_id) removes the ambiguity.
 #     table_project, table_dataset, table_name = table.split(".")
     table_dataset, table_name = table.split(".")
-    table_project = 'gcp-sapchoda-dev'
+    table_project = pipeline_config.GCP_PROJECT_ID
     project = project or table_project
     
     client = client or bigquery.Client(project=project)
