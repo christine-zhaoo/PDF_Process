@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-build_file_quality_review.py
+step5_file_quality.py
 
 Standalone script that reads BigQuery's survey_responses table (produced by
-merge_survey_pdfs.py's extraction step) and builds the file_quality_review
+step4_process_pdf.py's extraction step) and builds the file_quality_review
 table from it — one row per source file, summarizing every needs_review=TRUE
 question for quick triage.
 
-Split out of merge_survey_pdfs.py (explicit user request: "I need to extract
+Split out of step4_process_pdf.py (explicit user request: "I need to extract
 the sections of pdf_quality_table from merge survey pdfs, to a separate py
 file... it reads from the survey_responses table, and generates the
 file_quality_review table... to make merge survey pdfs process smaller") —
 this file is now a fully standalone tool with no import dependency on
-merge_survey_pdfs.py, so it can be run/deployed/scheduled independently of
-the Gemini/BigQuery extraction pipeline. merge_survey_pdfs.py no longer
+step4_process_pdf.py, so it can be run/deployed/scheduled independently of
+the Gemini/BigQuery extraction pipeline. step4_process_pdf.py no longer
 builds or loads file_quality_review itself; run this script after each
 extraction run (or on whatever schedule you like) to (re)build it.
 
@@ -28,8 +28,8 @@ What it does
    whether ANY question needs_review, how many/out of how many, a
    human-readable issue_summary, and two REPEATED columns (issues,
    unreadable_areas) listing exactly which questions/pages to look at and
-   why — using the same review-reason categorization
-   (_classify_review_reason()) merge_survey_pdfs.py always has.
+   why — using this file's own review-reason categorization
+   (_classify_review_reason(), below), independent of step4_process_pdf.py.
 4. Loads the resulting rows into file_quality_review via the Spark BigQuery
    connector, partitioned by refreshed_date, replacing (delete-then-load)
    any existing rows for the same folder_name(s) processed this run.
@@ -133,12 +133,12 @@ def err(msg, *args) -> None:
 
 
 # --------------------------------------------------------------------------
-# Question number / page lookups — copied verbatim from merge_survey_pdfs.py
+# Question number / page lookups — copied verbatim from step4_process_pdf.py
 # (QUESTION_TEXT_BY_NUMBER / _QUESTION_NUMBER_BY_TEXT / _QUESTION_PAGE_NUMBER)
 # so build_file_quality_row() below can turn a survey_responses row's
 # survey_question text back into a bare question number, without importing
-# merge_survey_pdfs.py's full SURVEY_QUESTIONS/build_full_question_text()
-# machinery. If merge_survey_pdfs.py's own question set ever changes, this
+# step4_process_pdf.py's full SURVEY_QUESTIONS/build_full_question_text()
+# machinery. If step4_process_pdf.py's own question set ever changes, this
 # map needs to be updated here too — see the "Not in scope" note in this
 # revision's project doc for why that tradeoff was accepted.
 # --------------------------------------------------------------------------
@@ -155,7 +155,7 @@ def _question_number_from_text(survey_question: str, question_number_by_text: di
     into its bare question number via the caller-supplied lookup (built once
     per run from the live survey_responses data itself — see
     build_question_number_lookup() — rather than a hardcoded copy of
-    merge_survey_pdfs.py's own question text, which could drift out of sync
+    step4_process_pdf.py's own question text, which could drift out of sync
     with whatever text a given historical row actually stored)."""
     return question_number_by_text.get(survey_question, "?")
 
@@ -166,12 +166,12 @@ def build_question_number_lookup(rows: list) -> dict:
     leading question number/label out of each row's own mark_position-
     adjacent conventions. Since survey_responses doesn't store a bare
     question number column (only the full question text), and this script
-    is deliberately independent of merge_survey_pdfs.py's SURVEY_QUESTIONS
+    is deliberately independent of step4_process_pdf.py's SURVEY_QUESTIONS
     definition, this infers the number from the text's own leading token —
     every question's stored text in this pipeline starts with its number
     followed by '.' or ')' (e.g. "H1. CalOMS Provider ID", "23) ..."), which
     is the one stable convention this script can rely on without importing
-    merge_survey_pdfs.py."""
+    step4_process_pdf.py."""
     lookup = {}
     for r in rows:
         text = r.get("survey_question") or ""
@@ -191,10 +191,10 @@ def build_question_number_lookup(rows: list) -> dict:
 def _classify_review_reason(review_note: str) -> str:
     """Turns one row's (possibly multi-clause, semicolon-joined) review_note
     into a single short category phrase for the "issues" list - purely
-    string-matching against the fixed phrasings merge_survey_pdfs.py's
+    string-matching against the fixed phrasings step4_process_pdf.py's
     answers_to_qa_rows()/cross_check_answer() themselves generate, so this
     never invents information that isn't already in review_note. Copied
-    verbatim from merge_survey_pdfs.py."""
+    verbatim from step4_process_pdf.py."""
     note = review_note.lower()
     # IMPORTANT: check the Cloud Vision cross-check phrasings BEFORE the
     # genuinely-blank check below. cross_check_written_field_with_vision()'s
@@ -244,7 +244,7 @@ def build_file_quality_row(
     review, so the table can also answer "how many files came back clean")
     - issue_summary/issues/unreadable_areas are simply empty/a
     clean-bill-of-health message in that case. Logic copied verbatim from
-    merge_survey_pdfs.py's build_file_quality_row(), adapted to take plain
+    step4_process_pdf.py's build_file_quality_row(), adapted to take plain
     dict rows (BigQuery query results) instead of in-process QARow objects."""
     report_date_str = report_date.isoformat() if report_date else None
     refreshed_at_str = refreshed_at.isoformat()
@@ -287,7 +287,7 @@ def build_file_quality_row(
 
 # --------------------------------------------------------------------------
 # file_quality_review BigQuery schema + Spark-based partitioned load. Same
-# registry shape and load pattern as merge_survey_pdfs.py's
+# registry shape and load pattern as step4_process_pdf.py's
 # BQ_FILE_QUALITY_SCHEMA/load_rows_into_bq_via_spark() (Revision 40) —
 # duplicated here (not imported) so this file has no dependency on that one.
 # --------------------------------------------------------------------------
@@ -311,7 +311,7 @@ def bq_schema_to_spark_schema(bq_schema):
     """Converts BQ_FILE_QUALITY_SCHEMA's plain (name, type, description)
     tuples into an explicit pyspark.sql.types.StructType, so the Spark load
     below uses a known schema instead of auto-inferring one from the data.
-    See merge_survey_pdfs.py's identically-named function (Revision 40) for
+    See step4_process_pdf.py's identically-named function (Revision 40) for
     the full rationale; duplicated here rather than imported to keep this
     file standalone."""
     from pyspark.sql.types import (
@@ -334,7 +334,7 @@ def bq_schema_to_spark_schema(bq_schema):
 
 def ensure_file_quality_table(bq_client, project: str, dataset: str, table: str):
     """Creates (or, on an older table, patches) the file_quality_review
-    table schema - same create-or-patch pattern merge_survey_pdfs.py uses
+    table schema - same create-or-patch pattern step4_process_pdf.py uses
     for its own tables, so an existing table never needs to be dropped just
     because a new column is added to BQ_FILE_QUALITY_SCHEMA later."""
     from google.api_core.exceptions import NotFound
@@ -387,7 +387,7 @@ def delete_existing_rows_for_folder(bq_client, table_ref, folder: str) -> None:
     the first time a folder is loaded. Uses a query job (DML), not a
     streaming insert, so this delete-then-load pattern doesn't hit
     BigQuery's "can't UPDATE/DELETE rows that were just streamed in"
-    restriction. Copied verbatim from merge_survey_pdfs.py."""
+    restriction. Copied verbatim from step4_process_pdf.py."""
     from google.cloud import bigquery
 
     full_table_id = f"{table_ref.project}.{table_ref.dataset_id}.{table_ref.table_id}"
@@ -409,7 +409,7 @@ def load_rows_into_bq_via_client(
 ) -> int:
     """Loads `rows` straight into BigQuery via the google-cloud-bigquery
     client's load_table_from_json (WRITE_APPEND) - same approach
-    merge_survey_pdfs.py/step4_process_pdf.py already use for their own BQ
+    step4_process_pdf.py already uses for its own BQ
     writes. Used as the plain fallback when no Spark session is available
     (e.g. running this script locally instead of inside a Syntasa/Databricks
     notebook), so this script can run and be validated without pyspark."""
@@ -443,13 +443,13 @@ def load_rows_into_bq_via_spark(
     mode='append', composing with delete_existing_rows_for_folder() above
     (the DELETE happens first; this call only appends). Copied verbatim
     (aside from the partition field name, unchanged here) from
-    merge_survey_pdfs.py's identically-named function (Revision 40/42).
+    step4_process_pdf.py's identically-named function (Revision 40/42).
 
     staging_bucket: the connector's default ("indirect") write path stages
     the DataFrame's data into a GCS bucket before loading it into BigQuery,
     and raises "Either temporary or persistent GCS bucket must be set" if
     none is configured. Defaults to SPARK_BQ_STAGING_BUCKET if not given -
-    unlike merge_survey_pdfs.py/merge_pdfs_to_folder.py, this script has no
+    unlike step4_process_pdf.py/merge_pdfs_to_folder.py, this script has no
     "main" GCS bucket of its own (it only touches BigQuery), so
     SPARK_BQ_STAGING_BUCKET defaults to None here and must be set explicitly
     (via --spark-staging-bucket, a config edit, or a cluster-level Spark
@@ -467,7 +467,7 @@ def load_rows_into_bq_via_spark(
     import pandas as pd
 
     # build_file_quality_row() stores report_date/refreshed_at/refreshed_date
-    # as ISO strings (matching merge_survey_pdfs.py's own QARow convention),
+    # as ISO strings (matching step4_process_pdf.py's own QARow convention),
     # but Spark's DateType/TimestampType converters need real date/datetime
     # objects, not strings - PySparkTypeError: "DateType() can not accept
     # object '2025-11-18' in type <class 'str'>" otherwise. Convert any
@@ -523,7 +523,7 @@ def load_rows_into_bq_via_spark(
 def query_survey_responses(bq_client, project: str, dataset: str, table: str, folders: Optional[list] = None) -> list:
     """Queries every row of survey_responses (optionally restricted to
     specific folder_name(s)), returning plain dicts. This is the one piece
-    of genuinely new logic in this script (merge_survey_pdfs.py never reads
+    of genuinely new logic in this script (step4_process_pdf.py never reads
     survey_responses back — it only ever wrote it) since file_quality_review
     now has to be built FROM BigQuery data rather than from in-process QARow
     objects produced during extraction."""
@@ -554,7 +554,7 @@ def build_file_quality_rows(rows: list, refreshed_at: Optional[datetime.datetime
     """Groups a flat list of survey_responses rows (plain dicts) by
     (folder_name, file_name) and aggregates each group into one
     file_quality_review row via build_file_quality_row(). `refreshed_at`
-    defaults to now (UTC) if not given, matching how merge_survey_pdfs.py
+    defaults to now (UTC) if not given, matching how step4_process_pdf.py
     always stamped this at extraction time — here it's stamped at the time
     this script actually runs, since that's a distinct (and possibly much
     later) event from when the underlying survey_responses rows were

@@ -389,7 +389,7 @@ BUCKET_NAME = pipeline_config.GCS_BUCKET
 ROOT_PREFIX = pipeline_config.GCS_SPLIT_PREFIX  # step4 reads step1's SPLIT output, not the raw scans
 OUTPUT_PREFIX = None  # None -> derived as "<ROOT_PREFIX>_merged/"
 # The Spark BigQuery connector's default write path (used by
-# load_rows_into_bq_via_spark(), Revision 40) stages data through a GCS bucket before loading it into BigQuery - reuses BUCKET_NAME so a separate bucket doesn't need to be created just for this.
+# load_rows_into_bq_via_spark()) stages data through a GCS bucket before loading it into BigQuery - reuses BUCKET_NAME so a separate bucket doesn't need to be created just for this.
 SPARK_BQ_STAGING_BUCKET = BUCKET_NAME
 SURVEY_LINK_BASE_URL = "http://localhost:8080/surveys/"  # survey_link column = this + file_name with ".pdf" stripped
 
@@ -434,7 +434,7 @@ FILE_EXTRACTION_WORKERS = pipeline_config.FILE_EXTRACTION_WORKERS
 # model's own self-reported confidence (build_extraction_prompt() rule 15) below this -> needs_review=True. Only gates a question where no pixel-verified reading already took over (see answers_to_qa_rows()) - a confident pixel detector's own margin check already independently vouches for those.
 VISION_DOUBLE_CHECK_ENABLED = pipeline_config.VISION_DOUBLE_CHECK_ENABLED  # set False (or pass --no-vision-check) to skip Cloud Vision calls entirely, e.g. no Vision API enabled/quota - written-text questions then fall back to model-only + confidence-threshold checking alone, same as before this feature existed.
 VISION_FREEFORM_COVERAGE_THRESHOLD = pipeline_config.VISION_FREEFORM_COVERAGE_THRESHOLD
-# cross_check_written_field_with_vision()'s freeform fields (H4/H5/H6/24): word-level matching coverage (see that function - Revision 19's word-level, sum-of-all-matching-runs fix) below this -> vision_match=False, needs_review=True. Raised from 0.7 to 0.9 (explicit user request) now that the coverage score is computed correctly and can be trusted at a tighter cutoff - was 0.7 while the score itself was still unreliable (see Revision 19's project doc for the four bugs fixed there).
+# cross_check_written_field_with_vision()'s freeform fields (H4/H5/H6/24): word-level matching coverage (see that function's word-level, sum-of-all-matching-runs scoring) below this -> vision_match=False, needs_review=True. Sourced from pipeline_config.py (VISION_FREEFORM_COVERAGE_THRESHOLD) - tune it there/in the shared config workbook rather than editing this constant directly, so the value stays in sync with what a reviewer sees when editing the workbook's Settings tab.
 H2_CHAR_OVERLAP_THRESHOLD = pipeline_config.H2_CHAR_OVERLAP_THRESHOLD
 H4_CHAR_OVERLAP_THRESHOLD = pipeline_config.H4_CHAR_OVERLAP_THRESHOLD
 # cross_check_written_field_with_vision()'s H4 (Field Based Services: Agency)
@@ -463,7 +463,7 @@ BQ_DATASET = pipeline_config.BQ_DATASET
 BQ_TABLE = pipeline_config.BQ_TABLE_SURVEY_RESPONSES
 BQ_CORRECTIONS_TABLE = pipeline_config.BQ_TABLE_CORRECTIONS  # see log_corrections() below
 
-# --- upstream QC routing (Revision 37) ---
+# --- upstream QC routing ---
 # `classify_pdf_quality.py` is a SEPARATE script that runs before this one
 # and writes one row per PDF to PDF_QUALITY_TABLE (see the "LAPD" project doc
 # "pdf-quality-classifier-and-routing.md" for its full field list and
@@ -503,7 +503,7 @@ PDF_MANIFEST_TABLE = pipeline_config.BQ_TABLE_MANIFEST  # step1_merge_pdf.py's p
 # required dependency.
 PDF_CALIBRATION_ROUTING_ENABLED = True  # set False (or pass --no-calibration-profile) to skip the lookup entirely
 
-# --- externalized calibration/tuning parameters (Revision 38) ---
+# --- externalized calibration/tuning parameters ---
 # Every _GRID_*/_YESNO_*/_MULTISELECT_* pixel-detection threshold, pad, and
 # per-question override, plus _INK_THRESHOLD, _WRITTEN_FIELD_ANCHORS, and
 # _CORRECTIONS_ROOT_CAUSE_CATEGORIES, is now ALSO recorded as a plain
@@ -1390,8 +1390,7 @@ _VISION_FREEFORM_FIELDS = pipeline_config._VISION_FREEFORM_FIELDS
 # (match=None) rather than "disagree" (match=False).
 _WRITTEN_FIELD_EXPECTED_DIGITS = {"26": 2}
 
-# Revision 29 follow-up (explicit user request: "H4 and H5 doesn't need to
-# be marked as need review if it's blank"). H4 (agency/program name) and H5
+# H4 (agency/program name) and H5
 # (address) are free-form written fields that are legitimately left blank
 # far more often than the other tracked fields - exempted from the general
 # blank-answer-always-needs-review backstop in answers_to_qa_rows() only;
@@ -1399,9 +1398,7 @@ _WRITTEN_FIELD_EXPECTED_DIGITS = {"26": 2}
 # applies to them normally.
 _BLANK_ANSWER_EXEMPT_FIELDS = pipeline_config._BLANK_ANSWER_EXEMPT_FIELDS
 
-# Revision 29 (explicit user request: "H2 and H6 should have the Vision OCR
-# rule over the Vision model, because I think Vision OCR has been capturing
-# it more accurately"). For these fields specifically, extract_qa_from_pdf()
+# For the fields in _VISION_AUTHORITATIVE_FIELDS specifically, extract_qa_from_pdf()
 # doesn't just CROSS-CHECK the model's answer against Cloud Vision's
 # anchored reading (like every other written-text field) - it REPLACES the
 # model's answer with the anchored Vision reading outright, whenever Vision
@@ -1955,10 +1952,11 @@ class QARow:
 # the last box). Every date the respondent could plausibly have written on
 # this batch of forms falls in this year, so it's fed to the model as a
 # known anchor for reading H6 (see rule 16 below) rather than something the
-# model has to infer purely from ambiguous handwriting. Change this between
-# batches if a future run covers forms filled out in a different year -
-# nothing else in this module derives the year from anywhere else.
-REPORT_YEAR = "2025"
+# model has to infer purely from ambiguous handwriting. Sourced from
+# pipeline_config.py (editable via the "REPORT_YEAR" row in the shared
+# configuration workbook's Settings tab) so a new batch's year is a config
+# edit, not a code change.
+REPORT_YEAR = pipeline_config.REPORT_YEAR
 
 
 def build_extraction_prompt() -> str:
@@ -5563,7 +5561,25 @@ def detect_yesno_box_answers(
                     if abs((fx1 - fx0) - expected_w) > 14 * x_scale or abs((fy1 - fy0) - expected_h) > 14 * y_scale:
                         shape_ok = False
                 if not shape_ok:
-                    if not row_was_located:
+                    # Explicit user request: generalize the multiselect
+                    # detector's "trust a calibration-confirmed rect
+                    # directly when the shape search fails on it" fix (see
+                    # detect_multiselect_ink_ratios()'s own comment on this
+                    # same rule - 2025_Nov_18_1_TPS_6952.pdf's Q34) to every
+                    # question that has one, here too - rects_confirmed
+                    # means THIS box's exact position was already verified
+                    # against the page's own printed registration marks
+                    # (a stronger signal than row_was_located, which is
+                    # really just a proxy for "do we trust the coordinates
+                    # enough to blindly read ink here"). Previously this
+                    # fallback only fired when row_was_located ALSO held
+                    # (ruled-line or list_anchor/fixed row detection
+                    # succeeded) - a calibration-confirmed box on a
+                    # question whose ROW-level search failed for some
+                    # other reason still aborted the whole candidate with
+                    # no reading at all, even though this one box's own
+                    # position was never in doubt.
+                    if not (row_was_located or rects_confirmed):
                         # No independent evidence of where this row even is
                         # yet - a border-agnostic reading here would be a
                         # pure guess, not a corroborated fallback. Abort this
@@ -9756,16 +9772,108 @@ def sync_survey_responses_with_feedback(
     bq_client.query(query).result()
 
 
-# Columns from survey_responses_with_feedback actually shown to a human
-# reviewer in export_needs_review_feedback()'s Excel file - everything else
-# on that row (model_confidence, vision_cross_check, pdf_quality_route,
-# etc.) is internal extraction detail a reviewer doesn't need to answer
-# "what's the correct value here". "correct_answer" itself isn't listed -
-# it's appended separately, blank, as the very last column.
-EXPORT_FEEDBACK_COLUMNS = [
-    "folder_name", "file_name", "question_number", "survey_question", "survey_answer",
-    "needs_review", "review_note", "survey_link", "report_date",
+# Columns actually shown to a human reviewer in export_needs_review_feedback()'s
+# Excel file, in display order - everything else on the row (model_confidence,
+# vision_cross_check, pdf_quality_route, report_date, etc.) is internal
+# extraction detail a reviewer doesn't need to answer "what's the correct value
+# here". "correct_answer" isn't queried from BigQuery - it's added separately,
+# blank, as the reviewer's own input column (see export_needs_review_feedback()).
+EXPORT_FEEDBACK_VISIBLE_COLUMNS = [
+    "question_number", "survey_question", "survey_answer", "review_note",
+    "needs_review", "survey_link", "source_page_range",
 ]
+# folder_name/file_name are NOT shown - a reviewer doesn't need them to answer
+# "what's correct here" - but step6_load_feedback.py's ingest MERGE needs both
+# (file_name alone isn't globally unique across folders - see this module's
+# other file_name-collision comments) to match a filled-in row back to the
+# right BigQuery row, so both are still written to the sheet, just as HIDDEN
+# columns after "correct_answer" (see _write_feedback_workbook()).
+EXPORT_FEEDBACK_JOIN_COLUMNS = ["folder_name", "file_name"]
+EXPORT_FEEDBACK_COLUMNS = EXPORT_FEEDBACK_VISIBLE_COLUMNS + EXPORT_FEEDBACK_JOIN_COLUMNS
+
+
+def _write_feedback_workbook(df) -> "io.BytesIO":
+    """Renders df (EXPORT_FEEDBACK_VISIBLE_COLUMNS + "correct_answer" +
+    EXPORT_FEEDBACK_JOIN_COLUMNS, in that column order) as a formatted .xlsx
+    for a human reviewer:
+
+      - bold, filled header row; header row frozen so it stays visible while
+        scrolling a long sheet.
+      - column widths sized per-column (wide + word-wrap for the free-text
+        survey_question/review_note/correct_answer columns, narrow for short
+        fields like needs_review/source_page_range).
+      - folder_name/file_name pushed to the end and HIDDEN - still present in
+        the file for step6_load_feedback.py to read back (see
+        EXPORT_FEEDBACK_JOIN_COLUMNS's comment), just out of the reviewer's way.
+      - sheet protection enabled with every cell LOCKED except the
+        "correct_answer" column's data cells - the only thing a reviewer
+        should be typing into. Protection has no password (a reviewer isn't
+        an adversary to defend against - this is guardrails against
+        accidentally overwriting a formula/lookup cell, not a security
+        boundary), so Excel's own "Unprotect Sheet" can always lift it if
+        someone genuinely needs to.
+
+    Returns an in-memory BytesIO positioned at the start, ready to upload."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill, Protection
+    from openpyxl.utils import get_column_letter
+
+    columns = EXPORT_FEEDBACK_VISIBLE_COLUMNS + ["correct_answer"] + EXPORT_FEEDBACK_JOIN_COLUMNS
+    editable_columns = {"correct_answer"}
+    # (width, wrap_text) per column - anything not listed falls back to the
+    # default branch below.
+    column_layout = {
+        "question_number": (12, False),
+        "survey_question": (50, True),
+        "survey_answer": (22, True),
+        "review_note": (60, True),
+        "needs_review": (12, False),
+        "survey_link": (46, False),
+        "source_page_range": (14, False),
+        "correct_answer": (30, True),
+    }
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Needs Review"
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    wrap_top_left = Alignment(vertical="top", wrap_text=True)
+    top_left = Alignment(vertical="top", wrap_text=False)
+    locked = Protection(locked=True)
+    unlocked = Protection(locked=False)
+
+    for col_idx, col_name in enumerate(columns, start=1):
+        letter = get_column_letter(col_idx)
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        cell.protection = locked  # header stays locked even though the column body may not be
+        width, _wrap = column_layout.get(col_name, (18, False))
+        ws.column_dimensions[letter].width = width
+        if col_name in EXPORT_FEEDBACK_JOIN_COLUMNS:
+            ws.column_dimensions[letter].hidden = True
+
+    for row_idx, record in enumerate(df[columns].itertuples(index=False, name=None), start=2):
+        for col_idx, (col_name, value) in enumerate(zip(columns, record), start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=(None if value is None else value))
+            _width, wrap = column_layout.get(col_name, (18, False))
+            cell.alignment = wrap_top_left if wrap else top_left
+            cell.protection = unlocked if col_name in editable_columns else locked
+
+    ws.freeze_panes = "A2"
+    ws.protection.sheet = True
+    ws.protection.formatCells = False
+    ws.protection.formatColumns = False
+    ws.protection.formatRows = False
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
 
 
 def export_needs_review_feedback(
@@ -9781,10 +9889,15 @@ def export_needs_review_feedback(
     exports every row that still needs a human's answer there - needs_
     review = TRUE and updated_with_feedback IS NULL - as one Excel file to
     gs://{feedback_bucket}/{feedback_prefix}tps_feedback_{datetime}.xlsx.
-    Only EXPORT_FEEDBACK_COLUMNS are included (feedback_table itself still
-    carries every column; this trims only what goes into the spreadsheet),
-    plus a blank "correct_answer" column at the end for the reviewer to
-    fill in.
+    Only EXPORT_FEEDBACK_VISIBLE_COLUMNS are shown to the reviewer (feedback_
+    table itself still carries every column; this trims only what goes into
+    the spreadsheet), plus a blank "correct_answer" column for the reviewer
+    to fill in - see _write_feedback_workbook() for the formatting (header
+    styling, column widths/wrapping, frozen header row) and protection
+    (every cell locked except "correct_answer") applied to the file.
+    folder_name/file_name are written too, as hidden columns, purely so
+    step6_load_feedback.py's ingest can match a filled-in row back to the
+    right BigQuery row - see EXPORT_FEEDBACK_JOIN_COLUMNS's comment.
 
     step6_load_feedback.py picks up the LATEST such file (the datetime
     suffix sorts lexicographically, so "latest by name" == "latest export
@@ -9796,8 +9909,6 @@ def export_needs_review_feedback(
 
     Returns the gs:// URI written, or None if there was nothing to export
     (every needs_review row already has feedback ingested)."""
-    import io
-
     bq_client = connect_bigquery(bq_project)
     resolved_bq_project = bq_project or bq_client.project
     sync_survey_responses_with_feedback(bq_client, resolved_bq_project, bq_dataset, bq_table, feedback_table)
@@ -9820,16 +9931,14 @@ def export_needs_review_feedback(
     # Excel can't hold a timezone-aware datetime (BigQuery TIMESTAMP/DATE columns
     # can come back from to_dataframe() as tz-aware) - strip the tzinfo (values
     # stay the same instant, just displayed without an explicit offset) so
-    # to_excel() below doesn't raise on them.
+    # the workbook writer below doesn't raise on them.
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
 
     file_name = f"tps_feedback_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     blob_name = f"{feedback_prefix.rstrip('/')}/{file_name}"
 
-    buffer = io.BytesIO()
-    df.to_excel(buffer, index=False)
-    buffer.seek(0)
+    buffer = _write_feedback_workbook(df)
 
     bucket = connect_gcs_bucket(feedback_bucket)
     blob = bucket.blob(blob_name)

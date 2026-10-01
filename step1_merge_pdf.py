@@ -97,10 +97,10 @@ ROOT_PREFIX = pipeline_config.GCS_RAW_PREFIX
 DESTINATION_PREFIX = pipeline_config.GCS_SPLIT_PREFIX
 PAGES_PER_SURVEY = 2
 TPS_EXTRACTION_MODEL = pipeline_config.TPS_EXTRACTION_MODEL
-# Explicit user request: keep gemini-3.1-flash-lite as the one model used
-# across all of step1's Gemini calls (TPS digit extraction, language
-# gating, blank/declined checking) rather than mixing in a stronger/
-# costlier model for just one check.
+# Explicit user request: keep ONE model used across all of step1's Gemini
+# calls (TPS digit extraction, language gating, blank/declined checking)
+# rather than mixing in a stronger/costlier model for just one check. See
+# pipeline_config.py's TPS_EXTRACTION_MODEL for the model actually in effect.
 TPS_EXTRACTION_LOCATION = pipeline_config.VERTEX_LOCATION
 TPS_EXTRACTION_PROJECT = pipeline_config.GCP_PROJECT_ID
 TPS_EXTRACTION_MAX_ATTEMPTS = 3

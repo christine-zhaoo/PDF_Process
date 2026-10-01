@@ -65,7 +65,6 @@ GCS_SPLIT_PREFIX = "TPS_Scanned_2025_Reorgnized/"
 
 # step6's input: the human-reviewed feedback/corrections spreadsheet.
 GCS_FEEDBACK_BUCKET = "tps_survey"
-GCS_FEEDBACK_BLOB = "TPS_Feedback/feedback_test.xlsx"
 # step4's output / step6's input: the folder step4's --export-needs-review-
 # feedback writes one "tps_feedback_{datetime}.xlsx" file into per run, and
 # step6 reads the LATEST (by name, since the datetime suffix sorts
@@ -100,6 +99,10 @@ VERTEX_LOCATION = "global"
 TPS_EXTRACTION_MODEL = "gemini-3.8-flash"
 # step4: the main survey question/answer extraction model.
 GEMINI_MODEL = "gemini-3.8-flash"
+# step3: the Cloud Vision judgment call on handwriting_readable/tears_or_
+# damage for non-clear files (see classify_gcs()/classify_pdf_bytes() in
+# step3_pdf_quality_check.py).
+STEP3_VISION_MODEL = "gemini-3.1-flash-lite"
 # None -> Cloud Vision uses the application-default GCP project, same
 # convention as step4's own VERTEX_PROJECT_ID/BQ_PROJECT_ID.
 VISION_PROJECT_ID = None
@@ -107,9 +110,12 @@ VISION_PROJECT_ID = None
 # ==========================================================================
 # Report year
 # ==========================================================================
-# The year this batch of surveys was collected - used wherever a written
-# date/digit reading needs a plausibility check (e.g. step4's H6 "does the
-# year look right" sanity check, step1/step2's folder-name year fallback).
+# The year this batch of surveys was collected - fed to step4's extraction
+# prompt as a known anchor for reading H6 ("Today's Date") and used in its
+# "does the year look right" plausibility check on Cloud Vision's OCR of
+# that field. Not currently consulted by step1/step2 (they derive a survey's
+# date from its folder name, with the run's own current year as a fallback
+# only when the folder name has none).
 REPORT_YEAR = "2025"
 
 # ==========================================================================
@@ -304,11 +310,11 @@ def _apply_settings(settings: dict) -> None:
     g = globals()
     string_params = (
         "GCS_BUCKET", "GCS_RAW_PREFIX", "GCS_SPLIT_PREFIX", "GCS_FEEDBACK_BUCKET",
-        "GCS_FEEDBACK_BLOB", "GCS_FEEDBACK_PREFIX", "GCP_PROJECT_ID", "BQ_DATASET", "BQ_TABLE_MANIFEST",
+        "GCS_FEEDBACK_PREFIX", "GCP_PROJECT_ID", "BQ_DATASET", "BQ_TABLE_MANIFEST",
         "BQ_TABLE_CALIBRATION", "BQ_TABLE_QUALITY", "BQ_TABLE_SURVEY_RESPONSES",
         "BQ_TABLE_CORRECTIONS", "BQ_TABLE_PIPELINE_CONFIG", "BQ_TABLE_FILE_QUALITY",
         "BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK", "VERTEX_LOCATION",
-        "TPS_EXTRACTION_MODEL", "GEMINI_MODEL", "REPORT_YEAR",
+        "TPS_EXTRACTION_MODEL", "GEMINI_MODEL", "STEP3_VISION_MODEL", "REPORT_YEAR",
     )
     float_params = (
         "MODEL_CONFIDENCE_THRESHOLD", "VISION_FREEFORM_COVERAGE_THRESHOLD",

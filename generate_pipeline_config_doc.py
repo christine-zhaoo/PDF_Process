@@ -113,8 +113,8 @@ SETTINGS_ROWS = [
      cfg.GCS_SPLIT_PREFIX, "Same place as above - the folder step 1 writes its output into. Look for subfolders named by date (e.g. \"Nov 23 2025\")."),
     ("GCS_FEEDBACK_BUCKET", "What bucket holds the spreadsheet where a human reviewer's corrections are recorded (step 6's input)?",
      cfg.GCS_FEEDBACK_BUCKET, "Usually the same bucket as above, unless your team keeps reviewed feedback in a separate bucket - check with whoever runs the review step."),
-    ("GCS_FEEDBACK_BLOB", "What is the exact file path of that feedback spreadsheet inside that bucket?",
-     cfg.GCS_FEEDBACK_BLOB, "Cloud Storage → open the feedback bucket → copy the full path shown for that file (folder/filename.xlsx)."),
+    ("GCS_FEEDBACK_PREFIX", "Inside that bucket, which folder does step 4 write its reviewable feedback spreadsheets into, and step 6 read the latest one from?",
+     cfg.GCS_FEEDBACK_PREFIX, "Cloud Storage → open the feedback bucket → look for a folder containing files named like \"tps_feedback_20251123_143000.xlsx\"; step 6 always picks the newest one automatically."),
 
     # --- Section: Where the processing runs ---
     ("__SECTION__", "WHERE THE PROCESSING RUNS (GOOGLE CLOUD PROJECT)"),
@@ -152,6 +152,8 @@ SETTINGS_ROWS = [
      cfg.TPS_EXTRACTION_MODEL, "Vertex AI Console → Model Garden → search \"Gemini\" → copy the exact model ID shown (e.g. gemini-3.8-flash). Ask engineering before changing this - a different model can change accuracy."),
     ("GEMINI_MODEL", "Which Gemini model does step 4 use to read every question's answer off the scanned form?",
      cfg.GEMINI_MODEL, "Same place as above. This is the single most important model in the whole pipeline - changing it changes the accuracy of every extracted answer."),
+    ("STEP3_VISION_MODEL", "Which Gemini model does step 3 use for its own judgment call on whether a scan's handwriting is readable or the page is torn/damaged?",
+     cfg.STEP3_VISION_MODEL, "Same place as above."),
 
     # --- Section: This survey's own details ---
     ("__SECTION__", "THIS SURVEY BATCH'S OWN DETAILS"),
@@ -361,8 +363,8 @@ def build_workbook(path: str) -> None:
          "Nearly everything - especially GEMINI_MODEL, all the accuracy tuning numbers, VISION_DOUBLE_CHECK_ENABLED, PDF_QUALITY_ROUTING_ENABLED, BQ_TABLE_SURVEY_RESPONSES, BQ_TABLE_CORRECTIONS, and the whole 'Survey Questions' tab"),
         ("Step 5 - Roll Up Quality", "Summarizes step 3/4's per-file quality findings into one reviewable report.",
          "GCP_PROJECT_ID, BQ_TABLE_FILE_QUALITY"),
-        ("Step 6 - Apply Human Corrections", "Reads the reviewer's corrections spreadsheet and produces the final, corrected results table.",
-         "GCS_FEEDBACK_BUCKET, GCS_FEEDBACK_BLOB, GCP_PROJECT_ID, BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK"),
+        ("Step 6 - Apply Human Corrections", "Reads the LATEST reviewer's-corrections spreadsheet step 4 exported and applies it to the final, corrected results table.",
+         "GCS_FEEDBACK_BUCKET, GCS_FEEDBACK_PREFIX, GCP_PROJECT_ID, BQ_TABLE_SURVEY_RESPONSES, BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK"),
     ]
     for title, desc, used in steps:
         _row(title, bold=True, size=11)

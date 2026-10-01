@@ -1,38 +1,39 @@
 #!/usr/bin/env python3
 """
-notebook_2_pdf_quality.py — SELF-CONTAINED. No other .py file needed.
+step3_pdf_quality_check.py — SELF-CONTAINED. No other .py file needed
+(other than pipeline_config.py for shared settings).
 
 Reads every PDF under a folder/GCS prefix and writes one QC row per file to a
-partitioned BigQuery table:
+partitioned BigQuery table (see pipeline_config.py's BQ_TABLE_QUALITY):
 
-    syntasa-saas.lapd_survey.pdf_quality
+    <GCP_PROJECT_ID>.<BQ_DATASET>.pdf_quality
 
 overall_quality (clear/unclear/totally_unreadable) and recommended_route
 (pixel/vision/fallback) are DIFFERENT questions - see the ROUTING section
 below.
 
-DEPENDS ON notebook 1's BIGQUERY TABLE, NOT ITS .py FILE
+DEPENDS ON step2's BIGQUERY TABLE, NOT ITS .py FILE
 ---------------------------------------------------------
-This notebook is self-contained code-wise (no import of
-notebook_1_calibration_profile.py or any other local file - all geometry/ink
-logic needed for the SELF-MEASURED fallback is duplicated inline below). But
-its PRIMARY input for each file's measurements is notebook 1's BigQuery
-output table, pdf_calibration_profile: for every file, this notebook first
-queries that table by file_name for the already-measured box rects, ink
-threshold and registration-mark geometry, and uses those directly instead of
-re-deriving them.
+This script is self-contained code-wise (no import of step2_pdf_
+calibration.py or any other local file - all geometry/ink logic needed for
+the SELF-MEASURED fallback is duplicated inline below). But its PRIMARY
+input for each file's measurements is step2's BigQuery output table,
+pdf_calibration_profile: for every file, this script first queries that
+table by file_name for the already-measured box rects, ink threshold and
+registration-mark geometry, and uses those directly instead of re-deriving
+them.
 
-If a file has no row there (notebook 1 hasn't been run on it yet, or its run
-failed), this notebook prints an explicit [ALERT] and falls back to
+If a file has no row there (step2 hasn't been run on it yet, or its run
+failed), this script prints an explicit [ALERT] and falls back to
 measuring that one file itself from scratch, using its own inlined copy of
 the same measurement code - so a pdf_quality row always gets written, never
 silently skipped, and never guessed. Which path was taken is recorded per
 row in calibration_source ('pdf_calibration_profile' or 'self-measured') and
 noted in error_reasons when the fallback was used.
 
-Because of this, run notebook 1 FIRST for best results - not because this
-notebook cannot run without it (it can), but because every file it falls
-back on re-measures work notebook 1 already did.
+Because of this, run step2_pdf_calibration.py FIRST for best results - not
+because this script cannot run without it (it can), but because every file
+it falls back on re-measures work step2 already did.
 
 PARTITIONING
 ------------
@@ -43,12 +44,12 @@ is DATE-partitioned on this column.
 
 USAGE
 -----
-    import notebook_2_pdf_quality as nb2
-    df = nb2.run("gs://syntasa-saas/syn-workspace/users/<you>/notebooks/test_pdf/",
-                 vision=True)
+    import step3_pdf_quality_check as step3
+    df = step3.run("gs://tps_survey/TPS_Scanned_2025_Reorgnized/",
+                    vision=True)
 
     # local folder, print only, don't touch BigQuery
-    df = nb2.run("./pdfs", dry_run=True)
+    df = step3.run("./pdfs", dry_run=True)
 """
 import datetime as _dt
 import json
@@ -74,7 +75,7 @@ SHADOW_MIN_BANDS = 6
 MAX_TRUSTED_RESIDUAL = 8.0
 VISION_ROUTE_MIN_FLAGS = 5
 
-VISION_MODEL = "gemini-3.1-flash-lite"
+VISION_MODEL = pipeline_config.STEP3_VISION_MODEL
 # PLACEHOLDER - set this before relying on the fallback route.
 FALLBACK_VISION_MODEL = None
 
@@ -83,9 +84,13 @@ FALLBACK_VISION_MODEL = None
 _ABSENT_LAYOUTS = ("27#0",)
 
 # ==========================================================================
-# calibration baseline — measured box geometry, copied verbatim from
-# merge_survey_pdfs.py (Revision 33). Identical to notebook_1's copy; kept
-# duplicated here on purpose, per the "no cross-file imports" requirement.
+# calibration baseline — measured box geometry, identical to step2_pdf_
+# calibration.py's own copy. Deliberately duplicated (not imported from
+# step2) rather than shared: this describes the form's PHYSICAL print
+# layout, which pipeline_config.py's own docstring explains is intentionally
+# kept out of the shared config module (see its "WHAT'S DELIBERATELY *NOT*
+# HERE" section) - step2/step3 each measure/consume this geometry
+# independently rather than one depending on the other's internals.
 # ==========================================================================
 BASELINE_MARKS = {
     0: ((184.0, 223.0), (2384.0, 224.0), (176.0, 3120.0), (2374.0, 3119.0)),
@@ -1319,9 +1324,8 @@ def explain(r):
 # ==========================================================================
 # run directly, e.g. from a notebook cell:
 #
-#   import notebook_2_pdf_quality as nb2
-#   df = nb2.run("gs://syntasa-saas/syn-workspace/users/<you>/notebooks/test_pdf/",
-#                vision=True)
+#   import step3_pdf_quality_check as step3
+#   df = step3.run("gs://tps_survey/TPS_Scanned_2025_Reorgnized/", vision=True)
 # ==========================================================================
 
 # df = run("gs://tps_survey/TPS_Scanned_2025_Reorgnized/Nov 23 2025/", vision=True)

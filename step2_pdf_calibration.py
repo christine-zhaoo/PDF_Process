@@ -24,8 +24,8 @@ import pipeline_config
 
 RENDER_DPI = 300
 # "<dataset>.<table>" (project is added separately - see to_bigquery()'s own
-# hardcoded table_project below) - both pulled from pipeline_config.py, the
-# shared source of truth across step1-step6.
+# table_project, also sourced from pipeline_config.py) - both pulled from
+# pipeline_config.py, the shared source of truth across step1-step6.
 BQ_TABLE = f"{pipeline_config.BQ_DATASET}.{pipeline_config.BQ_TABLE_CALIBRATION}"
 
 # ==========================================================================
@@ -1445,7 +1445,6 @@ def to_bigquery(results_or_df, table=BQ_TABLE, project=None, client=None,
     # bare "project.dataset" string. Some environments (this one included) run with an ambient default GCP project on the BigQuery client that differs 
     # from   the project actually named in `table`. A bare-string Dataset/DatasetReference can silently resolve against that ambient default instead of the
     # embedded one, producing "Invalid resource name projects/<ambient>". Explicit DatasetReference(project, dataset_id) removes the ambiguity.
-#     table_project, table_dataset, table_name = table.split(".")
     table_dataset, table_name = table.split(".")
     table_project = pipeline_config.GCP_PROJECT_ID
     project = project or table_project
