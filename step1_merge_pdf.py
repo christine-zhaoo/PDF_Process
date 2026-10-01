@@ -4,10 +4,23 @@ merge_pdfs_to_folder process:
 
 Standalone script that organizes loose survey PDFs into per-date folders. A
 normal individual survey is moved unchanged. A combined scan such as
-``Nov17_10.pdf`` is treated as a sequence of two-page surveys: each first
-page's handwritten TPS number is read, the two pages are split into a new PDF
-named ``2025_Nov_17_10_TPS_6558.pdf``, and the outputs are placed in
-``Nov 17 2025``.
+``Nov17_10.pdf`` is treated as a sequence of two-page surveys: no handwritten
+content is read to identify a survey unit at all - each one's identity is
+purely its source file name + page range (e.g. pages 1-2 of ``Nov10_1.pdf``
+becomes ``2025_Nov_10_1_Page_1-2.pdf``), placed in ``Nov 10 2025``.
+
+Each survey unit is still read by Gemini for two things that DO require
+looking at the page content: a language check (English vs. not - a non-
+English survey is accepted and flagged for review, never rejected) and a
+content-quality/decline check. A survey unit lands in exactly one of three
+destination categories (see split_combined_pdf()'s docstring for the full
+decision logic):
+  - normal date folder: the common case.
+  - ``Declined/`` subfolder: a large handwritten "Declined"/"Decline"/
+    "Refused" word is written - still uploaded, flagged needs_review.
+  - ``Rejected/`` subfolder: the page is blank/unreadable, OR there's a
+    large hand-drawn cancellation scribble/strikethrough across the answer
+    grid with NO "Declined" word written (not a confirmed decline).
 
 --------------------------------------------------------------------------
 What it does
@@ -15,16 +28,17 @@ What it does
 Given a bucket laid out like:
 
 gs://<BUCKET>/<ROOT_PREFIX>/
-    Dec14_1_TPS_4223.pdf
+    Dec14_1.pdf
     Nov 18 2025/            <- an existing, already-organized date folder
-        2025_Nov_18_TPS_5581.pdf
+        2025_Nov_18_1_Page_1-2.pdf
         ...
 
 Every PDF directly under ROOT_PREFIX (i.e. NOT already inside a date
 subfolder) is treated as unorganized. For each one:
 
 1. A combined name matching ``<Mon><D[D]>_<batch>.pdf`` is split into
-   two-page survey PDFs and named from its extracted TPS number.
+   two-page survey PDFs, named purely from the source file name and each
+   one's own page range (see split_combined_pdf()).
 2. An individual name's destination date is parsed from the leading
    "<Mon><D[D]>" token (e.g. "Dec14" -> month=Dec). See parse_file_name_date().
 3. The year for that date is the year inferred once per run from this bucket/root's existing date folders (see infer_survey_year()) — the file
@@ -67,6 +81,19 @@ Revision notes (this pass)
   Both would have raised at runtime. Partitioning is now on `moved_date`
   (the column that already exists and that the docstring above always said
   it partitions on), and the stray debug/broken lines are gone.
+- Explicit user request: step1 no longer reads any handwritten TPS number at
+  all. extract_tps_number_from_page(), its confusable-digit cross-checks
+  (_DigitTemplateBank/_extract_digit_crops/_CONFUSABLE_DIGIT_PAIRS), and the
+  duplicate-TPS collision handling (verify_same_tps_number()) are all
+  removed - a survey unit's identity is now purely its source file name +
+  page range (see split_combined_pdf()), which needs no OCR and can never
+  collide. assess_page_content_and_declined() now distinguishes a written
+  "Declined" WORD (accepted, uploaded to a new "Declined" subfolder, flagged
+  needs_review) from a bare cancellation SCRIBBLE with no word (REJECTED,
+  uploaded to a new "Rejected" subfolder instead of being discarded as
+  before). A non-English survey (validate_survey_language()) is no longer a
+  rejection either - it's accepted into its normal destination, just flagged
+  needs_review. See ManifestRow's new output_category field.
 """
 import argparse
 import concurrent.futures
@@ -97,9 +124,12 @@ ROOT_PREFIX = pipeline_config.GCS_RAW_PREFIX
 DESTINATION_PREFIX = pipeline_config.GCS_SPLIT_PREFIX
 PAGES_PER_SURVEY = 2
 TPS_EXTRACTION_MODEL = pipeline_config.TPS_EXTRACTION_MODEL
-# Explicit user request: keep ONE model used across all of step1's Gemini
-# calls (TPS digit extraction, language gating, blank/declined checking)
-# rather than mixing in a stronger/costlier model for just one check. See
+# Name kept as-is (not renamed) even though step1 no longer extracts any TPS
+# number at all - explicit user request, survey identity is now purely the
+# source file name + page range (see split_combined_pdf()). This model is
+# still used for every remaining Gemini call here (language gating, blank/
+# declined/scribble checking) - keeping ONE model across all of them rather
+# than mixing in a stronger/costlier one for just one check. See
 # pipeline_config.py's TPS_EXTRACTION_MODEL for the model actually in effect.
 TPS_EXTRACTION_LOCATION = pipeline_config.VERTEX_LOCATION
 TPS_EXTRACTION_PROJECT = pipeline_config.GCP_PROJECT_ID
@@ -323,181 +353,6 @@ def parse_file_name_date(file_name: str) -> Optional[tuple]:
     return (month, day)
 
 
-_CONFUSABLE_DIGIT_PAIRS = {
-    frozenset(pair) for pair in
-    [("1", "4"), ("1", "7"), ("3", "8"), ("5", "6"), ("0", "6"),
-     ("0", "8"), ("0", "9"), ("6", "8"), ("8", "9"), ("2", "7")]
-}
-
-# Row band (top, bottom), in pixels of the pixmap returned by
-# _crop_tps_field_pixmap(), where the big printed TPS number itself sits -
-# empirically well below the small table/header text at the top of that
-# crop. Used by _extract_digit_crops() to isolate just the number before
-# segmenting it into individual digits.
-_DIGIT_BAND_ROWS = (140, 210)
-_DIGIT_CROP_SIZE = (30, 50)
-
-
-def _extract_digit_crops(page) -> Optional[list]:
-    """Segments the 4 individual printed digits out of the cropped TPS
-    number field into fixed-size, thresholded single-digit images, for
-    pixel-level shape comparison (see _DigitTemplateBank below).
-
-    This exists because the OCR model's own semantic reading can be
-    confidently wrong about a digit's shape (e.g. a '6' whose closed loop
-    has a small ink gap gets read as a '5' with HIGH self-reported
-    confidence) - comparing the actual pixels of a disputed digit against
-    other digits already confirmed correct elsewhere in this same source
-    PDF is a check the model's own confidence self-report can't provide.
-
-    Returns None (rather than raising) if the row band doesn't segment into
-    exactly 4 digit-sized connected components - this segmentation isn't
-    guaranteed to work on every scan/crop, and a failed segmentation should
-    just skip the extra shape check, not block the existing OCR pipeline."""
-    import cv2
-    import numpy as np
-
-    pixmap = _crop_tps_field_pixmap(page)
-    img = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(pixmap.height, pixmap.width, pixmap.n)
-    gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
-    band_top, band_bottom = _DIGIT_BAND_ROWS
-    band = gray[band_top:min(band_bottom, gray.shape[0]), :]
-    if band.size == 0:
-        return None
-    _, thresh = cv2.threshold(band, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dilated = cv2.dilate(thresh, np.ones((3, 3), np.uint8), iterations=1)
-    num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(dilated, connectivity=8)
-    boxes = [
-        (x, y, w, h) for x, y, w, h, area in (stats[i] for i in range(1, num_labels))
-        if area > 60 and w < 40
-    ]
-
-    # Merge vertically-split fragments of the same digit before checking for
-    # exactly 4 - confirmed directly (2025_Oct_30_1_TPS_1878.pdf, whose real
-    # TPS is 1678): a printed '6' whose thin waist (where the upper curve
-    # meets the lower loop) is too faint/thin to survive Otsu thresholding
-    # splits into TWO connected components instead of one, so this used to
-    # find 5 boxes instead of 4 and bail out entirely (return None) - which
-    # meant the confusable-pair pixel backstop below never even ran for this
-    # record, letting Gemini's confidently-wrong HIGH '8' reading (it's a
-    # known 6/8 confusable pair - see _CONFUSABLE_DIGIT_PAIRS) sail through
-    # with no independent check at all. Two fragments sharing substantial
-    # horizontal (x-axis) overlap are almost certainly one digit split
-    # top/bottom, not two separate adjacent digits - real neighboring digits
-    # in this printed TPS number are spaced apart with little to no x-overlap,
-    # so this merge only ever fuses fragments that share a column, never two
-    # genuinely different digits.
-    merged = []
-    for box in sorted(boxes, key=lambda b: b[0]):
-        x, y, w, h = box
-        for i, (mx, my, mw, mh) in enumerate(merged):
-            overlap = min(x + w, mx + mw) - max(x, mx)
-            if overlap > 0.5 * min(w, mw):
-                nx0, ny0 = min(x, mx), min(y, my)
-                nx1, ny1 = max(x + w, mx + mw), max(y + h, my + mh)
-                merged[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0)
-                break
-        else:
-            merged.append(box)
-    boxes = merged
-
-    if len(boxes) != 4:
-        return None
-    boxes.sort(key=lambda box: box[0])
-    pad = 3
-    crops = []
-    for x, y, w, h in boxes:
-        x0, y0 = max(0, x - pad), max(0, y - pad)
-        x1, y1 = min(thresh.shape[1], x + w + pad), min(thresh.shape[0], y + h + pad)
-        crops.append(cv2.resize(thresh[y0:y1, x0:x1], _DIGIT_CROP_SIZE, interpolation=cv2.INTER_AREA))
-    return crops
-
-
-class _DigitTemplateBank:
-    """Accumulates confirmed-correct digit shape exemplars from this source
-    PDF's own TPS numbers, so a later survey's confusable-pair digit (see
-    _CONFUSABLE_DIGIT_PAIRS) can be checked against real pixel shapes
-    already seen in this same batch, instead of only trusting the OCR
-    model's own (sometimes confidently wrong) self-reported confidence.
-
-    Scoped to one source PDF (one _DigitTemplateBank per split_combined_pdf()
-    call), not the whole run - digit shape/font is consistent within one
-    scanned batch but can differ across batches, so cross-batch templates
-    would risk comparing against the wrong font's digit shapes.
-
-    Seeded up front from every HIGH-confidence reading across the WHOLE
-    batch (see split_combined_pdf()'s two-pass structure) rather than built
-    incrementally page-by-page - a survey near the end of the batch used to
-    have no templates to compare against for a digit that only happened to
-    appear in an EARLIER survey the sequential, one-pass version of this
-    bank hadn't reached yet when it was checked, so a perfectly legible
-    reading could never be rescued out of LOW confidence no matter how
-    clear the handwriting actually was (confirmed directly: TPS
-    4382/4384/4387 in Nov6_1.pdf, all cleanly printed numbers, stuck on LOW
-    confidence with nothing yet in the bank to compare against). Seeding
-    from the full batch first means every survey gets checked against the
-    same complete evidence, regardless of where in the batch it falls.
-
-    Each observed crop is tagged with the id (survey start-page index) of
-    the record that contributed it, so a caller checking THAT SAME record
-    against the bank can exclude its own crop via `exclude` - otherwise a
-    record's own just-seeded crop would trivially "confirm" itself (a
-    perfect self-match) instead of being checked against independent
-    evidence from other surveys."""
-
-    def __init__(self):
-        self._templates = {}  # digit char -> list of (record_id, crop)
-
-    def observe(self, digits: str, crops: list, record_id) -> None:
-        for digit, crop in zip(digits, crops):
-            self._templates.setdefault(digit, []).append((record_id, crop))
-
-    def has_templates_for(self, candidates, exclude=None) -> bool:
-        """True only if EVERY digit in `candidates` has at least one observed
-        template from a record other than `exclude` - used by callers that
-        need best_match()'s verdict to be an actual comparison between the
-        candidates, not just a report of whichever one happens to have
-        templates so far (best_match() itself will happily return a
-        candidate with no real competition if the other candidate has no
-        templates yet)."""
-        return all(
-            any(rid != exclude for rid, _crop in self._templates.get(digit, []))
-            for digit in candidates
-        )
-
-    def best_match(self, crop, candidates, exclude=None) -> Optional[str]:
-        """Returns whichever of `candidates` this crop's shape most closely
-        matches by normalized cross-correlation, or None if no template has
-        been observed yet for any candidate digit. Templates contributed by
-        `exclude` itself are skipped, so a record is never validated against
-        its own crop. Note this can still return a candidate even when only
-        one of them has any (non-excluded) template at all (in which case
-        it isn't a real comparison) - check has_templates_for() first if
-        that distinction matters."""
-        import cv2
-
-        best_digit, best_score = None, None
-        for digit in candidates:
-            for record_id, template in self._templates.get(digit, []):
-                if record_id == exclude:
-                    continue
-                score = float(cv2.matchTemplate(
-                    crop.astype("float32"), template.astype("float32"), cv2.TM_CCOEFF_NORMED
-                )[0][0])
-                if best_score is None or score > best_score:
-                    best_digit, best_score = digit, score
-        return best_digit
-
-
-class TpsRejected(Exception):
-    """Raised when a survey's page 1 can't be trusted for a TPS number —
-    either the handwritten number (or the page content around it) is
-    illegible, or the page is written in a language other than English.
-    This is expected to happen for a genuinely bad or foreign-language
-    scan, not a bug, and is handled by recording a rejected manifest row
-    (with a rejected_reason) rather than failing the whole source PDF."""
-
-
 def _is_rate_limit_error(error: Exception) -> bool:
     """True if `error` looks like a Vertex quota/rate-limit rejection - a 429
     RESOURCE_EXHAUSTED, or a 403 PERMISSION_DENIED (Vertex sometimes surfaces
@@ -522,7 +377,7 @@ def _record_gemini_usage(usage) -> tuple:
     concurrently (see SOURCE_PDF_WORKERS), plain unlocked `+=` on the shared
     dict from multiple threads could lose updates. Returns
     (prompt_tokens, output_tokens, total_tokens) so callers that also want
-    to log the per-call numbers (e.g. extract_tps_number_from_page's status
+    to log the per-call numbers (e.g. validate_survey_language()'s status
     line) don't need to re-derive them. No-op returning (0, 0, 0) if usage
     is None (e.g. a response with no usage_metadata)."""
     if usage is None:
@@ -540,9 +395,9 @@ def _record_gemini_usage(usage) -> tuple:
 
 def _get_genai_client():
     """Builds the Vertex-backed genai.Client used by every Gemini call site
-    in this file - factored out since all three call sites (TPS extraction,
-    content/declined assessment, duplicate-TPS visual verification)
-    constructed an identical client from the same three constants."""
+    in this file - factored out since both call sites (language gating,
+    content/declined assessment) constructed an identical client from the
+    same three constants."""
     from google import genai
 
     return genai.Client(
@@ -552,42 +407,25 @@ def _get_genai_client():
     )
 
 
-def _crop_tps_field_pixmap(page):
-    """Renders the cropped handwritten TPS-number field (upper-right of the
-    page) at 3x zoom - the same crop rectangle and zoom that
-    extract_tps_number_from_page() and verify_same_tps_number() both need,
-    factored out here since they previously duplicated this rect math."""
-    import pymupdf
-
-    page_rect = page.rect
-    crop = pymupdf.Rect(
-        page_rect.x0 + page_rect.width * 0.80,
-        page_rect.y0 + page_rect.height * 0.08,
-        page_rect.x1 - page_rect.width * 0.01,
-        page_rect.y0 + page_rect.height * 0.24,
-    )
-    return page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=crop, alpha=False)
-
-
 def _generate_content_with_limits(client, model: str, contents: list, label: str):
     """Shared wrapper around client.models.generate_content() used by every
-    Gemini call site in this file (TPS extraction, content/declined
-    assessment, duplicate-TPS visual verification).
+    Gemini call site in this file (language gating, content/declined
+    assessment).
 
     Always passes temperature=0 - confirmed directly (TPS 3865 in a real
-    batch): calling assess_page_content_and_declined() 3 times in a row on
-    the exact same page, unchanged, returned declined=False, True, False -
-    a genuinely borderline strikethrough mark (real ink on the page, but
-    covering a judgment-call amount of the answer grid) flipped the model's
-    answer between identical calls with no way to reproduce or trust either
+    batch, back when this file still read TPS numbers): calling assess_
+    page_content_and_declined() 3 times in a row on the exact same page,
+    unchanged, returned declined=False, True, False - a genuinely
+    borderline strikethrough mark (real ink on the page, but covering a
+    judgment-call amount of the answer grid) flipped the model's answer
+    between identical calls with no way to reproduce or trust either
     result. This file was the only one of the three Gemini-calling scripts
     in this pipeline (unlike step3/step4) that never set a temperature at
     all, so every call here ran at the model's non-zero default. temperature
     =0 doesn't make a genuinely ambiguous page unambiguous, but it does mean
-    the SAME page always gets the SAME answer - a prerequisite for the
-    confusable-digit cross-checks and duplicate-TPS re-checks elsewhere in
-    this file to mean anything, and for a human reviewing a flagged page to
-    trust that rerunning the check wouldn't silently change the verdict.
+    the SAME page always gets the SAME answer - a prerequisite for a human
+    reviewing a flagged page to trust that rerunning the check wouldn't
+    silently change the verdict.
 
     Two protections that matter once run() processes multiple source PDFs
     concurrently (see SOURCE_PDF_WORKERS):
@@ -620,181 +458,6 @@ def _generate_content_with_limits(client, model: str, contents: list, label: str
         )
         time.sleep(delay)
     raise last_error  # pragma: no cover - loop always returns or raises above
-
-
-def extract_tps_number_from_page(
-    page,
-    model: str = TPS_EXTRACTION_MODEL,
-    max_attempts: int = TPS_EXTRACTION_MAX_ATTEMPTS,
-    expected_next_tps: Optional[str] = None,
-) -> tuple:
-    """Reads the handwritten TPS number printed at the upper-right of page 1.
-
-    The source scans are image-only and the number is handwritten, so PDF text
-    extraction and filename parsing cannot recover it. Gemini receives only a
-    tightly cropped image of that field and must return exactly four digits
-    plus its own confidence in that reading.
-
-    Returns (tps: str, confidence: "HIGH"|"LOW") rather than just the digits -
-    confidence gates what split_combined_pdf() is allowed to do when this
-    reading collides with an already-used TPS number (see its docstring):
-    a HIGH-confidence collision still gets a visual re-check before being
-    called a genuine duplicate; a LOW-confidence one goes straight to manual
-    review instead of being trusted enough to reject anything over.
-
-    expected_next_tps: the previous survey's TPS number in this same combined
-    scan (surveys are digitized in sequence, so TPS numbers normally
-    increment one-by-one within a batch). Passed along as a hint in the
-    prompt to help disambiguate easily-confused handwritten digits (e.g. a 1
-    misread as a 4, or a 6 misread as an 8) that previously caused two
-    different surveys to resolve to the same TPS number and made the whole
-    combined source PDF look like it had a duplicate. None for the first
-    survey in a batch (no prior number to anchor against).
-    """
-    from google.genai import types
-
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be at least 1")
-
-    pixmap = _crop_tps_field_pixmap(page)
-    prompt_parts = [
-        "Read the handwritten four-digit TPS number in this cropped survey "
-        "field. Respond with exactly the four digits, then a space, then "
-        "your own confidence in that reading as exactly HIGH or LOW - HIGH "
-        "only if every digit is unambiguous and clearly formed, LOW if any "
-        "single digit could plausibly be misread as a different digit. This "
-        "includes both digit shapes that are commonly confused in "
-        "handwriting (e.g. 1/4/7, 3/8, 5/6, 0/6/8/9, 2/7), AND a digit whose "
-        "pen stroke has a small gap, break, or faded/missing ink in part of "
-        "its loop or curve - for example, a '6' whose closed loop has a "
-        "break in the ink can look like a '5', and a '9' or '8' with a "
-        "similar gap can look like other digits. Look carefully for such "
-        "partial/broken strokes before committing to HIGH confidence: if a "
-        "digit's shape depends on a stroke that looks incomplete or "
-        "interrupted, treat it as ambiguous and respond LOW. "
-        "Example response: '5202 HIGH'. No other text, punctuation, or "
-        "markdown."
-    ]
-    if expected_next_tps is not None:
-        try:
-            hint_value = f"{int(expected_next_tps) + 1:04d}"
-        except ValueError:
-            hint_value = None
-        if hint_value is not None:
-            prompt_parts.append(
-                f"Context: TPS numbers in this scanned batch are assigned "
-                f"sequentially, one higher than the previous survey. The "
-                f"previous survey's TPS number was {expected_next_tps}, so "
-                f"this one is expected to be close to {hint_value}. Use this "
-                f"only to disambiguate handwritten digits that are hard to "
-                f"tell apart (e.g. 1 vs 4, 6 vs 8, 3 vs 8) - always defer to "
-                f"what is actually handwritten if it clearly differs from "
-                f"this expectation; the sequence can still skip or reset."
-            )
-    prompt_parts.append(
-        "If the TPS number's digits are not all clearly legible, or the "
-        "cropped image content itself is blank, corrupted, or otherwise "
-        "unreadable, do not guess — return exactly REJECT_UNREADABLE "
-        "instead."
-        # Explicit user request: this used to also instruct REJECT_NON_ENGLISH
-        # here, but the cropped image is just the small handwritten TPS-number
-        # field (see _crop_tps_field_pixmap()) - it essentially never contains
-        # enough visible text to judge the survey's language at all, so this
-        # instruction was dead weight that didn't actually solve the
-        # Spanish-PDF problem. Language is now gated by validate_survey_
-        # language() below, against the FULL survey page, instead.
-    )
-    prompt = " ".join(prompt_parts)
-    last_error = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            client = _get_genai_client()
-            response = _generate_content_with_limits(
-                client,
-                model,
-                [
-                    types.Part.from_bytes(data=pixmap.tobytes("png"), mime_type="image/png"),
-                    prompt,
-                ],
-                "TPS extraction",
-            )
-            usage = getattr(response, "usage_metadata", None)
-            if usage is not None:
-                prompt_tokens, output_tokens, total_tokens = _record_gemini_usage(usage)
-                status(
-                    "[GEMINI] model=%s attempt=%d/%d prompt_tokens=%s "
-                    "output_tokens=%s total_tokens=%s",
-                    model,
-                    attempt,
-                    max_attempts,
-                    prompt_tokens,
-                    output_tokens,
-                    total_tokens,
-                )
-            raw_text = (response.text or "").strip()
-            normalized = raw_text.upper()
-            if normalized == "REJECT_UNREADABLE":
-                raise TpsRejected(
-                    "Gemini could not read the TPS number or page content "
-                    f"(returned {raw_text!r})"
-                )
-            digit_confidence_match = re.fullmatch(r"(\d{4})\s*(HIGH|LOW)?", normalized)
-            if digit_confidence_match:
-                # A response with no parseable confidence word is treated as LOW,
-                # never HIGH - an unrecognized/missing confidence shouldn't get the
-                # benefit of the doubt that lets split_combined_pdf() skip straight
-                # to visual duplicate verification instead of manual review.
-                digits = digit_confidence_match.group(1)
-                confidence = digit_confidence_match.group(2) or "LOW"
-                # Don't trust the model's own HIGH self-rating over a deterministic
-                # check: if this reading breaks the expected +1 sequence by exactly
-                # one digit, and that digit swap is a known handwriting/print
-                # confusable pair (e.g. 5/6), that's a real, checkable reason to
-                # distrust this specific reading regardless of how confidently the
-                # model reported it - a broken/under-inked stroke (e.g. a '6' with a
-                # gap in its loop reading as '5') can look completely unambiguous in
-                # isolation while still being wrong. The digits themselves are never
-                # silently changed to the expected value - only confidence is
-                # downgraded, so this still goes to manual review instead of being
-                # guessed at.
-                if expected_next_tps is not None and confidence == "HIGH":
-                    try:
-                        expected_digits = f"{int(expected_next_tps) + 1:04d}"
-                    except ValueError:
-                        expected_digits = None
-                    if expected_digits is not None and expected_digits != digits:
-                        mismatches = [
-                            i for i in range(4) if digits[i] != expected_digits[i]
-                        ]
-                        if len(mismatches) == 1:
-                            i = mismatches[0]
-                            if frozenset((digits[i], expected_digits[i])) in _CONFUSABLE_DIGIT_PAIRS:
-                                confidence = "LOW"
-                return digits, confidence
-            last_error = TpsRejected(
-                f"TPS extraction returned {raw_text!r}; expected exactly four digits "
-                f"followed by HIGH or LOW"
-            )
-        except TpsRejected as error:
-            last_error = error
-        except Exception as error:  # noqa: BLE001 - retry, then surface the final failure
-            last_error = error
-
-        if attempt < max_attempts:
-            status(
-                "[GEMINI] TPS extraction attempt %d/%d failed (%s); retrying in %d second(s).",
-                attempt,
-                max_attempts,
-                last_error,
-                TPS_EXTRACTION_RETRY_DELAY_SECONDS,
-            )
-            time.sleep(TPS_EXTRACTION_RETRY_DELAY_SECONDS)
-
-    if isinstance(last_error, TpsRejected):
-        raise TpsRejected(str(last_error)) from last_error
-    raise ValueError(
-        f"TPS extraction failed after {max_attempts} attempt(s): {last_error}"
-    ) from last_error
 
 
 def validate_survey_language(
@@ -912,11 +575,6 @@ def assess_page_content_and_declined(
     here into one render + one prompt to cut Gemini calls (and the token
     cost of re-sending the same page image) roughly in half.
 
-    extract_tps_number_from_page() only crops the small handwritten
-    TPS-number field, which rarely has enough visible text to judge the
-    page's language or to see a handwritten marking that could appear
-    anywhere on the form — this instead renders the WHOLE page(s).
-
     second_page: the survey's second page (page 2 of this 2-page-per-survey
     form), if the caller has it - confirmed directly (Nov24_1.pdf, TPS 6995
     and TPS 7012): the BLANK criterion used to judge only page 1's Q1-23
@@ -930,34 +588,34 @@ def assess_page_content_and_declined(
     second page to pair it with), this falls back to judging page 1 alone,
     same as before.
 
-    Returns (content_issue: Optional[str], declined: bool):
+    Returns (content_issue: Optional[str], decline_marking: Optional[str]):
     - content_issue is a human-readable reason the survey can't be trusted
       (unreadable, or blank/unfilled on every page given), or None if
       nothing looks wrong. Language is NOT judged here - see
       validate_survey_language(), a separate gate against the full page.
-    - declined is True either for a large handwritten "Declined"/"Decline"/
-      "Refused" word, OR for a large scribble/loop/strikethrough mark drawn
-      across page 1's answer grid with no such word written (respondents
-      on this form mark a declined/voided response either way) — a page
-      with declined=True still gets split and uploaded like any other
-      survey (the TPS number is still valid and needed), just flagged with
-      needs_review=True so a human confirms it before the response is
-      treated as normal survey data.
+    - decline_marking is "WORD" when a large handwritten "Declined"/
+      "Decline"/"Refused" word is written, "SCRIBBLE" when a large
+      cancellation mark (scribble/loop/strikethrough) is drawn across the
+      answer grid with NO such word, or None when neither is present.
+      Explicit user request: these two are now treated very differently by
+      the caller - a WORD is an explicit, legible decline so the survey is
+      still split/uploaded (into a dedicated "Declined" folder) and merely
+      flagged needs_review=True for a human to confirm; a bare SCRIBBLE with
+      no word is NOT a confirmed decline (could be a stray mark, a
+      correction, anything) and is instead REJECTED outright (routed to a
+      "Rejected" folder) rather than guessed at.
 
-    content_issue takes priority over declined at the call site
-    (split_combined_pdf() checks content_issue first and rejects/continues
-    before ever looking at declined) - so a survey that is BOTH marked
-    declined AND has no actual survey answers selected anywhere is rejected
-    outright (content_issue = "no data to process"), not merely flagged for
-    review. The BLANK criterion above is judged purely by whether any
-    individual answer field was filled in, deliberately not counting a
-    decline scribble/strikethrough over page 1's grid as a "mark" that
-    would disqualify BLANK - otherwise a blank-and-declined survey could
-    slip through as merely needs-review instead of being rejected.
+    content_issue takes priority over decline_marking at the call site
+    (split_combined_pdf() checks content_issue first) - a survey that is
+    BOTH marked declined/scribbled AND has no actual survey answers selected
+    anywhere is rejected as BLANK, not merely as a decline. The BLANK
+    criterion above is judged purely by whether any individual answer field
+    was filled in, deliberately not counting a decline scribble/strikethrough
+    over page 1's grid as a "mark" that would disqualify BLANK.
 
     Never raises: this is advisory context, so a network hiccup here
     shouldn't block the rejection/processing decision it supports —
-    returns (None, False) on any failure."""
+    returns (None, None) on any failure."""
     import pymupdf
     from google.genai import types
 
@@ -986,47 +644,46 @@ def assess_page_content_and_declined(
         "If NOT EVEN ONE answer checkbox, comment box, or field is filled "
         "in or marked with an X or other selection, the word is BLANK - "
         "full stop, regardless of anything else on the page(s). "
-        "Specifically, respond BLANK even when: the TPS number is clearly "
-        "legible, the date fields are filled in, the header/ID boxes at "
-        "the top are filled in, and/or there is a large scribble, loop, "
-        "strikethrough, or handwritten word like 'Declined' drawn across "
-        "page 1's grid. None of those count as answering the questions, "
-        "and a legible TPS number or a legible 'Declined' marking must NOT "
-        "cause you to answer OK instead of BLANK - only actual answer "
-        "marks/written responses count. IMPORTANT: a large declined "
-        "scribble or strikethrough line often happens to physically cross "
-        "through or touch several checkbox squares on its way across the "
-        "page - that incidental crossing does NOT count as those boxes "
-        "being individually marked. Only count a checkbox as marked if it "
-        "has its OWN distinct X or checkmark placed inside it as a "
-        "deliberate answer selection, separate from any larger scribble "
-        "passing through or near it. If the only marks anywhere on the "
-        "grid are pieces of that one continuous declined scribble/line, "
-        "with no individual checkbox independently selected, the answer "
-        "is still BLANK.\n"
+        "Specifically, respond BLANK even when: the date fields are filled "
+        "in, the header/ID boxes at the top are filled in, and/or there is "
+        "a large scribble, loop, strikethrough, or handwritten word like "
+        "'Declined' drawn across page 1's grid. None of those count as "
+        "answering the questions - only actual answer marks/written "
+        "responses count. IMPORTANT: a large declined scribble or "
+        "strikethrough line often happens to physically cross through or "
+        "touch several checkbox squares on its way across the page - that "
+        "incidental crossing does NOT count as those boxes being "
+        "individually marked. Only count a checkbox as marked if it has "
+        "its OWN distinct X or checkmark placed inside it as a deliberate "
+        "answer selection, separate from any larger scribble passing "
+        "through or near it. If the only marks anywhere on the grid are "
+        "pieces of that one continuous declined scribble/line, with no "
+        "individual checkbox independently selected, the answer is still "
+        "BLANK.\n"
         "Step 2 (only if at least one field IS filled in/marked): OK if "
-        "the handwritten TPS number (if visible) and the marked answers are "
-        "legible; UNREADABLE if the content or TPS number can't be made out "
-        "at all. Do not judge language here - only legibility.\n\n"
-        "Second word - whether the respondent declined: "
-        "Before deciding DECLINED, first identify the respondent's individual "
+        "the marked answers are legible; UNREADABLE if the content can't "
+        "be made out at all. Do not judge language here - only "
+        "legibility.\n\n"
+        "Second word - the respondent's decline marking, if any: "
+        "Before deciding, first identify the respondent's individual "
         "answer marks in the grid and treat those as legitimate selections. "
         "The mental test: is this one additional connected cancellation "
-        "mark, or is it a collection of individual answer marks? Return "
-        "DECLINED ONLY when there is strong visual evidence the respondent "
-        "intentionally invalidated/crossed out the survey.\n\n"
-        "Return DECLINED if EITHER:\n"
-        "(a) A large handwritten word such as 'Declined', 'Decline', or "
-        "'Refused' is prominently written across page 1.\n"
-        "OR\n"
-        "(b) There is a clearly intentional cancellation mark consisting of "
-        "ADDITIONAL continuous ink drawn across the answer grid, visually "
-        "distinguishable from the respondent's individual answer "
-        "selections, that appears to cross out/invalidate/cancel the "
-        "survey as a whole.\n\n"
-        "The following are NOT DECLINED - do not classify the survey as "
-        "DECLINED merely because ink appears across multiple checkbox rows "
-        "or columns:\n"
+        "mark, or is it a collection of individual answer marks? Respond "
+        "DECLINED_WORD or DECLINED_SCRIBBLE ONLY when there is strong "
+        "visual evidence the respondent intentionally invalidated/crossed "
+        "out the survey.\n\n"
+        "Respond DECLINED_WORD if a large handwritten word such as "
+        "'Declined', 'Decline', or 'Refused' is prominently written across "
+        "page 1.\n\n"
+        "Otherwise respond DECLINED_SCRIBBLE if there is a clearly "
+        "intentional cancellation mark consisting of ADDITIONAL continuous "
+        "ink drawn across the answer grid, visually distinguishable from "
+        "the respondent's individual answer selections, that appears to "
+        "cross out/invalidate/cancel the survey as a whole, with NO "
+        "'Declined'/'Decline'/'Refused' word written anywhere.\n\n"
+        "The following are NEITHER DECLINED_WORD NOR DECLINED_SCRIBBLE - do "
+        "not classify the survey as declined merely because ink appears "
+        "across multiple checkbox rows or columns:\n"
         "- An X or checkmark inside an individual checkbox, even one that "
         "extends slightly outside it or touches an adjacent checkbox.\n"
         "- The respondent selecting the same answer column on many "
@@ -1039,7 +696,7 @@ def assess_page_content_and_declined(
         "mark, creating the illusion of one continuous connected line "
         "threading down or across the grid. This is NOT a cancellation "
         "mark, even when it links together many rows and/or columns.\n\n"
-        "To classify a mark as DECLINED under rule (b), verify ALL of these "
+        "To classify a mark as DECLINED_SCRIBBLE, verify ALL of these "
         "conditions:\n"
         "1. The mark is continuous or forms a clearly connected scribble, "
         "line, loop, or cross-out.\n"
@@ -1053,12 +710,13 @@ def assess_page_content_and_declined(
         "point that is NOT any individual checkbox - e.g. the blank "
         "margin, the header area, or free space between rows. A mark "
         "entirely traceable to individual checkboxes' own marks is never "
-        "DECLINED, no matter how large or connected-looking it is.\n\n"
+        "a cancellation mark, no matter how large or connected-looking it "
+        "is.\n\n"
         "If you cannot confidently distinguish an intentional cancellation "
         "mark from legitimate answer selections, return NOT_DECLINED.\n\n"
         "Otherwise respond NOT_DECLINED.\n\n"
-        "Example response: 'OK NOT_DECLINED', 'UNREADABLE DECLINED', or "
-        "'BLANK NOT_DECLINED'."
+        "Example response: 'OK NOT_DECLINED', 'UNREADABLE DECLINED_WORD', "
+        "or 'BLANK NOT_DECLINED'."
     )
     try:
         pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
@@ -1084,69 +742,15 @@ def assess_page_content_and_declined(
             content_issue = "Gemini could not read the page content"
         elif content_word == "BLANK":
             content_issue = "the PDF is empty - there's no data to process"
-        declined = declined_word == "DECLINED"
-        return content_issue, declined
+        decline_marking = None
+        if declined_word == "DECLINED_WORD":
+            decline_marking = "WORD"
+        elif declined_word == "DECLINED_SCRIBBLE":
+            decline_marking = "SCRIBBLE"
+        return content_issue, decline_marking
     except Exception as error:  # noqa: BLE001 - advisory only, never block the decision this supports
         status("[GEMINI] Page content/declined assessment failed (%s); continuing without it.", error)
-        return None, False
-
-
-def verify_same_tps_number(
-    page_a,
-    page_b,
-    model: str = TPS_EXTRACTION_MODEL,
-) -> str:
-    """Visually re-checks whether two pages' handwritten TPS numbers are
-    genuinely the same, before split_combined_pdf() calls two surveys
-    duplicates. A matching OCR reading alone does NOT prove two surveys share
-    a TPS number - Gemini can misread one ambiguous digit (e.g. 1 vs 4) and
-    make two genuinely-different surveys collide on the same four digits.
-    This sends BOTH cropped number images to Gemini in one call and asks it
-    to compare them digit-by-digit, rather than re-reading each in isolation
-    (which would just repeat whatever mistake caused the collision).
-
-    Returns "SAME", "DIFFERENT", or "AMBIGUOUS" (never raises - any failure
-    to get a clean verdict returns "AMBIGUOUS", the safe default that routes
-    to manual review instead of either wrongly confirming or wrongly
-    dismissing a duplicate)."""
-    from google.genai import types
-
-    prompt = (
-        "IMAGE A and IMAGE B each show a cropped handwritten four-digit "
-        "survey ID number. Read each one character-by-character, digit by "
-        "digit, paying special attention to digits that are commonly "
-        "confused in handwriting (1/4/7, 3/8, 5/6, 0/6/8/9, 2/7). Then state "
-        "whether IMAGE A and IMAGE B show the SAME four-digit number or "
-        "DIFFERENT numbers. Respond with exactly one word: SAME if every "
-        "digit matches, DIFFERENT if any digit differs, or AMBIGUOUS if you "
-        "cannot confidently read one or more digits on either image well "
-        "enough to compare them. No other text."
-    )
-    try:
-        pixmap_a = _crop_tps_field_pixmap(page_a)
-        pixmap_b = _crop_tps_field_pixmap(page_b)
-        client = _get_genai_client()
-        response = _generate_content_with_limits(
-            client,
-            model,
-            [
-                "IMAGE A:",
-                types.Part.from_bytes(data=pixmap_a.tobytes("png"), mime_type="image/png"),
-                "IMAGE B:",
-                types.Part.from_bytes(data=pixmap_b.tobytes("png"), mime_type="image/png"),
-                prompt,
-            ],
-            "duplicate-TPS visual verification",
-        )
-        _record_gemini_usage(getattr(response, "usage_metadata", None))
-        verdict = (response.text or "").strip().upper()
-        if verdict in ("SAME", "DIFFERENT", "AMBIGUOUS"):
-            return verdict
-        status("[GEMINI] Duplicate-TPS visual check returned an unexpected verdict (%r); treating as AMBIGUOUS.", verdict)
-        return "AMBIGUOUS"
-    except Exception as error:  # noqa: BLE001 - never let this crash the run; be conservative instead
-        status("[GEMINI] Duplicate-TPS visual check failed (%s); treating as AMBIGUOUS.", error)
-        return "AMBIGUOUS"
+        return None, None
 
 
 def split_combined_pdf(
@@ -1155,20 +759,47 @@ def split_combined_pdf(
     year: int,
     dry_run: bool,
     pages_per_survey: int = PAGES_PER_SURVEY,
-    tps_extractor=extract_tps_number_from_page,
     max_surveys: Optional[int] = None,
     only_page_range: Optional[tuple] = None,
 ) -> list:
-    """Builds one two-page PDF per survey and names it with its TPS number.
+    """Builds one two-page PDF per survey unit, named purely from its source
+    file name and page range (e.g. "2025_Nov_10_1_Page_1-2.pdf" for pages
+    1-2 of Nov10_1.pdf) - explicit user request: step1 no longer reads any
+    handwritten TPS number at all. That extraction, its confusable-digit
+    cross-checks, and the duplicate-TPS collision handling it existed for
+    are all gone - a survey unit's identity now comes entirely from its own
+    position in the source PDF, which needs no OCR and can never collide or
+    be misread.
+
+    Every survey unit falls into exactly one output_category, each routed
+    by organize_combined_pdf() to its own destination subfolder - unlike
+    before, a declined OR rejected survey unit still gets split and
+    uploaded (just into that category's own folder), never silently
+    dropped, so every survey unit in this source PDF always ends up
+    somewhere:
+
+      - "rejected": the page content is BLANK (no field filled in anywhere)
+        or UNREADABLE, OR there's a large hand-drawn cancellation scribble/
+        strikethrough across the grid with NO 'Declined' word written (see
+        assess_page_content_and_declined()'s decline_marking="SCRIBBLE") -
+        not a confirmed decline, so this is rejected rather than guessed at.
+      - "declined": a large handwritten 'Declined'/'Decline'/'Refused' WORD
+        is written (decline_marking="WORD") - an explicit, legible decline,
+        so still uploaded (to a dedicated "Declined" folder) and flagged
+        needs_review for a human to confirm.
+      - "normal": everything else - uploaded to the normal date/batch
+        folder. Still flagged needs_review if the survey's language isn't
+        English (see validate_survey_language()) - a non-English survey is
+        NOT rejected, just flagged for a human to confirm/translate.
 
     only_page_range: an optional (start_page, end_page) pair, 1-indexed and
     inclusive, exactly as page numbers are shown in a PDF viewer (e.g.
     (219, 220) for the survey occupying pages 219-220 of this source PDF).
     When given, every survey unit whose page range doesn't exactly match
-    this is skipped entirely - no TPS extraction, no content/declined
-    check, nothing added to the returned list for it - so this is for a
-    manual one-off recheck of a single already-known survey unit, not a
-    normal run (which should process every unit)."""
+    this is skipped entirely - no content/declined check, nothing added to
+    the returned list for it - so this is for a manual one-off recheck of a
+    single already-known survey unit, not a normal run (which should
+    process every unit)."""
     import pymupdf
 
     if pages_per_survey < 1:
@@ -1190,10 +821,12 @@ def split_combined_pdf(
             # full content for a language/legibility issue, since that's often
             # WHY a source ended up with a malformed page count in the first
             # place (e.g. a single stray page scanned in isolation) and is
-            # useful context for review.
+            # useful context for review. No output file is produced for this
+            # whole-source failure (there's no clean per-survey page range to
+            # extract) - manifest-only, unlike the per-survey categories below.
             if not validate_survey_language(source_doc[0]):
                 rejected_reason = f"{rejected_reason}; Also: the PDF is in a language other than English"
-            content_issue, _declined = assess_page_content_and_declined(source_doc[0])
+            content_issue, _decline_marking = assess_page_content_and_declined(source_doc[0])
             if content_issue:
                 rejected_reason = f"{rejected_reason}; Also: {content_issue}"
             return [
@@ -1204,6 +837,7 @@ def split_combined_pdf(
                     "pdf_bytes": None,
                     "page_start": 1,
                     "page_end": len(source_doc),
+                    "output_category": "rejected",
                     "rejected_reason": rejected_reason,
                 }
             ]
@@ -1220,344 +854,53 @@ def split_combined_pdf(
                 raise ValueError("max_surveys must be at least 1")
             survey_starts = list(survey_starts)[:max_surveys]
 
-        previous_tps = None  # last successfully-read TPS number, used as sequential context for the next one
-        seen_tps = {}  # tps -> {"page_range": str, "start": int} for the earlier survey in this same source that first read this TPS number
-        digit_bank = _DigitTemplateBank()  # seeded from the WHOLE batch's HIGH-confidence readings before any confusable-pair check runs - see _DigitTemplateBank's docstring
+        batch_match = _COMBINED_FILE_RE.fullmatch(source_name)
+        if batch_match is None:
+            raise ValueError(f"cannot determine batch suffix from {source_name!r}")
+        batch_suffix = batch_match.group("batch")
 
-        # ---- Pass 1: OCR + content check for every survey, in page order ----
-        # expected_next_tps still threads sequentially page-to-page (that hint
-        # is genuinely about reading order, unrelated to the digit bank), but
-        # the confusable-pair confidence check is deliberately NOT done here
-        # anymore - doing it inline, as the batch was walked, meant a survey
-        # could only ever compare against digit shapes some earlier survey
-        # happened to contain. Instead this pass only extracts each survey's
-        # raw OCR reading and digit crops; pass 2 below builds the complete
-        # digit bank from ALL of them before any comparison happens.
-        pending = []  # records still needing confidence finalization + collision handling
         for start in survey_starts:
-            batch_match = _COMBINED_FILE_RE.fullmatch(source_name)
-            if batch_match is None:
-                raise ValueError(f"cannot determine batch suffix from {source_name!r}")
-            batch_suffix = batch_match.group("batch")
             page_range = f"{start + 1}-{start + pages_per_survey}"
-            try:
-                tps, confidence = tps_extractor(source_doc[start], expected_next_tps=previous_tps)
-            except TpsRejected as rejection:
-                outputs.append(
-                    {
-                        "source_name": source_name,
-                        "date_folder": date_folder,
-                        "output_name": None,
-                        "pdf_bytes": None,
-                        "page_start": start + 1,
-                        "page_end": start + pages_per_survey,
-                        "rejected_reason": str(rejection),
-                    }
-                )
-                continue
+            output_name = (
+                f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}_Page_{page_range}.pdf"
+            )
 
-            previous_tps = tps
-
-            # Language is gated FIRST, before the content/blank/declined check
-            # below and before the TPS collision check further down - same
-            # "contributes no data regardless of what else is going on"
-            # rationale as the content_issue check that follows. Checked
-            # against page 1 alone (see validate_survey_language()'s
-            # docstring for why this replaced the two earlier, weaker
-            # attempts at this same check) - this form's language is
-            # consistent across both of a survey's pages, so page 1 is
-            # sufficient without a second Gemini call for page 2 too.
+            # Language is gated first, but - explicit user request - is NO LONGER a
+            # rejection reason: a non-English survey is still accepted/uploaded like
+            # any other normal survey, just flagged needs_review so a human confirms/
+            # translates it, instead of being discarded outright.
+            language_note = None
             if not validate_survey_language(source_doc[start]):
-                entry = {
-                    "source_name": source_name,
-                    "date_folder": date_folder,
-                    "output_name": None,
-                    "pdf_bytes": None,
-                    "page_start": start + 1,
-                    "page_end": start + pages_per_survey,
-                    "rejected_reason": f"the PDF is in a language other than English (TPS {tps})",
-                }
-                outputs.append(entry)
-                existing = seen_tps.get(tps)
-                if existing is None or existing["output"].get("rejected_reason") is not None:
-                    seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
-                continue
+                language_note = "the survey appears to be written in a language other than English"
 
-            # Page content is checked before anything else remaining, including a
-            # TPS collision below - a blank/unreadable survey contributes no data
-            # regardless of what its TPS number does or doesn't collide with, so
-            # it's rejected outright rather than getting pulled into a TPS dispute
-            # (which would otherwise wrongly flag it, or even an unrelated later
-            # survey, as merely needs_review instead of rejected).
             # Page 2 is passed too (when this survey unit has one) so BLANK is
             # judged across the whole survey, not just page 1's answer grid -
             # see assess_page_content_and_declined()'s docstring for why.
             second_page = source_doc[start + 1] if start + 1 < len(source_doc) else None
-            content_issue, declined = assess_page_content_and_declined(source_doc[start], second_page)
+            content_issue, decline_marking = assess_page_content_and_declined(source_doc[start], second_page)
+
             if content_issue:
-                entry = {
-                    "source_name": source_name,
-                    "date_folder": date_folder,
-                    "output_name": None,
-                    "pdf_bytes": None,
-                    "page_start": start + 1,
-                    "page_end": start + pages_per_survey,
-                    "rejected_reason": f"{content_issue} (TPS {tps})",
-                }
-                outputs.append(entry)
-                # Don't let a rejected page's (possibly misread) TPS number clobber a
-                # still-live prior survey's tracking entry - only register this TPS
-                # if nothing live is already tracking it (see the collision check
-                # below, which likewise ignores a rejected prior as a non-collision).
-                existing = seen_tps.get(tps)
-                if existing is None or existing["output"].get("rejected_reason") is not None:
-                    seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
-                continue
-
-            pending.append({
-                "start": start,
-                "batch_suffix": batch_suffix,
-                "page_range": page_range,
-                "tps": tps,
-                "confidence": confidence,
-                "digit_crops": _extract_digit_crops(source_doc[start]),
-                "declined": declined,
-            })
-
-        # ---- Pass 2: seed the digit bank from every HIGH reading in the WHOLE batch ----
-        # Seeded only from each record's raw self-reported HIGH confidence, not
-        # from anything decided during pass 3 below - pass 3 reads this bank but
-        # never adds to it, so every record is checked against the same fixed,
-        # complete evidence regardless of the order pass 3 processes them in.
-        for record in pending:
-            if record["confidence"] == "HIGH" and record["digit_crops"] is not None:
-                digit_bank.observe(record["tps"], record["digit_crops"], record["start"])
-
-        # ---- Pass 3: confusable-pair confidence check (against the complete
-        # bank, excluding each record's own just-seeded crop), then collision
-        # handling and output building, still in page order (seen_tps and the
-        # prior-survey NEEDS_REVIEW rename both depend on that order) ----
-        for record in pending:
-            start = record["start"]
-            batch_suffix = record["batch_suffix"]
-            page_range = record["page_range"]
-            tps = record["tps"]
-            confidence = record["confidence"]
-            digit_crops = record["digit_crops"]
-            declined = record["declined"]
-
-            # Cross-check this reading's actual digit shapes against other digits
-            # already confirmed correct elsewhere in this same source PDF - the OCR
-            # model's own self-reported confidence is a noisy signal that can't
-            # always be trusted either way: it can be confidently wrong (a HIGH-rated
-            # '6' whose closed loop has a small ink gap reads as a confident '5'), and
-            # it can also be needlessly hedgy about a perfectly legible digit - the
-            # same clearly-printed number sent to the model twice can come back HIGH
-            # once and LOW another time. The digit bank gives a second, deterministic
-            # opinion pixel comparison against real digit shapes already seen in this
-            # batch can't have that kind of run-to-run noise. This only fires for a
-            # digit that's in a known commonly-confused pair, and only once a
-            # template exists (from a DIFFERENT survey) for the other candidate digit.
-            if digit_crops is not None:
-                if confidence == "HIGH":
-                    # If the digit's pixels match the OTHER candidate better than the
-                    # one the model claimed, the reading is downgraded to LOW so it
-                    # still gets flagged for manual review below instead of silently
-                    # passing through as trustworthy. Both candidates need a template
-                    # for this to be a real comparison - otherwise best_match() would
-                    # just return whichever one happens to have any template so far
-                    # (e.g. the claimed digit has never itself been confirmed yet in
-                    # this batch, so its only "competition" trivially "wins"), which
-                    # would wrongly downgrade a correct reading with no real evidence
-                    # against it at all.
-                    for i, digit in enumerate(tps):
-                        pair = next((p for p in _CONFUSABLE_DIGIT_PAIRS if digit in p), None)
-                        if pair is None:
-                            continue
-                        other_digit = next(iter(pair - {digit}))
-                        if not digit_bank.has_templates_for((digit, other_digit), exclude=start):
-                            continue
-                        match = digit_bank.best_match(digit_crops[i], (digit, other_digit), exclude=start)
-                        if match == other_digit:
-                            confidence = "LOW"
-                            break
-                elif confidence == "LOW":
-                    # The reverse check: don't let a bare self-reported LOW alone send
-                    # an otherwise-legible reading to manual review. If every digit here
-                    # that's part of a commonly-confused pair has a bank template to
-                    # compare against, AND every one of them matches the digit the model
-                    # actually claimed (not the confusable alternative), that's real
-                    # independent pixel evidence the reading is correct despite the
-                    # model's own hedging - upgrade to HIGH. If the bank instead prefers
-                    # a different digit, or has no template for either candidate ANYWHERE
-                    # else in the batch, leave it LOW so this still goes to manual review -
-                    # the bank's silence isn't evidence either way. A TPS number with no
-                    # confusable-pair digits at all has no independent evidence to check,
-                    # so it also stays LOW. (A LOW record was never seeded into the bank
-                    # in pass 2, so `exclude` here never actually removes anything for
-                    # it - harmless, kept for symmetry with the HIGH branch above.)
-                    bank_confirmed, checked_any = True, False
-                    for i, digit in enumerate(tps):
-                        pair = next((p for p in _CONFUSABLE_DIGIT_PAIRS if digit in p), None)
-                        if pair is None:
-                            continue
-                        other_digit = next(iter(pair - {digit}))
-                        # Both candidates need a template - otherwise best_match()
-                        # would just return whichever one happens to have any
-                        # template so far, which isn't a real comparison against
-                        # the confusable alternative at all.
-                        if not digit_bank.has_templates_for((digit, other_digit), exclude=start):
-                            bank_confirmed = False
-                            break
-                        checked_any = True
-                        match = digit_bank.best_match(digit_crops[i], (digit, other_digit), exclude=start)
-                        if match != digit:
-                            bank_confirmed = False
-                            break
-                    if checked_any and bank_confirmed:
-                        confidence = "HIGH"
-
-            # A matching OCR reading alone does NOT prove two surveys share a TPS
-            # number - never reject solely because two OCR reads collided. A
-            # HIGH-confidence collision still gets a visual, digit-by-digit
-            # re-check before being called a genuine duplicate; a LOW-confidence
-            # one skips straight to manual review, since a re-check would just
-            # repeat the same uncertain reading. Either way, neither survey's ID
-            # is ever silently changed to resolve the collision. A prior entry
-            # that was itself rejected (e.g. blank/unreadable) isn't a genuine
-            # collision - its TPS reading was never trustworthy data to begin
-            # with, so this survey proceeds normally instead of being dragged
-            # into a dispute with a page that has nothing to compare against.
-            prior = seen_tps.get(tps)
-            if prior is not None and prior["output"].get("rejected_reason") is None:
-                if confidence == "HIGH":
-                    verdict = verify_same_tps_number(source_doc[prior["start"]], source_doc[start])
-                else:
-                    verdict = None  # LOW confidence: go straight to review, don't trust a re-check of an uncertain read
-
-                # Never reject a survey solely because this check thinks it's a
-                # duplicate - confirmed directly (TPS 3229): there is no genuine
-                # duplicate TPS number anywhere in this source PDF's real batch,
-                # so a "SAME" verdict here is itself a misread (this check compares
-                # rendered page images visually and can be fooled by two different,
-                # but similarly-shaped, handwritten TPS numbers), not real physical
-                # duplication. Silently dropping the survey on that basis would
-                # permanently lose a real respondent's data over a model error with
-                # no way for a human to ever notice or recover it. Every collision -
-                # "SAME" included - is instead always split and uploaded (so nothing
-                # is ever silently lost) and flagged NEEDS_REVIEW with the disputed
-                # TPS number and both page ranges spelled out, so a human makes the
-                # actual call. Neither survey's TPS is ever silently changed to
-                # resolve the collision.
-                if verdict == "SAME":
-                    review_reason = (
-                        f"TPS {tps} on pages {page_range} visually matched pages "
-                        f"{prior['page_range']} in this same source PDF closely enough "
-                        f"to look like a genuine duplicate - likely a misread of a "
-                        f"similar-looking handwritten digit rather than an actual "
-                        f"duplicate, since this batch has no confirmed duplicate TPS "
-                        f"numbers. Not rejected; flagged for manual review instead of "
-                        f"discarding this survey's data."
-                    )
-                elif verdict == "DIFFERENT":
-                    review_reason = (
-                        f"TPS {tps} initially matched pages {prior['page_range']} in this "
-                        f"same source PDF, but a digit-by-digit visual re-check found they "
-                        f"are actually different numbers - one of the two readings is "
-                        f"wrong. Not treated as a duplicate; flagged for manual review "
-                        f"instead of guessing which reading to trust."
-                    )
-                else:
-                    reason_prefix = (
-                        f"TPS {tps} was already read from pages {prior['page_range']} in "
-                        f"this same source PDF"
-                    )
-                    review_reason = (
-                        f"{reason_prefix}, and the visual re-check could not confidently "
-                        f"confirm or rule out a duplicate - flagged for manual review."
-                        if verdict == "AMBIGUOUS" else
-                        f"{reason_prefix}, and this reading's own confidence was LOW - "
-                        f"flagged for manual review instead of trusting either reading "
-                        f"enough to call it a duplicate."
-                    )
-
-                # Page range is included so this doesn't collide with the earlier
-                # survey's own NEEDS_REVIEW file below - both surveys share the same
-                # (disputed) TPS number, so the bare TPS number alone isn't unique here.
-                # Explicit user request: matches the prior survey's own rename
-                # template below (_TPS_{tps}_NEEDS_REVIEW_pages_{page_range}.pdf) -
-                # these two used to put "_pages_{page_range}" in different spots
-                # (before vs. after "_TPS_{tps}_NEEDS_REVIEW"), so the two output
-                # files from the SAME collision event looked like two different
-                # naming conventions instead of a matched pair.
-                review_name = (
-                    f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                    f"_TPS_{tps}_NEEDS_REVIEW_pages_{page_range}.pdf"
+                output_category, reason = "rejected", content_issue
+            elif decline_marking == "SCRIBBLE":
+                output_category, reason = "rejected", (
+                    "a large hand-drawn strikethrough/scribble was detected across "
+                    "the answer grid on this survey page, with no 'Declined' word "
+                    "written - treated as a voided/cancelled response rather than a "
+                    "confirmed decline."
                 )
-                output_doc = pymupdf.open()
-                try:
-                    output_doc.insert_pdf(
-                        source_doc,
-                        from_page=start,
-                        to_page=start + pages_per_survey - 1,
-                    )
-                    outputs.append(
-                        {
-                            "source_name": source_name,
-                            "date_folder": date_folder,
-                            "output_name": review_name,
-                            "pdf_bytes": output_doc.tobytes(),
-                            "page_start": start + 1,
-                            "page_end": start + pages_per_survey,
-                            "needs_review_reason": review_reason,
-                        }
-                    )
-                finally:
-                    output_doc.close()
-
-                # The earlier survey's reading is now in question too - rename it to a
-                # NEEDS_REVIEW file (keeping its already-built pdf_bytes so it still
-                # gets uploaded) instead of silently leaving it looking trustworthy
-                # under its original TPS-only name.
-                prior_output = prior.get("output")
-                if prior_output is not None and prior_output.get("rejected_reason") is None:
-                    prior_output["output_name"] = (
-                        f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                        f"_TPS_{tps}_NEEDS_REVIEW_pages_{prior['page_range']}.pdf"
-                    )
-                    prior_output["needs_review_reason"] = (
-                        f"TPS {tps} on this survey (pages {prior['page_range']}) was "
-                        f"called into question by a later collision with pages "
-                        f"{page_range} in the same source PDF; the visual re-check "
-                        f"could not confirm both readings are correct - flagged for "
-                        f"manual review alongside pages {page_range}."
-                    )
-                continue
-
-            review_reasons = []
-            if confidence == "LOW":
-                review_reasons.append(
-                    f"TPS number {tps} could not be read with 100% confidence "
-                    f"(LOW confidence reading) - flagged for manual review since "
-                    f"the handwritten number is not clearly recognizable."
-                )
-            if declined:
-                review_reasons.append(
-                    f"A large handwritten 'Declined' marking was detected on this "
-                    f"survey page (TPS {tps}) - flagged for manual review."
-                )
-            if review_reasons:
-                output_name = (
-                    f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                    f"_TPS_{tps}_NEEDS_REVIEW_pages_{page_range}.pdf"
-                )
-                declined_reason = " ".join(review_reasons)
+            elif decline_marking == "WORD":
+                output_category = "declined"
+                reason = "a large handwritten 'Declined' marking was detected on this survey page."
+                if language_note:
+                    reason = f"{reason} Also, {language_note}."
             else:
-                output_name = (
-                    f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}"
-                    f"_TPS_{tps}.pdf"
-                )
-                declined_reason = None
+                output_category = "normal"
+                reason = language_note
+
+            # Every category is still split and uploaded (just to its own
+            # destination subfolder - see organize_combined_pdf()), so pdf_bytes is
+            # always built here, unlike the old TPS-reading version where a
+            # rejected survey's bytes were simply discarded.
             output_doc = pymupdf.open()
             try:
                 output_doc.insert_pdf(
@@ -1572,10 +915,13 @@ def split_combined_pdf(
                     "pdf_bytes": output_doc.tobytes(),
                     "page_start": start + 1,
                     "page_end": start + pages_per_survey,
-                    "needs_review_reason": declined_reason,
+                    "output_category": output_category,
                 }
+                if output_category == "rejected":
+                    entry["rejected_reason"] = reason
+                elif reason:
+                    entry["needs_review_reason"] = reason
                 outputs.append(entry)
-                seen_tps[tps] = {"page_range": page_range, "start": start, "output": entry}
             finally:
                 output_doc.close()
         return outputs
@@ -1590,7 +936,15 @@ def combined_source_is_complete(
     year: int,
     blob,
 ) -> bool:
-    """Return whether every survey unit already has a destination PDF.
+    """Return whether every survey unit already has a destination PDF - now a
+    purely deterministic check, since every survey unit's output file name is
+    derived entirely from (year, month, day, batch, page range), with no
+    OCR-dependent content (see split_combined_pdf()'s docstring) - so each
+    one's expected name can be checked directly for existence, across all
+    three possible destination subfolders it could have landed in (the
+    normal date folder, or the dedicated "Declined"/"Rejected" ones - see
+    organize_combined_pdf()), rather than merely counting how many output
+    files exist under one prefix as the old TPS-named version did.
 
     This check only reads the source PDF structure and lists GCS objects. It
     deliberately does not call Gemini, so completed sources consume no Vertex
@@ -1629,19 +983,19 @@ def combined_source_is_complete(
     date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
     batch_suffix = combined_match.group("batch")
     subfolder = survey_batch_subfolder(month, day, batch_suffix)
-    output_prefix = (
-        f"{_normalize_prefix(destination_prefix)}{date_folder}/{subfolder}/"
-        f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}_TPS_"
+    normalized_destination = _normalize_prefix(destination_prefix)
+    category_roots = (
+        f"{normalized_destination}{date_folder}/{subfolder}/",
+        f"{normalized_destination}Declined/{date_folder}/{subfolder}/",
+        f"{normalized_destination}Rejected/{date_folder}/{subfolder}/",
     )
-    existing_outputs = [
-        destination_blob.name
-        for destination_blob in bucket.client.list_blobs(
-            bucket, prefix=output_prefix
-        )
-        if destination_blob.name.endswith(".pdf")
-    ]
-    expected_count = page_count // PAGES_PER_SURVEY
-    return len(existing_outputs) == expected_count
+
+    for start in range(0, page_count, PAGES_PER_SURVEY):
+        page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
+        file_name = f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}_Page_{page_range}.pdf"
+        if not any(bucket.blob(f"{root}{file_name}").exists() for root in category_roots):
+            return False
+    return True
 
 
 def list_root_contents(bucket, root_prefix: str) -> tuple:
@@ -1737,12 +1091,13 @@ class ManifestRow:
     source_gcs_uri: str
     parsed_month_day: str  # e.g. "12/14" - the (month, day) parsed from the file name, for auditability
     destination_folder: str  # e.g. "Dec 14 2025"
-    destination_gcs_uri: Optional[str]  # None when the survey was rejected (never split/uploaded)
+    destination_gcs_uri: Optional[str]  # None only for a whole-source failure that couldn't be split into survey units at all (malformed page count); every per-survey-unit row - rejected, declined, or normal - IS still split/uploaded, just to that category's own destination subfolder (see organize_combined_pdf())
     moved_at: Optional[datetime.datetime] = None  # when this ETL run moved the file
     moved_date: Optional[datetime.date] = None  # DATE(moved_at); the BQ table's partitioning column
-    rejected_reason: Optional[str] = None  # why this survey was fully rejected (never split/uploaded; destination_gcs_uri stays None), else None
-    needs_review_reason: Optional[str] = None  # why this survey needs a manual look even though it WAS still split/uploaded (e.g. disputed TPS number, declined marking), else None
+    rejected_reason: Optional[str] = None  # why this survey was rejected (blank/unreadable, or a decline scribble with no word - see split_combined_pdf()), else None
+    needs_review_reason: Optional[str] = None  # why this survey needs a manual look even though it WAS still split/uploaded (e.g. a declined WORD marking, a non-English survey), else None
     source_page_range: Optional[str] = None  # e.g. "1-2" - which pages/survey unit inside source_file this row is about, for a combined scan
+    output_category: Optional[str] = None  # "normal" / "declined" / "rejected" - which destination subfolder this survey unit was routed to (see split_combined_pdf()/organize_combined_pdf()); None only for the whole-source failure case above
     rejected: bool = False  # auto-derived in __post_init__ - True whenever rejected_reason is set
     needs_review: bool = False  # auto-derived in __post_init__ - True whenever needs_review_reason is set
 
@@ -1875,7 +1230,12 @@ def organize_combined_pdf(
     max_surveys: Optional[int] = None,
     only_page_range: Optional[tuple] = None,
 ) -> OrganizeResult:
-    """Splits one combined scan and uploads named survey PDFs.
+    """Splits one combined scan and uploads named survey PDFs, each routed to
+    its own destination subfolder by output_category (see split_combined_
+    pdf()'s docstring): "normal" -> <date folder>/<batch subfolder>/,
+    "declined" -> Declined/<date folder>/<batch subfolder>/, "rejected" ->
+    Rejected/<date folder>/<batch subfolder>/ - all three still under
+    destination_prefix.
 
     The source is never modified or deleted. Existing destination objects are
     never overwritten.
@@ -1930,21 +1290,26 @@ def organize_combined_pdf(
     batch_suffix = combined_match_for_split.group("batch")
     subfolder = survey_batch_subfolder(month, day, batch_suffix)
 
+    # Explicit user request: "declined" and "rejected" survey units are routed to
+    # their own dedicated subfolders under destination_prefix, instead of the
+    # normal <date folder>/<batch subfolder>/ path - category_subdir is prepended
+    # to that same path, so each category still keeps its own per-date/per-batch
+    # structure, just nested one level deeper under "Declined"/"Rejected".
+    category_subdir = {"normal": "", "declined": "Declined/", "rejected": "Rejected/"}
+
     for output in outputs:
         page_range = f"{output['page_start']}-{output['page_end']}"
+        output_category = output.get("output_category")
         rejected_reason = output.get("rejected_reason")
-        # A rejected_reason with no output_name means split_combined_pdf() couldn't (or
-        # decided not to) produce a file at all - e.g. an unreadable/blank page, a
-        # non-English survey, or a genuine confirmed duplicate. That's a true reject:
-        # nothing to upload, and never flagged needs_review too (a file can't be both -
-        # see ManifestRow.__post_init__). A needs_review_reason WITH an output_name (a
-        # NEEDS_REVIEW file name) means the opposite - the survey still gets split and
-        # uploaded, just under a name that flags it for a human, so it falls through to
-        # the same upload path as a normal success below instead of being skipped here.
+        # A rejected_reason with no output_name means split_combined_pdf() couldn't
+        # split this source into survey units at all (a malformed whole-source page
+        # count) - nothing to upload, not even to the "Rejected" folder, since there's
+        # no clean per-survey-unit page range to extract. Every OTHER rejected/
+        # declined/normal survey unit DOES still get an output_name + pdf_bytes (see
+        # split_combined_pdf()'s docstring) and falls through to the upload path below.
         if rejected_reason and output.get("output_name") is None:
             err(
-                "[SPLIT] REJECTED survey (pages %s) in %s: %s",
-                page_range,
+                "[SPLIT] REJECTED source %s: %s",
                 source_uri,
                 rejected_reason,
             )
@@ -1959,15 +1324,19 @@ def organize_combined_pdf(
                     moved_date=moved_at.date(),
                     rejected_reason=rejected_reason,
                     source_page_range=page_range,
+                    output_category=output_category,
                 )
             )
             continue
 
         output_name = output["output_name"]
         if output_name in seen_names:
-            # split_combined_pdf() already dedupes by TPS number across a source's
-            # own survey units - reaching this is unexpected, so flag just this one
-            # survey rather than aborting the rest of an otherwise-good source PDF.
+            # Output names are now fully deterministic from (year, month, day,
+            # batch, page range) - see split_combined_pdf()'s docstring - so a
+            # collision here would mean two survey units landed on the exact same
+            # page range, which should never happen from one source PDF's own
+            # page count. Reaching this is unexpected; flag just this one survey
+            # unit rather than aborting the rest of an otherwise-good source PDF.
             # Nothing is uploaded under this colliding name, so this is a true reject.
             err(
                 "[SPLIT] REJECTED survey (pages %s) in %s: duplicate output name %s",
@@ -1982,17 +1351,23 @@ def organize_combined_pdf(
                     destination_gcs_uri=None,
                     moved_at=moved_at,
                     moved_date=moved_at.date(),
-                    rejected_reason=f"duplicate TPS output name {output_name!r} within this source PDF",
+                    rejected_reason=f"duplicate output name {output_name!r} within this source PDF",
                     source_page_range=page_range,
+                    output_category="rejected",
                 )
             )
             continue
         seen_names.add(output_name)
         needs_review_reason = output.get("needs_review_reason")
-        destination_blob_name = f"{destination_prefix}{output['date_folder']}/{subfolder}/{output_name}"
+        destination_blob_name = (
+            f"{destination_prefix}{category_subdir.get(output_category, '')}"
+            f"{output['date_folder']}/{subfolder}/{output_name}"
+        )
         destination_uri = f"gs://{bucket.name}/{destination_blob_name}"
         destination_blob = bucket.blob(destination_blob_name)
-        review_tag = " [NEEDS REVIEW]" if needs_review_reason else ""
+        status_tag = {
+            "declined": " [DECLINED]", "rejected": " [REJECTED]",
+        }.get(output_category, " [NEEDS REVIEW]" if needs_review_reason else "")
         # As in organize_loose_pdfs(): an already-uploaded survey is not re-uploaded,
         # but its manifest row is still (re-)appended below instead of skipped -
         # otherwise this survey's BQ row (including needs_review_reason, which
@@ -2003,7 +1378,7 @@ def organize_combined_pdf(
         elif dry_run:
             status(
                 "[SPLIT] [dry-run]%s %s pages %d-%d -> %s",
-                review_tag,
+                status_tag,
                 source_uri,
                 output["page_start"],
                 output["page_end"],
@@ -2013,7 +1388,7 @@ def organize_combined_pdf(
             destination_blob.upload_from_string(
                 output["pdf_bytes"], content_type="application/pdf"
             )
-            status("[SPLIT] Uploaded%s %s -> %s", review_tag, source_uri, destination_uri)
+            status("[SPLIT] Uploaded%s %s -> %s", status_tag, source_uri, destination_uri)
         result.moved_rows.append(
             ManifestRow(
                 source_file=source_path,
@@ -2023,8 +1398,10 @@ def organize_combined_pdf(
                 destination_gcs_uri=destination_uri,
                 moved_at=moved_at,
                 moved_date=moved_at.date(),
+                rejected_reason=rejected_reason if output_category == "rejected" else None,
                 needs_review_reason=needs_review_reason,
                 source_page_range=page_range,
+                output_category=output_category,
             )
         )
 
@@ -2046,9 +1423,10 @@ BQ_MANIFEST_SCHEMA = [
     ("moved_at", "TIMESTAMP", "When this ETL run moved the file."),
     ("moved_date", "DATE", "DATE(moved_at); the table's partitioning column."),
     ("source_page_range", "STRING", "e.g. '1-2' - which pages/survey unit inside source_file this row is about, for a combined scan; NULL for a standalone source file."),
-    ("rejected", "BOOLEAN", "True if this survey was fully rejected and never split/uploaded (destination_gcs_uri NULL) - e.g. a blank/unreadable/non-English page or a confirmed duplicate. Mutually exclusive with needs_review."),
+    ("output_category", "STRING", "'normal' / 'declined' / 'rejected' - which destination subfolder this survey unit was routed to (see split_combined_pdf()/organize_combined_pdf()); NULL only for a whole-source failure that couldn't be split into survey units at all (destination_gcs_uri also NULL in that one case)."),
+    ("rejected", "BOOLEAN", "True if this survey was rejected (output_category='rejected') - a blank/unreadable page, or a decline scribble/strikethrough with no 'Declined' word written. A rejected survey is STILL split and uploaded (to a dedicated 'Rejected' subfolder), unlike before - destination_gcs_uri is NULL only for the rarer whole-source-failure case. Mutually exclusive with needs_review."),
     ("rejected_reason", "STRING", "Why this survey was rejected; NULL unless rejected=true."),
-    ("needs_review", "BOOLEAN", "True if this survey was still split/uploaded but flagged for a human to double-check (e.g. a disputed TPS number, a declined marking). Mutually exclusive with rejected."),
+    ("needs_review", "BOOLEAN", "True if this survey was split/uploaded but flagged for a human to double-check (a declined WORD marking, or a non-English survey). Mutually exclusive with rejected."),
     ("needs_review_reason", "STRING", "Why this survey needs manual review; NULL unless needs_review=true."),
 ]
 
@@ -2543,8 +1921,8 @@ def main():
         metavar="START-END",
         help="Only process the single survey unit occupying pages START-END (1-indexed, "
         "inclusive, exactly as shown in a PDF viewer, e.g. '219-220') of the PDF given by "
-        "--only-file - every other survey unit in that source is skipped entirely (no TPS "
-        "extraction, no content/declined check). Requires --only-file. Also bypasses the "
+        "--only-file - every other survey unit in that source is skipped entirely (no "
+        "content/declined check). Requires --only-file. Also bypasses the "
         "'already fully processed' skip that would otherwise apply to that whole source PDF, "
         "so this always runs even to recheck one already-processed survey.",
     )

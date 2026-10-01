@@ -1,0 +1,79 @@
+failed_at_utc,source_uri,bad_pdf,error
+2026-10-01T16:02:54.566997+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_1.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_1.pdf (pages 1-2),the PDF is empty - there's no data to process
+2026-10-01T16:09:14.776790+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 1-2),the PDF is empty - there's no data to process
+2026-10-01T16:09:14.777599+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 3-4),the PDF is empty - there's no data to process
+2026-10-01T16:09:14.777936+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 5-6),the PDF is empty - there's no data to process
+2026-10-01T16:09:14.778231+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 7-8),the PDF is empty - there's no data to process
+2026-10-01T16:09:14.778521+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 9-10),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.778896+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 11-12),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.779387+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 15-16),a large handwritten 'Declined' marking was detected on this survey page.
+2026-10-01T16:09:14.779614+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 19-20),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.779808+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 21-22),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.780041+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 23-24),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.780233+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 25-26),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.780415+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 27-28),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.780594+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 59-60),the survey appears to be written in a language other than English
+2026-10-01T16:09:14.780756+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 63-64),the PDF is empty - there's no data to process
+2026-10-01T16:09:14.780892+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_5.pdf (pages 85-86),the survey appears to be written in a language other than English
+2026-10-01T16:10:40.574747+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_9.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_9.pdf (pages 9-10),"a large hand-drawn strikethrough/scribble was detected across the answer grid on this survey page, with no 'Declined' word written - treated as a voided/cancelled response rather than a confirmed decline."
+2026-10-01T16:14:29.126524+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf (pages 125-126),the survey appears to be written in a language other than English
+2026-10-01T16:14:29.127027+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf (pages 127-128),the survey appears to be written in a language other than English
+2026-10-01T16:14:29.127195+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf (pages 129-130),the survey appears to be written in a language other than English
+2026-10-01T16:14:29.127402+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf (pages 131-132),the survey appears to be written in a language other than English
+2026-10-01T16:14:29.127585+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_6.pdf (pages 133-134),the survey appears to be written in a language other than English
+2026-10-01T16:19:16.566052+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 3-4),the PDF is empty - there's no data to process
+2026-10-01T16:19:16.566678+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 15-16),the survey appears to be written in a language other than English
+2026-10-01T16:19:16.566940+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 55-56),the survey appears to be written in a language other than English
+2026-10-01T16:19:16.567162+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 109-110),the survey appears to be written in a language other than English
+2026-10-01T16:19:16.567371+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 123-124),the survey appears to be written in a language other than English
+2026-10-01T16:19:16.567571+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 125-126),the survey appears to be written in a language other than English
+2026-10-01T16:19:16.567773+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_10.pdf (pages 127-128),the survey appears to be written in a language other than English
+2026-10-01T16:21:05.506022+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf (pages 9-10),the survey appears to be written in a language other than English
+2026-10-01T16:21:05.507949+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf (pages 35-36),the survey appears to be written in a language other than English
+2026-10-01T16:21:05.508273+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf (pages 39-40),the survey appears to be written in a language other than English
+2026-10-01T16:21:05.508560+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_14.pdf (pages 41-42),the PDF is empty - there's no data to process
+2026-10-01T16:22:09.076581+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 1-2),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.077695+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 3-4),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.077845+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 7-8),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.077976+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 9-10),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.078091+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 19-20),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.078345+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 21-22),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.078496+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 125-126),the PDF is empty - there's no data to process
+2026-10-01T16:22:09.078648+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 129-130),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.078822+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 133-134),the survey appears to be written in a language other than English
+2026-10-01T16:22:09.078936+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_11.pdf (pages 135-136),the survey appears to be written in a language other than English
+2026-10-01T16:23:24.655171+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf (pages 37-38),the PDF is empty - there's no data to process
+2026-10-01T16:23:24.655845+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf (pages 39-40),the PDF is empty - there's no data to process
+2026-10-01T16:23:24.656048+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf (pages 145-146),the PDF is empty - there's no data to process
+2026-10-01T16:23:24.656242+00:00,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf,gs://tps_survey/TPS_Scanned_2025/Nov3_12.pdf (pages 147-148),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.644427+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 1-2),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.645613+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 7-8),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.645912+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 11-12),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.646186+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 13-14),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.646438+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 23-24),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.646685+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 27-28),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.646924+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 29-30),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.647158+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 33-34),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.647390+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 35-36),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.647625+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 37-38),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.647864+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 43-44),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.648087+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 45-46),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.648316+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 47-48),the PDF is empty - there's no data to process
+2026-10-01T16:27:24.648545+00:00,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov4_4.pdf (pages 55-56),the PDF is empty - there's no data to process
+2026-10-01T16:35:32.745499+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_3.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_3.pdf (pages 15-16),the survey appears to be written in a language other than English
+2026-10-01T16:41:58.716702+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 1-2),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.717309+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 3-4),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.718153+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 7-8),the survey appears to be written in a language other than English
+2026-10-01T16:41:58.718327+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 23-24),the survey appears to be written in a language other than English
+2026-10-01T16:41:58.718643+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 27-28),the survey appears to be written in a language other than English
+2026-10-01T16:41:58.718804+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 29-30),the survey appears to be written in a language other than English
+2026-10-01T16:41:58.718973+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 35-36),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.719089+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 37-38),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.719240+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 41-42),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.719351+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 47-48),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.719758+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 49-50),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.719871+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 55-56),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.719981+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 57-58),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.720094+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 65-66),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.720200+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 67-68),the PDF is empty - there's no data to process
+2026-10-01T16:41:58.720313+00:00,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf,gs://tps_survey/TPS_Scanned_2025/Nov17_7.pdf (pages 69-70),a large handwritten 'Declined' marking was detected on this survey page.
