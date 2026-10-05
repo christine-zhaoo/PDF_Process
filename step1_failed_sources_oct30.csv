@@ -1,0 +1,2 @@
+failed_at_utc,source_uri,bad_pdf,error
+2026-10-05T18:16:38.724267+00:00,gs://tps_survey/TPS_Scanned_2025/Nov 10 2025/Nov10_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov 10 2025/Nov10_4.pdf (pages 1-2),a large handwritten 'Declined' marking was detected on this survey page.

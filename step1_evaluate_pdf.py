@@ -894,7 +894,7 @@ def split_combined_pdf(
             # translates it, instead of being discarded outright.
             language_note = None
             if not validate_survey_language(source_doc[start]):
-                language_note = "the survey appears to be written in a language other than English"
+                language_note = "The survey appears to be written in a language other than English"
 
             # Page 2 is passed too (when this survey unit has one) so BLANK is
             # judged across the whole survey, not just page 1's answer grid -
@@ -931,7 +931,7 @@ def split_combined_pdf(
                 # would otherwise reject it as "empty - no data to process".
                 output_category = "declined"
                 reason = (
-                    "a large hand-drawn strikethrough/scribble was detected across "
+                    "A large hand-drawn strikethrough/scribble was detected across "
                     "the answer grid on this survey page, with no 'Declined' word "
                     "written - treated as a voided/cancelled response; needs review "
                     "to confirm the respondent meant to decline."
@@ -1156,7 +1156,7 @@ def reconcile_manifest_rows_for_complete_source(
                     language_note = None
                     if not validate_survey_language(source_doc[start]):
                         language_note = (
-                            "the survey appears to be written in a language other than English"
+                            "The survey appears to be written in a language other than English"
                         )
                     second_page = (
                         source_doc[start + 1] if start + 1 < page_count else None
@@ -1181,7 +1181,7 @@ def reconcile_manifest_rows_for_complete_source(
                         # survey actually shows.
                         if decline_marking == "SCRIBBLE":
                             needs_review_reason = (
-                                "a large hand-drawn strikethrough/scribble was detected across "
+                                "A large hand-drawn strikethrough/scribble was detected across "
                                 "the answer grid on this survey page, with no 'Declined' word "
                                 "written - treated as a voided/cancelled response; needs review "
                                 "to confirm the respondent meant to decline."
