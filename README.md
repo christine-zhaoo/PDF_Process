@@ -14,6 +14,12 @@ If the workbook is unreachable (moved, deleted, no network), every step falls ba
 
 Regenerate the workbook's starting point (e.g. after adding a brand-new setting to `pipeline_config.py`) with `generate_pipeline_config_doc.py`; it pre-fills from whatever the live workbook already has, so regenerating never silently discards someone's edits.
 
+python3 generate_pipeline_config_doc.py pipeline_configuration_2026.xlsx \
+  --report-year 2026 \
+  --question-overrides tps_2026_question_overrides.json \
+  --upload-blob Pipeline_Config/pipeline_configuration_2026.xlsx
+  
+
 **Pixel-level calibration is deliberately NOT in this workbook** — exact checkbox x/y coordinates, anchor label text, confusable handwritten-digit pairs, and ink thresholds live in step1–step4's own code, because they're tied to this exact form's physical print layout. Porting to a genuinely different PDF format requires re-measuring that geometry against the new form (see step 2), not just editing a config value.
 
 ## Pipeline overview

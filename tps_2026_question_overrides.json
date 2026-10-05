@@ -1,0 +1,38 @@
+{
+  "H3": {
+    "question_text": "Setting",
+    "choices": "Early Intervention | OP/IOP | Residential | OTP | WM | Recovery Services"
+  },
+  "H4": {
+    "question_text": "Field Based Services (FBS) Agency",
+    "choices": "written agency name, if filled in"
+  },
+  "H5": {
+    "question_text": "FBS Address",
+    "choices": "written address, if filled in"
+  },
+  "20": {
+    "question_text": "How helpful were your telehealth visits compared to traditional in-person visits?",
+    "choices": "Much Better | Somewhat Better | About the same | Somewhat worse | Much worse | N/A"
+  },
+  "24": {
+    "question_text": "Comment: Please let us know your comments. What was most helpful about this program? What would you change about this program? Please do not write any information that may identify you. For example, DO NOT write your name or phone number.",
+    "choices": "open text (respondent instructed not to identify themselves)"
+  },
+  "29": {
+    "question_text": "What is your current gender identity? (Note: This is how you identify yourself, which may not be the same as the sex you were assigned at birth)",
+    "choices": "Male | Female | Female-to-Male (FTM)/Transgender Male/Trans Man | Male-to-Female (MTF)/Transgender Female/Trans Woman | Gender Queer/Gender Non-Conforming | Other (specify) | Prefer not to state"
+  },
+  "33": {
+    "question_text": "Race/Ethnicity (Please mark all that apply)",
+    "choices": "American Indian/Alaskan Native | Asian | Black/African American | Native Hawaiian/Pacific Islander | White/Caucasian | Other (specify) | Prefer not to state"
+  },
+  "34": {
+    "question_text": "Disability Status (Please mark all that apply)",
+    "choices": "Physically Disabled | Visually Impaired/Blind | Hearing Impaired/Deaf | Co-occurring Mental Health Condition | Developmentally or Intellectually Disabled | Other (specify) | None"
+  },
+  "31": {
+    "question_text": "What is your sexual orientation?",
+    "choices": "Heterosexual/Straight | Lesbian (Female) | Gay (Male) | Bisexual | Unsure/Questioning/Don't know | Pansexual | Asexual | Other (specify) | Queer | Prefer not to state"
+  }
+}

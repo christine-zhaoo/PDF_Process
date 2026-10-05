@@ -862,7 +862,7 @@ def split_combined_pdf(
         for start in survey_starts:
             page_range = f"{start + 1}-{start + pages_per_survey}"
             output_name = (
-                f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}_Page_{page_range}.pdf"
+                f"{year}_{_MONTH_NAMES[month]}_{day}_{batch_suffix}_Page_{page_range}.pdf"
             )
 
             # Language is gated first, but - explicit user request - is NO LONGER a
@@ -992,10 +992,183 @@ def combined_source_is_complete(
 
     for start in range(0, page_count, PAGES_PER_SURVEY):
         page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-        file_name = f"{year}_{_MONTH_NAMES[month]}_{day:02d}_{batch_suffix}_Page_{page_range}.pdf"
+        file_name = f"{year}_{_MONTH_NAMES[month]}_{day}_{batch_suffix}_Page_{page_range}.pdf"
         if not any(bucket.blob(f"{root}{file_name}").exists() for root in category_roots):
             return False
     return True
+
+
+def reconcile_manifest_rows_for_complete_source(
+    bucket,
+    root_prefix: str,
+    destination_prefix: str,
+    year: int,
+    blob,
+    moved_at: Optional[datetime.datetime] = None,
+) -> list:
+    """Explicit user request ("have the logic to always update the records
+    once step 1 runs"): combined_source_is_complete() returning True makes
+    the caller skip this source ENTIRELY - no Gemini call (the whole point,
+    to avoid burning Vertex quota on a source nothing changed about) but
+    also, as a side effect, no manifest row emission at all. That means
+    once a source is ever judged complete, NOTHING ever updates its
+    manifest rows again - confirmed as the real cause of a reported stale
+    pdf_manifest_list row (gs://.../2025_Nov_18_1_TPS_6947.pdf) that kept
+    pointing at a destination file which no longer existed, because
+    whatever renamed it to the current _Page_21-22.pdf naming never ran
+    through this script's own delete-then-load path at all.
+
+    Call this INSTEAD of returning empty when combined_source_is_complete()
+    is True: it finds each survey unit's ACTUAL current destination file
+    (same deterministic filename/category-root search that function
+    already does) and returns one ManifestRow per unit describing exactly
+    what's really there right now - no re-upload and no re-split, but it
+    DOES re-run the per-survey gates (see below) - enough for
+    load_manifest_rows_into_bq()'s existing delete_existing_manifest_rows_
+    for_sources() step to replace any stale row for the same (source_gcs_
+    uri, source_page_range) key with one that matches current reality.
+
+    The ORIGINAL reason text from the run that first split this source was
+    never stored outside that run's own manifest row, so it can't be read
+    back. Instead of guessing at it from the file's name/folder, this
+    RE-RUNS the same gates split_combined_pdf() runs (validate_survey_
+    language() + assess_page_content_and_declined()) against the source's
+    real pages, so a reconciled row carries a genuine, Gemini-backed
+    judgment. The file's category (normal/Declined/Rejected) still comes
+    from which subfolder it physically sits in - that was decided by the
+    earlier run and isn't second-guessed here; only the REASON is recomputed.
+
+    This costs the same Gemini calls a fresh split would have made, so it is
+    no longer "no Gemini call" cheap. That's deliberate: the previous
+    filename-based shortcut ("_NEEDS_REVIEW" in file_name) silently stopped
+    working when outputs were renamed to
+    "{year}_{Mon}_{day}_{batch}_Page_{range}.pdf", leaving every reconciled
+    "normal" unit with needs_review_reason=None - including confirmed
+    non-English surveys."""
+    import pymupdf
+
+    moved_at = moved_at or datetime.datetime.utcnow()
+    source_name = blob.name.rsplit("/", 1)[-1]
+    source_path = f"{bucket.name}/{blob.name}"
+    source_uri = f"gs://{bucket.name}/{blob.name}"
+    relative_parts = blob.name[len(_normalize_prefix(root_prefix)):].split("/")
+    source_folder = next(
+        (part for part in relative_parts[:-1] if parse_date_folder_name(part)),
+        None,
+    )
+    folder_date = parse_date_folder_name(source_folder) if source_folder else None
+    source_name_for_date = source_name
+    combined_match = _COMBINED_FILE_RE.fullmatch(source_name)
+    if combined_match is None:
+        return []
+    if folder_date:
+        source_name_for_date = (
+            f"{_MONTH_NAMES[folder_date.month]}{folder_date.day}_"
+            f"{combined_match.group('batch')}.pdf"
+        )
+    source_date = parse_file_name_date(source_name_for_date)
+    if source_date is None:
+        return []
+    month, day = source_date
+    source_bytes = blob.download_as_bytes()
+    source_doc = pymupdf.open(stream=source_bytes, filetype="pdf")
+    page_count = len(source_doc)
+    if page_count < PAGES_PER_SURVEY or page_count % PAGES_PER_SURVEY:
+        source_doc.close()
+        return []
+
+    date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
+    batch_suffix = combined_match.group("batch")
+    subfolder = survey_batch_subfolder(month, day, batch_suffix)
+    normalized_destination = _normalize_prefix(destination_prefix)
+    category_roots = {
+        "normal": f"{normalized_destination}{date_folder}/{subfolder}/",
+        "declined": f"{normalized_destination}Declined/{date_folder}/{subfolder}/",
+        "rejected": f"{normalized_destination}Rejected/{date_folder}/{subfolder}/",
+    }
+
+    rows = []
+    try:
+        for start in range(0, page_count, PAGES_PER_SURVEY):
+            page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
+            file_name = f"{year}_{_MONTH_NAMES[month]}_{day}_{batch_suffix}_Page_{page_range}.pdf"
+            for category, root in category_roots.items():
+                if bucket.blob(f"{root}{file_name}").exists():
+                    destination_uri = f"gs://{bucket.name}/{root}{file_name}"
+                    # Re-derive the review reason by actually LOOKING at the
+                    # survey's pages, the same way split_combined_pdf() does
+                    # on a fresh run, rather than inferring it from the file's
+                    # name. The old filename test ("_NEEDS_REVIEW" in
+                    # file_name) was a leftover from the TPS-era naming that
+                    # stamped the marker into the name; since the rename to
+                    # "{year}_{Mon}_{day}_{batch}_Page_{range}.pdf" that
+                    # substring never appears, so every reconciled "normal"
+                    # unit silently came back with needs_review_reason=None -
+                    # which is how a confirmed non-English survey
+                    # (2025_Nov_23_5_Page_3-4.pdf) ended up with no language
+                    # note at all. Re-running the gates costs the same Gemini
+                    # calls a fresh split would have made, but it's the only
+                    # way these rows carry a real, Gemini-backed judgment
+                    # instead of a guess.
+                    language_note = None
+                    if not validate_survey_language(source_doc[start]):
+                        language_note = (
+                            "the survey appears to be written in a language other than English"
+                        )
+                    second_page = (
+                        source_doc[start + 1] if start + 1 < page_count else None
+                    )
+                    content_issue, decline_marking = assess_page_content_and_declined(
+                        source_doc[start], second_page
+                    )
+
+                    rejected_reason = None
+                    needs_review_reason = None
+                    if category == "rejected":
+                        rejected_reason = content_issue or (
+                            "a large hand-drawn strikethrough/scribble was detected across "
+                            "the answer grid on this survey page, with no 'Declined' word "
+                            "written - treated as a voided/cancelled response rather than a "
+                            "confirmed decline."
+                            if decline_marking == "SCRIBBLE"
+                            else "this file sits under this source's Rejected/ subfolder, but "
+                            "re-checking its pages found no current reason to reject it - "
+                            "the ORIGINAL reason from the run that first produced it was "
+                            "never stored outside that run's own manifest row"
+                        )
+                    elif category == "declined":
+                        needs_review_reason = (
+                            "a large handwritten 'Declined' marking was detected on this survey page."
+                        )
+                        if language_note:
+                            needs_review_reason = f"{needs_review_reason} Also, {language_note}."
+                    else:
+                        needs_review_reason = language_note
+
+                    rows.append(
+                        ManifestRow(
+                            source_file=source_path,
+                            source_gcs_uri=source_uri,
+                            parsed_month_day=f"{month:02d}/{day:02d}",
+                            destination_folder=date_folder,
+                            destination_gcs_uri=destination_uri,
+                            moved_at=moved_at,
+                            moved_date=moved_at.date(),
+                            rejected_reason=rejected_reason,
+                            needs_review_reason=needs_review_reason,
+                            source_page_range=page_range,
+                            output_category=category,
+                        )
+                    )
+                    break
+            # If no category root has the file (shouldn't happen - the caller
+            # only invokes this after combined_source_is_complete() already
+            # confirmed every unit exists somewhere), silently emit no row for
+            # that one unit rather than guessing - the next run's completeness
+            # check will catch it and reprocess normally.
+    finally:
+        source_doc.close()
+    return rows
 
 
 def list_root_contents(bucket, root_prefix: str) -> tuple:
@@ -1494,6 +1667,102 @@ def ensure_manifest_table(bq_client, project: str, dataset: str, table: str):
     return bq_table
 
 
+def cleanup_superseded_destination_files(
+    bq_client,
+    bucket,
+    project: str,
+    dataset: str,
+    table: str,
+    moved_rows: list,
+) -> int:
+    """Explicit user request, follow-up to reconcile_manifest_rows_for_
+    complete_source(): that function keeps pdf_manifest_list in sync with
+    reality, but this script NEVER deletes a GCS object anywhere else
+    (see organize_combined_pdf()'s own docstring, "Existing destination
+    objects are never overwritten" - and never deleted, either) - so an
+    old-style destination file (e.g. a legacy TPS-numbered one) superseded
+    by a newer run's differently-named file for the exact same survey unit
+    was left behind forever, with nothing ever cleaning it up (confirmed
+    directly: 1,291 such stale files across 39 folders had to be found and
+    deleted BY HAND earlier, via a one-off script, before this existed).
+
+    Call this BEFORE delete_existing_manifest_rows_for_sources() runs (i.e.
+    before load_manifest_rows_into_bq()) - it needs to read each survey
+    unit's PREVIOUS destination_gcs_uri out of the manifest table first,
+    while it's still there. For every (source_gcs_uri, source_page_range)
+    key in `moved_rows`, looks up the existing manifest row(s) for that
+    same key and, when the OLD row's destination_gcs_uri differs from the
+    NEW one `moved_rows` is about to write:
+
+      1. Confirms the NEW destination file actually exists in GCS (never
+         deletes the old one on the strength of a manifest row alone - a
+         row could itself be wrong/stale).
+      2. Only then deletes the OLD destination file, if it still exists.
+
+    This is the exact same two-step safety check used for the real, one-
+    off cleanup earlier (confirm the replacement exists for the identical
+    page range before removing anything) - never a bulk "delete everything
+    matching a name pattern" sweep. Returns the number of files deleted."""
+    from google.cloud import bigquery
+    from google.api_core.exceptions import NotFound
+
+    keys = sorted({(r.source_gcs_uri, r.source_page_range) for r in moved_rows if r.source_gcs_uri})
+    new_dest_by_key = {(r.source_gcs_uri, r.source_page_range): r.destination_gcs_uri for r in moved_rows}
+    if not keys:
+        return 0
+
+    table_id = f"`{project}`.`{dataset}`.`{table}`"
+    struct_params = [
+        bigquery.StructQueryParameter(
+            None,
+            bigquery.ScalarQueryParameter("source_gcs_uri", "STRING", uri),
+            bigquery.ScalarQueryParameter("source_page_range", "STRING", page_range),
+        )
+        for uri, page_range in keys
+    ]
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("keys", "STRUCT", struct_params)],
+    )
+    try:
+        old_rows = list(
+            bq_client.query(
+                f"""
+                SELECT DISTINCT t.source_gcs_uri, t.source_page_range, t.destination_gcs_uri
+                FROM {table_id} AS t
+                WHERE EXISTS (
+                    SELECT 1 FROM UNNEST(@keys) AS k
+                    WHERE t.source_gcs_uri = k.source_gcs_uri
+                      AND (t.source_page_range = k.source_page_range
+                           OR (t.source_page_range IS NULL AND k.source_page_range IS NULL))
+                )
+                """,
+                job_config=job_config,
+            ).result()
+        )
+    except NotFound:
+        return 0  # table doesn't exist yet - nothing to clean up
+
+    bucket_prefix = f"gs://{bucket.name}/"
+    deleted = 0
+    for row in old_rows:
+        key = (row["source_gcs_uri"], row["source_page_range"])
+        old_uri = row["destination_gcs_uri"]
+        new_uri = new_dest_by_key.get(key)
+        if not old_uri or not new_uri or old_uri == new_uri:
+            continue
+        if not old_uri.startswith(bucket_prefix) or not new_uri.startswith(bucket_prefix):
+            continue  # a different bucket than the one we have a client for - skip, never guess
+        if not bucket.blob(new_uri[len(bucket_prefix):]).exists():
+            # The replacement isn't actually there - don't touch the old file.
+            continue
+        old_blob = bucket.blob(old_uri[len(bucket_prefix):])
+        if old_blob.exists():
+            old_blob.delete()
+            deleted += 1
+            status("[CLEANUP] Deleted superseded destination file %s (replaced by %s).", old_uri, new_uri)
+    return deleted
+
+
 def delete_existing_manifest_rows_for_sources(
     bq_client,
     project: str,
@@ -1710,7 +1979,19 @@ def _process_source_pdf(
                     "[PROGRESS] Fully processed; skipping Vertex for source PDF %d/%d: %s",
                     pdf_index, total_pdfs, source_uri,
                 )
-                return OrganizeResult(moved_rows=[], skipped_files=[])
+                # Explicit user request: "always update the records once
+                # step1 runs" - skipping Vertex here must not ALSO mean
+                # skipping the manifest table. Without this, a source that's
+                # ever judged complete can never have its manifest rows
+                # refreshed again by any later run - see
+                # reconcile_manifest_rows_for_complete_source()'s own
+                # docstring for the real stale-row case this fixes. Still
+                # zero Gemini calls - this only lists/confirms GCS objects
+                # combined_source_is_complete() just confirmed exist.
+                reconciled_rows = reconcile_manifest_rows_for_complete_source(
+                    bucket, root_prefix, DESTINATION_PREFIX, resolved_year, blob,
+                )
+                return OrganizeResult(moved_rows=reconciled_rows, skipped_files=[])
             pdf_result = organize_combined_pdf(
                 bucket, root_prefix, DESTINATION_PREFIX, resolved_year, dry_run, blob,
                 max_surveys=max_surveys, only_page_range=only_page_range,
@@ -1840,6 +2121,21 @@ def run(
         resolved_bq_project = bq_project or bq_client.project
         try:
             ensure_manifest_table(bq_client, resolved_bq_project, bq_dataset, manifest_table)
+            # Explicit user request: clean up any old-style destination file
+            # a survey unit in this run's rows supersedes - see
+            # cleanup_superseded_destination_files()'s own docstring. Must
+            # run BEFORE load_manifest_rows_into_bq() below, which deletes
+            # the very manifest rows this reads the OLD destination_gcs_uri
+            # from. Never fatal - a cleanup failure must not block the
+            # manifest load that already has the correct, current data.
+            try:
+                n_cleaned = cleanup_superseded_destination_files(
+                    bq_client, bucket, resolved_bq_project, bq_dataset, manifest_table, result.moved_rows,
+                )
+                if n_cleaned:
+                    status("[CLEANUP] Deleted %d superseded old-style destination file(s).", n_cleaned)
+            except Exception as e:  # noqa: BLE001 - cleanup is best-effort, never block the manifest load over it
+                err("[CLEANUP] Could not clean up superseded destination files: %s", e)
             n_loaded = load_manifest_rows_into_bq(
                 result.moved_rows, resolved_bq_project, bq_dataset, manifest_table,
                 staging_bucket=spark_staging_bucket or BUCKET_NAME,

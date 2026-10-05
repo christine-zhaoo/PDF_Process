@@ -50,7 +50,7 @@ import io
 # edit + redeploy, unlike everything else below.
 # ==========================================================================
 _CONFIG_GCS_BUCKET = "tps_survey"
-_CONFIG_GCS_BLOB = "Pipeline_Config/pipeline_configuration.xlsx"
+_CONFIG_GCS_BLOB = "Pipeline_Config/pipeline_configuration_2025.xlsx"
 
 # ==========================================================================
 # GCS locations
@@ -124,18 +124,13 @@ REPORT_YEAR = "2025"
 # Model self-reported confidence (0-1) below which a model-only answer (no
 # pixel/Vision corroboration) is flagged needs_review.
 MODEL_CONFIDENCE_THRESHOLD = 0.7
-# Word-level coverage (0-1) below which a freeform written-text field
-# (H4/H5/H6/24) disagrees with Cloud Vision's OCR and is flagged.
+# General coverage/overlap threshold (0-1) for every written-text field's
+# near-miss tolerance check against Cloud Vision's OCR (word-level for H4/
+# H5/24, character-level for H2, digit-level for H1/26/H6) - below this,
+# the field disagrees with Vision's reading and is flagged. Previously H2/
+# H4/H6 each had their own separately-tuned threshold (0.8/0.5/0.5); explicit
+# user request consolidated all of them into this one general value.
 VISION_FREEFORM_COVERAGE_THRESHOLD = 0.7
-# Character-level overlap (0-1) tolerance for H2's short alphanumeric code.
-H2_CHAR_OVERLAP_THRESHOLD = 0.8
-# Character-level overlap (0-1) tolerance for H4's short agency-name answers
-# (e.g. "N/A" vs Cloud Vision dropping the handwritten slash to read "NA").
-H4_CHAR_OVERLAP_THRESHOLD = 0.5
-# H6 (Today's Date) last-resort digit-overlap coverage (0-1): when Vision
-# drops/misses whole digits outright (not a wrong-but-present digit), the
-# fraction of digits that still line up before treating it as a pass.
-H6_DIGIT_COVERAGE_THRESHOLD = 0.5
 # Set False to skip the Cloud Vision double-check entirely (e.g. no Vision
 # API enabled/quota) - written-text questions fall back to model-only +
 # confidence-threshold checking alone.
@@ -152,138 +147,147 @@ FILE_EXTRACTION_WORKERS = 4
 # ==========================================================================
 # Survey schema: questions, answer choices, and question-TYPE rules
 # ==========================================================================
-# This is the part to replace wholesale when porting to a different survey
-# PDF. SURVEY_QUESTIONS is the single source of truth - step4 derives
+# To port this pipeline to a different survey PDF, edit the configuration
+# WORKBOOK on GCS, not this file. SURVEY_QUESTIONS (loaded from that
+# workbook at import) is the single source of truth - step4 derives
 # QUESTION_TEXT_BY_NUMBER, CHOICE_LISTS_BY_NUMBER, and WRITTEN_TEXT_QUESTION_
 # NUMBERS straight from it, so those never need separate maintenance. The
-# sets below it (MULTI_SELECT_QUESTION_NUMBERS onward) are the parts that
-# genuinely can't be derived automatically - they encode real,
-# case-by-case decisions about how each question's answer should be
-# verified, made and documented over many real scans (see step4_process_
-# pdf.py's own inline history for each one).
+# sets below it (MULTI_SELECT_QUESTION_NUMBERS onward) come from that same
+# sheet's per-question columns - they encode real, case-by-case decisions
+# about how each question's answer should be verified, made and documented
+# over many real scans (see step4_process_pdf.py's own inline history).
 
 # No grouped "big question -> lettered sub-items" structure in this
 # template (e.g. no "Q5a / Q5b / Q5c" under one shared stem) - a form that
 # has one would populate this as {group_key: "shared stem text"}.
 GROUP_HEADERS = {}
 
-_SIX_POINT_SCALE = "Strongly Agree / Agree / I am Neutral / Disagree / Strongly Disagree / Not Applicable"
-_SIX_POINT_SCALE_NA = "Strongly Agree / Agree / I am Neutral / Disagree / Strongly Disagree / N/A"
-_MULTI_SELECT_NOTE = " (mark all that apply — more than one choice may be marked)"
+# ==========================================================================
+# How a question's answer choices are written in one cell/string, and the
+# ONE parser (split_choices()/is_choice_list() below) every step must use to
+# read them back - never a hand-rolled .split() at the call site.
+#
+# CHOICE_SEPARATOR is "|" because a choice's OWN text very often contains a
+# slash - "Female-to-Male (FTM)/Transgender Male/Trans Man" is ONE choice on
+# Q29, "Unsure/Questioning/Don't know" is ONE choice on Q31 - so a slash
+# cannot safely separate choices from each other. The original convention
+# worked around that by requiring a SPACE-slash-SPACE (" / ") separator and
+# splitting on exactly that, which does parse correctly, but silently
+# depends on invisible whitespace: someone editing the workbook who types
+# "Yes/No" or "Yes/ No" instead of "Yes / No" gets a SINGLE run-together
+# choice with no error, and the resulting off-by-N choice list shifts every
+# mark_position after it - exactly the class of silent mislabeling the Q31
+# choice-ORDER bug caused. A pipe can't collide with a choice's own text, so
+# it needs no whitespace ceremony to be unambiguous.
+#
+# Legacy " / " input is still parsed (see split_choices()) so the live
+# workbook written under the old convention keeps working untouched.
+# ==========================================================================
+CHOICE_SEPARATOR = "|"
+_LEGACY_CHOICE_SEPARATOR = " / "
 
-# Each entry: (question_number, group_key, sub_text, choices).
-# - question_number: the label used everywhere downstream ("H1".."H6", "1".."35").
-# - group_key: None unless this question is a lettered sub-item of a shared
-#   stem question (see GROUP_HEADERS above).
-# - sub_text: the question's own printed text (combined with the group's
-#   stem, if any, by build_full_question_text()).
-# - choices: " / "-separated answer choices for a fixed-choice question, or
-#   a plain descriptive string (no " / ") for an open write-in field - this
-#   is exactly what step4 uses to tell the two question TYPES apart (see
-#   WRITTEN_TEXT_QUESTION_NUMBERS's derivation).
-SURVEY_QUESTIONS = [
-    # --- form header / admin fields (not numbered on the form itself) ---
-    ("H1", None, "Home Unit CalOMS Provider ID", "written ID number"),
-    ("H2", None, "Program Reporting Unit (Address) code", "written alphanumeric code"),
-    ("H3", None, "Setting", "Early Intervention / OP/IOP / Residential / OTP/NTP / Detox/WM / Recovery Services"),
-    ("H4", None, "Field Based Services: Agency", "written agency name, if filled in"),
-    ("H5", None, "Field Based Services: Address", "written address, if filled in"),
-    ("H6", None, "Today's Date (the respondent's own written completion date on the form, MM/DD/YYYY)", "written date"),
-    # --- Q1-18: single-select 6-point agreement scale ---
-    ("1", None, "The location was convenient (public transportation, distance, parking, etc.).", _SIX_POINT_SCALE),
-    ("2", None, "Services were available when I needed them.", _SIX_POINT_SCALE),
-    ("3", None, "I chose the early intervention/treatment/recovery goals with my provider's help.", _SIX_POINT_SCALE),
-    ("4", None, "Staff gave me enough time in my early intervention/treatment/recovery sessions.", _SIX_POINT_SCALE),
-    ("5", None, "Staff treated me with respect.", _SIX_POINT_SCALE),
-    ("6", None, "Staff spoke to me in a way I understood.", _SIX_POINT_SCALE),
-    ("7", None, "Staff were sensitive to my cultural background (race/ethnicity, religion, language, etc.).", _SIX_POINT_SCALE),
-    ("8", None, "I felt welcomed here.", _SIX_POINT_SCALE),
-    ("9", None, "As a direct result of the services I am receiving, I am better able to do things that I want to do.", _SIX_POINT_SCALE),
-    ("10", None, "As a direct result of the services I am receiving, I feel less craving for drugs and alcohol.", _SIX_POINT_SCALE),
-    ("11", None, "Staff here work with my physical health care providers to support my wellness.", _SIX_POINT_SCALE),
-    ("12", None, "Staff here work with my mental health care providers to support my wellness.", _SIX_POINT_SCALE),
-    ("13", None, "Staff here helped me to connect with other services as needed (social services, housing, etc.).", _SIX_POINT_SCALE),
-    ("14", None, "Overall, I am satisfied with the services I received.", _SIX_POINT_SCALE),
-    ("15", None, "I was able to get all the help/services that I needed.", _SIX_POINT_SCALE),
-    ("16", None, "I would recommend this agency to a friend or family member.", _SIX_POINT_SCALE),
-    ("17", None, "I feel comfortable discussing any lapses or return to substance use with my provider.", _SIX_POINT_SCALE),
-    ("18", None, "I began substance use treatment services with the goal of achieving either complete abstinence or reduction in use.", _SIX_POINT_SCALE),
-    ("19", None, "Now thinking about the services you received, how much of it was by telehealth (by telephone or video-conferencing)?", "None / Very little / About half / Almost all / All"),
-    ("20", None, "How helpful were your telehealth visits compared to traditional in-person visits?", "Much better / Somewhat better / About the same / Somewhat worse / N/A"),
-    ("21", None, "When you entered the treatment program, did the program staff offer you a copy of the patient handbook or show you where you can find it?", "Yes / No"),
-    ("22", None, "Did the program staff show you the patient orientation video?", "Yes / No"),
-    ("23", None, "Watching the patient orientation video helped me with information I can use to access all available substance use disorder services.", _SIX_POINT_SCALE_NA),
-    ("24", None, "Comment: What was most helpful about this program? What would you change about this program?", "open text (respondent instructed not to identify themselves)"),
-    ("25", None, "How long have you received services here?", "First visit/day / 2 weeks or less / More than 2 weeks but less than 4 weeks / 4 weeks or more"),
-    ("26", None, "Age", "written number"),
-    ("27", None, "Are you homeless?", "Yes / No"),
-    ("28", None, "Have you ever received Contingency Management services?", "Yes, I am currently receiving Contingency Management services / Yes, I received Contingency Management services in the past / No, I have never received Contingency Management services"),
-    ("29", None, "What is your current gender identity (this is how the respondent identifies themselves, which may not match sex assigned at birth)?", "Male / Female / Female-to-Male (FTM)/Transgender Male/Trans Man / Male-to-Female (MTF)/Transgender Female/Trans Woman / Gender Queer/Gender Non-Conforming / Other (specify) / Prefer not to state"),
-    ("30", None, "What was your sex at birth?", "Female / Male / Other (specify) / Prefer not to state"),
-    ("31", None, "What is your sexual orientation?", "Heterosexual/Straight / Lesbian (Female) / Gay (Male) / Bisexual / Unsure/Questioning/Don't know / Pansexual / Asexual / Queer / Other (specify) / Prefer not to state"),
-    ("32", None, "Are you of Mexican/Hispanic/Latino/a descent?", "Yes / No / Unknown"),
-    ("33", None, "Race/Ethnicity" + _MULTI_SELECT_NOTE, "American Indian/Alaskan Native / Asian / Black/African American / Native Hawaiian/Pacific Islander / White/Caucasian / Other (specify) / Prefer not to state"),
-    ("34", None, "Disability Status" + _MULTI_SELECT_NOTE, "Physically Disabled / Visually Impaired/Blind / Hearing Impaired/Deaf / Co-occurring Mental Health Condition / Developmentally or Intellectually Disabled / Other (specify) / None"),
-    ("35", None, "What is your criminal justice involvement status?", "Post-release Community Supervision (AB109) or on Probation from any federal, state, or local jurisdiction / Awaiting trial, charges or sentencing / On parole from any other jurisdiction / Any other criminal justice involvement / No criminal justice involvement"),
-]
+
+def is_choice_list(choices: str) -> bool:
+    """True when `choices` is a fixed-choice question's list of options,
+    False when it's an open write-in field's plain descriptive string (e.g.
+    "written agency name, if filled in"). This is what tells the two
+    question TYPES apart everywhere downstream - see step4_process_pdf.py's
+    CHOICE_LISTS_BY_NUMBER/WRITTEN_TEXT_QUESTION_NUMBERS."""
+    choices = choices or ""
+    return CHOICE_SEPARATOR in choices or _LEGACY_CHOICE_SEPARATOR in choices
+
+
+def split_choices(choices: str) -> list:
+    """Parses a choices string into its ordered list of individual choices.
+
+    Prefers CHOICE_SEPARATOR ("|"), and deliberately splits on it with or
+    without surrounding spaces ("A|B", "A | B" and "A |B" all parse the
+    same) - safe precisely because a pipe never appears inside a choice's
+    own text, so there's no whitespace convention left for a human editing
+    the workbook to get subtly wrong.
+
+    Falls back to the legacy " / " separator (space-slash-space, spaces
+    REQUIRED - unlike the pipe, a bare "/" genuinely does appear inside many
+    choices and must never be split on) only when no pipe is present, so a
+    workbook still written the old way keeps parsing exactly as before.
+
+    Returns [] for an open write-in field's descriptive string."""
+    choices = choices or ""
+    if CHOICE_SEPARATOR in choices:
+        parts = choices.split(CHOICE_SEPARATOR)
+    elif _LEGACY_CHOICE_SEPARATOR in choices:
+        parts = choices.split(_LEGACY_CHOICE_SEPARATOR)
+    else:
+        return []
+    return [part.strip() for part in parts if part.strip()]
+
+
+def join_choices(choices: list) -> str:
+    """The inverse of split_choices() - writes a choice list back out in the
+    canonical CHOICE_SEPARATOR form, spaced (" | ") for readability in a
+    spreadsheet cell."""
+    return f" {CHOICE_SEPARATOR} ".join(c.strip() for c in choices if c.strip())
+
+
+# The survey's questions, answer choices and per-question handling rules
+# live ENTIRELY in the configuration workbook on GCS (the "Survey Questions"
+# sheet of _CONFIG_GCS_BLOB, generated/edited via
+# generate_pipeline_config_doc.py). There is deliberately NO built-in copy
+# of any question text or answer choice in this file: a second copy here
+# would silently diverge from the workbook, and because _load_overrides()
+# REPLACES this list wholesale rather than merging into it, an edit made
+# here would appear to work locally and then be discarded at import time.
+# The workbook is the single source of truth.
+#
+# Everything below is populated by _apply_survey_questions() at import.
+# They start empty, so if the workbook cannot be read the pipeline fails
+# loudly (see _load_overrides()) instead of extracting against a stale or
+# wrong question list.
+SURVEY_QUESTIONS = []
 
 # Questions where more than one choice can legitimately be marked at once.
-MULTI_SELECT_QUESTION_NUMBERS = {"33", "34"}
+MULTI_SELECT_QUESTION_NUMBERS = set()
 
-# Every pixel-checked choice question (19-35, excluding 24/26 which are
-# written-text/Vision-checked, not pixel-checked) where, on disagreement
-# between the model's own reading and the deterministic pixel detector, the
-# MODEL's answer is kept and the disagreement is only surfaced via
-# needs_review, rather than the pixel reading being auto-applied. See
-# step4_process_pdf.py's own inline history for the real per-file failures
-# (Q20/Q23/Q25/Q29 pixel-detector errors, Q31/33/34 false-blanks) that
-# established this policy.
-MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS = {
-    "19", "20", "21", "22", "23", "25", "27", "28", "29", "30",
-    "31", "32", "33", "34", "35",
-}
+# Choice questions where, on disagreement between the model's reading and
+# the deterministic pixel detector, the MODEL's answer is kept and the
+# disagreement is only surfaced via needs_review, rather than the pixel
+# reading being auto-applied. (Workbook column: "If the AI's answer and the
+# automatic checkbox-detector disagree, trust the AI's answer instead...")
+MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS = set()
 
-# Of the open write-in fields (derived as WRITTEN_TEXT_QUESTION_NUMBERS from
-# SURVEY_QUESTIONS itself - any entry with no " / " in its choices), H1/H2/26
-# are short enough to realistically be ONE token on the page, so they're
-# compared against Cloud Vision's individually-segmented word-level OCR
-# tokens for an exact match. The rest can legitimately span multiple
-# words/lines, so they're compared against Vision's fuzzy freeform coverage
-# check instead. See cross_check_written_field_with_vision() in step4.
-_VISION_TOKEN_FIELDS = {"H1", "H2", "26"}
-_VISION_FREEFORM_FIELDS = {"H4", "H5", "H6", "24"}
+# Write-in fields compared against Cloud Vision's word-level OCR tokens for
+# an exact match (short, realistically one token) vs. its fuzzy freeform
+# coverage check (can span multiple words/lines). See
+# cross_check_written_field_with_vision() in step4.
+_VISION_TOKEN_FIELDS = set()
+_VISION_FREEFORM_FIELDS = set()
 
-# Written-text fields that are legitimately left blank far more often than
-# the near-mandatory ID (H1) and date (H6) fields - exempted from the
-# generic "blank final answer always needs review" backstop (any OTHER
-# check, e.g. a Vision disagreement, can still flag them for its own
-# reason).
-_BLANK_ANSWER_EXEMPT_FIELDS = {"H4", "H5"}
+# Write-in fields legitimately left blank often enough to be exempt from the
+# generic "blank final answer always needs review" backstop (any OTHER check
+# can still flag them for its own reason).
+_BLANK_ANSWER_EXEMPT_FIELDS = set()
 
-# Written-text fields where, on disagreement, Cloud Vision's own anchored
-# OCR reading is treated as MORE trustworthy than the model's and is used
-# as survey_answer instead (still always flagged needs_review so a human
-# confirms). Explicit user request, extended field by field as each one
-# was confirmed to have Vision consistently right more often than the
-# model on real scans - see _format_vision_authoritative_value()'s
-# docstring in step4.
-_VISION_AUTHORITATIVE_FIELDS = {"H2", "H5"}
+# Write-in fields where, on disagreement, Cloud Vision's anchored OCR
+# reading is treated as MORE trustworthy than the model's and used as
+# survey_answer instead (still always flagged needs_review).
+_VISION_AUTHORITATIVE_FIELDS = set()
 
-# Which page (0-indexed) of a survey's 2-page PDF each written-text
-# question's field actually sits on - used to fetch the right page's Cloud
-# Vision OCR result without re-running it per question.
-_WRITTEN_TEXT_QUESTION_PAGE = {"H1": 0, "H2": 0, "H4": 0, "H5": 0, "H6": 0, "24": 1, "26": 1}
+# Which page (0-indexed) of a survey's 2-page PDF each write-in question
+# sits on - used to fetch the right page's Vision OCR result.
+_WRITTEN_TEXT_QUESTION_PAGE = {}
 
 
 # ==========================================================================
 # Load overrides from the GCS-hosted configuration workbook (generated by
-# generate_pipeline_config_doc.py). Every module-level name assigned above
-# is a fallback default; this section OVERRIDES those names in place with
-# whatever the workbook says, if it can be read at all. Never fatal - a
-# missing/unreachable workbook, a missing sheet, a malformed row, or a
-# missing optional dependency (google-cloud-storage/pandas/openpyxl) all
-# just leave the built-in defaults above in effect, with a printed warning
-# so the fallback is visible rather than silent.
+# generate_pipeline_config_doc.py). This section fills in the survey schema
+# names declared empty above, and overrides the tunable settings.
+#
+# The SETTINGS above (paths, model names, thresholds) are real fallback
+# defaults. The SURVEY SCHEMA is not: there is no built-in question list any
+# more, so a missing/unreachable workbook, a missing sheet or a missing
+# dependency (google-cloud-storage/pandas/openpyxl) is FATAL rather than a
+# warning - running on an empty question list would quietly write a whole
+# batch of empty answers to BigQuery.
 # ==========================================================================
 _YES_VALUES = {"y", "yes", "true", "1"}
 
@@ -316,10 +320,7 @@ def _apply_settings(settings: dict) -> None:
         "BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK", "VERTEX_LOCATION",
         "TPS_EXTRACTION_MODEL", "GEMINI_MODEL", "STEP3_VISION_MODEL", "REPORT_YEAR",
     )
-    float_params = (
-        "MODEL_CONFIDENCE_THRESHOLD", "VISION_FREEFORM_COVERAGE_THRESHOLD",
-        "H2_CHAR_OVERLAP_THRESHOLD", "H4_CHAR_OVERLAP_THRESHOLD", "H6_DIGIT_COVERAGE_THRESHOLD",
-    )
+    float_params = ("MODEL_CONFIDENCE_THRESHOLD", "VISION_FREEFORM_COVERAGE_THRESHOLD")
     bool_params = ("VISION_DOUBLE_CHECK_ENABLED", "PDF_QUALITY_ROUTING_ENABLED", "PIPELINE_CONFIG_ENABLED")
 
     for name, raw in settings.items():
@@ -447,7 +448,10 @@ def _apply_survey_questions(rows: list) -> None:
             written_text_page[number] = int(float(page))
 
     if not survey_questions:
-        return  # empty/template-only sheet - keep the built-in default question list
+        raise ValueError(
+            "the workbook's 'Survey Questions' sheet has no rows with a "
+            "Number - there is no built-in question list to fall back on"
+        )
 
     g["SURVEY_QUESTIONS"] = survey_questions
     g["MULTI_SELECT_QUESTION_NUMBERS"] = multi_select
@@ -484,13 +488,19 @@ def _load_overrides() -> None:
         _apply_survey_questions(rows)
 
         print(f"[pipeline_config] Loaded settings + survey schema from {location}.")
-    except Exception as e:  # noqa: BLE001 - a config-doc problem must never block the pipeline; fall back to built-in defaults
-        print(
-            f"[pipeline_config] WARNING: could not load {location} ({e}) - "
-            "using this module's built-in fallback defaults instead. If this "
-            "is unexpected, check the workbook exists at that path and that "
-            "this environment can reach GCS."
-        )
+    except Exception as e:  # noqa: BLE001 - re-raised below with context
+        # The workbook is the ONLY source of the survey schema - there are no
+        # built-in question defaults to fall back on any more, so a failure
+        # here must be fatal. Silently continuing would run the pipeline with
+        # an empty question list and write a whole batch of empty/garbage
+        # answers to BigQuery.
+        raise RuntimeError(
+            f"could not load the pipeline configuration workbook {location} "
+            f"({e}). The survey questions and answer choices live only in "
+            "that workbook, so the pipeline cannot run without it. Check the "
+            "workbook exists at that path, that this environment can reach "
+            "GCS, and that google-cloud-storage/pandas/openpyxl are installed."
+        ) from e
 
 
 _load_overrides()

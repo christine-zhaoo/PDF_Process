@@ -1,0 +1,132 @@
+{
+  "H1": {
+    "question_text": "CalOMS Provider ID (required)",
+    "choices": "written CalOMS Provider ID",
+    "question_type": "Written Answer - Short Code or Number"
+  },
+  "H2": {
+    "question_text": "Program Reporting Unit (if required by your county)",
+    "choices": "written Program Reporting Unit",
+    "question_type": "Written Answer - Short Code or Number"
+  },
+  "H3": {
+    "question_text": "Treatment Setting (required)",
+    "choices": "OP/IOP | Residential | OTP/NTP | Detox/WM | Partial Hospitalization",
+    "question_type": "Single Choice (pick one)"
+  },
+  "1": {
+    "question_text": "The location was convenient (public transportation, distance, parking, etc.).",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "2": {
+    "question_text": "Services were available when I needed them.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "3": {
+    "question_text": "I chose the treatment goals with my provider's help.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "4": {
+    "question_text": "Staff gave me enough time in my treatment sessions.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "5": {
+    "question_text": "Staff treated me with respect.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "6": {
+    "question_text": "Staff spoke to me in a way I understood.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "7": {
+    "question_text": "Staff were sensitive to my cultural background (race/ethnicity, religion, language, etc.).",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "8": {
+    "question_text": "I felt welcomed here.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "9": {
+    "question_text": "As a direct result of the services I am receiving, I am better able to do things that I want to do.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "10": {
+    "question_text": "As a direct result of the services I am receiving, I feel less craving for drugs and alcohol.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "11": {
+    "question_text": "Staff here work with my physical health care providers to support my wellness.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "12": {
+    "question_text": "Staff here work with my mental health care providers to support my wellness.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "13": {
+    "question_text": "Staff here helped me to connect with other services as needed (social services, housing, etc.).",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "14": {
+    "question_text": "Overall, I am satisfied with the services I received.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "15": {
+    "question_text": "I was able to get all the help/services that I needed.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "16": {
+    "question_text": "I would recommend this agency to a friend or family member.",
+    "choices": "Strongly Agree | Agree | I am Neutral | Disagree | Strongly Disagree | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "17": {
+    "question_text": "Now thinking about the services you received, how much of it was by telehealth? by telephone or video-conferencing",
+    "choices": "None | Very little | About half | Almost all | All",
+    "question_type": "Single Choice (pick one)"
+  },
+  "18": {
+    "question_text": "How helpful were your telehealth visits compared to traditional in-person visits?",
+    "choices": "Much better | Somewhat better | About the same | Somewhat worse | Not Applicable",
+    "question_type": "Single Choice (pick one)"
+  },
+  "19": {
+    "question_text": "Please leave additional comments about your treatment experience. Do NOT write any information that may identify you, for example do NOT write your name or phone number. Do NOT use this space to report an emergency or crisis.",
+    "choices": "written comments",
+    "question_type": "Written Answer - Longer Text"
+  },
+  "20": {
+    "question_text": "What is your sex?",
+    "choices": "Male | Female",
+    "question_type": "Single Choice (pick one)"
+  },
+  "21": {
+    "question_text": "Age Range",
+    "choices": "18-25 | 26-35 | 36-45 | 46-55 | 56-64 | 65+",
+    "question_type": "Single Choice (pick one)"
+  },
+  "22": {
+    "question_text": "Are you of Mexican/Hispanic/Latinx descent?",
+    "choices": "Yes | No | Unknown",
+    "question_type": "Single Choice (pick one)"
+  },
+  "23": {
+    "question_text": "Race/Ethnicity (Please select all that apply)",
+    "choices": "American Indian/Alaska Native | Asian | Black/African-American | Native Hawaiian/Other Pacific Islander | White/Caucasian | Another race | Unknown",
+    "question_type": "Multiple Choice (pick several)"
+  }
+}

@@ -391,12 +391,11 @@ OUTPUT_PREFIX = None  # None -> derived as "<ROOT_PREFIX>_merged/"
 # The Spark BigQuery connector's default write path (used by
 # load_rows_into_bq_via_spark()) stages data through a GCS bucket before loading it into BigQuery - reuses BUCKET_NAME so a separate bucket doesn't need to be created just for this.
 SPARK_BQ_STAGING_BUCKET = BUCKET_NAME
-SURVEY_LINK_BASE_URL = "http://localhost:8080/surveys/"  # survey_link column = this + file_name with ".pdf" stripped
-
+SURVEY_LINK_BASE_URL = "https://ladph.syntasa.ai/surveys/"  # survey_link column = this + file_name with ".pdf" stripped
 
 def _survey_link_for(file_name: str) -> str:
     """Builds the survey_link column's value for one file - SURVEY_LINK_BASE_URL
-    plus file_name with its ".pdf" extension stripped, e.g. "http://localhost:8080/
+    plus file_name with its ".pdf" extension stripped, e.g. "https://ladph.syntasa.ai/
     surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2" for "2025_Nov_10_16_TPS_
     4813_NEEDS_REVIEW_pages_1-2.pdf"."""
     return SURVEY_LINK_BASE_URL + Path(file_name).stem
@@ -434,27 +433,20 @@ FILE_EXTRACTION_WORKERS = pipeline_config.FILE_EXTRACTION_WORKERS
 # model's own self-reported confidence (build_extraction_prompt() rule 15) below this -> needs_review=True. Only gates a question where no pixel-verified reading already took over (see answers_to_qa_rows()) - a confident pixel detector's own margin check already independently vouches for those.
 VISION_DOUBLE_CHECK_ENABLED = pipeline_config.VISION_DOUBLE_CHECK_ENABLED  # set False (or pass --no-vision-check) to skip Cloud Vision calls entirely, e.g. no Vision API enabled/quota - written-text questions then fall back to model-only + confidence-threshold checking alone, same as before this feature existed.
 VISION_FREEFORM_COVERAGE_THRESHOLD = pipeline_config.VISION_FREEFORM_COVERAGE_THRESHOLD
-# cross_check_written_field_with_vision()'s freeform fields (H4/H5/H6/24): word-level matching coverage (see that function's word-level, sum-of-all-matching-runs scoring) below this -> vision_match=False, needs_review=True. Sourced from pipeline_config.py (VISION_FREEFORM_COVERAGE_THRESHOLD) - tune it there/in the shared config workbook rather than editing this constant directly, so the value stays in sync with what a reviewer sees when editing the workbook's Settings tab.
-H2_CHAR_OVERLAP_THRESHOLD = pipeline_config.H2_CHAR_OVERLAP_THRESHOLD
-H4_CHAR_OVERLAP_THRESHOLD = pipeline_config.H4_CHAR_OVERLAP_THRESHOLD
-# cross_check_written_field_with_vision()'s H4 (Field Based Services: Agency)
-# fallback: when word-level matching scores below VISION_FREEFORM_COVERAGE_
-# THRESHOLD, H4 alone (not H5/H6/24) gets a second chance via character-level
-# overlap (spaces/punctuation ignored), scoped to the ANCHORED comparison
-# window only. Explicit user request, confirmed on 2025_Nov_18_2_TPS_6901.pdf
-# and several siblings in the same batch: Cloud Vision's OCR frequently drops
-# or fragments the handwritten "/" in "N/A" (reading "NA", "N/", or "A" alone)
-# because this batch's respondents draw it as a near-vertical stroke rather
-# than a typical diagonal slash - confirmed by direct crop of the actual
-# handwriting. Word-level matching can't fix this: the punctuation sits
-# INSIDE the word ("n/a" vs "na"), not at its edges, so it isn't touched by
-# the edge-punctuation stripping already applied for Q24. A lower 50%
-# threshold (vs. H2's 80%) reflects how short H4's answers typically are
-# (often literally just "N/A"), where a couple of dropped/garbled characters
-# is a much bigger fraction of the total than it would be in a longer answer.
-# cross_check_written_field_with_vision()'s H2 (Program Reporting Unit code): character-level matching coverage (difflib matching-block chars, as a fraction of the model's own answer length) below this -> vision_match=False, needs_review=True. Explicit user request: H1/26 (pure digits) and H4/H5/H6/24 (freeform) already tolerate this kind of near-miss OCR noise (digit-strip / word-coverage respectively); H2 alone required a byte-exact match, which meant Vision's own OCR noise on H2's label/value window (e.g. reading "4450WCE" as "4450 W CEN") forced needs_review=True even though the model's answer was correct. Below 1.0 exact match, falls back to this coverage check rather than failing outright.
-H6_DIGIT_COVERAGE_THRESHOLD = pipeline_config.H6_DIGIT_COVERAGE_THRESHOLD
-# cross_check_written_field_with_vision()'s H6 (Today's Date) last-resort digit-overlap check: when NONE of the exact/range-hint/spurious-separator corrections above resolved found_digits to match the model's target_digits (e.g. a genuinely DROPPED digit, not a wrong or extra one - real case: Vision read "0202025", 7 digits, for handwritten "10/20/2025" - the leading "1" box simply wasn't transcribed at all, leaving the remaining 7 digits an exact contiguous match against the model's last 7), difflib matching-block coverage (as a fraction of the LONGER of found_digits/target_digits) below this -> vision_match=False, needs_review=True; at or above -> vision_match=True (explicit user request: "as long as the digit has 50% coverage or overlapping, then think this as a pass and needs_review = false"). Deliberately looser than H2's 0.8 (H6's failure mode here is Vision dropping/missing whole digits outright, not misreading similar-looking characters, so a lower bar is safe - still requires HALF the digits to genuinely line up, not a coincidental partial match).
+# cross_check_written_field_with_vision()'s ONE general coverage threshold,
+# used across every written-text field's near-miss tolerance check - H1/26
+# (digit-strip coverage), H2 (character-level difflib coverage, anchored or
+# whole-page fallback), H4/H5/24 (word-level matching coverage, plus H4's
+# own character-level fallback), and H6 (digit-overlap coverage). Explicit
+# user request: previously each of H2/H4/H6 had its own separately-tuned
+# threshold (0.8/0.5/0.5) alongside this one (0.7) for H5/24 - consolidated
+# into this single constant so there's one coverage bar to tune instead of
+# four, at the cost of no longer giving H6's historically looser "half the
+# digits is enough" tolerance (Vision dropping/missing whole digits
+# outright, not misreading similar-looking ones) its own lower number.
+# Sourced from pipeline_config.py - tune it there/in the shared config
+# workbook rather than editing this constant directly, so the value stays
+# in sync with what a reviewer sees when editing the workbook's Settings tab.
 VISION_PROJECT_ID = pipeline_config.VISION_PROJECT_ID  # None -> uses application-default GCP project, same convention as VERTEX_PROJECT_ID
 
 # --- extraction output (BigQuery) ---
@@ -1298,21 +1290,26 @@ MULTI_SELECT_QUESTION_NUMBERS = pipeline_config.MULTI_SELECT_QUESTION_NUMBERS
 MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS = pipeline_config.MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS
 
 # --------------------------------------------------------------------------
-# CHOICE_LISTS_BY_NUMBER: for every question whose `choices` field is a fixed
-# " / "-separated list (as opposed to an open write-in like "written date" or
-# "written number"), the ordered list of choice labels — same left-to-right
-# order they're presented to the model in the extraction prompt. Used to
-# cross-check the model's reported mark_position against its reported answer
-# label (see cross_check_answer() below). Splitting on " / " (with spaces)
-# rather than bare "/" is deliberate: several choice labels contain their own
-# internal slash with no surrounding spaces (e.g. "OP/IOP", "First
-# visit/day", "American Indian/Alaskan Native") and must stay intact as one
-# choice.
+# CHOICE_LISTS_BY_NUMBER: for every fixed-choice question (as opposed to an
+# open write-in like "written date" or "written number"), the ordered list of
+# choice labels — same left-to-right order they're presented to the model in
+# the extraction prompt. Used to cross-check the model's reported
+# mark_position against its reported answer label (see cross_check_answer()
+# below), and to map a pixel detector's own winning box index back to a label
+# (choices[position - 1]) - so this list's ORDER and LENGTH are both load-
+# bearing, and a mis-split here silently mislabels real answers.
+#
+# Parsing is delegated to pipeline_config.split_choices()/is_choice_list()
+# rather than split here: several choice labels contain their own internal
+# slash (e.g. "OP/IOP", "Female-to-Male (FTM)/Transgender Male/Trans Man")
+# and must stay intact as ONE choice - see CHOICE_SEPARATOR's comment there
+# for why that's a pipe now, and why every reader must go through that one
+# parser instead of hand-rolling a .split() that can drift from it.
 # --------------------------------------------------------------------------
 CHOICE_LISTS_BY_NUMBER = {
-    number: [c.strip() for c in choices.split(" / ")]
+    number: pipeline_config.split_choices(choices)
     for number, _group_key, _sub_text, choices in SURVEY_QUESTIONS
-    if " / " in choices
+    if pipeline_config.is_choice_list(choices)
 }
 
 
@@ -1341,9 +1338,10 @@ def _choice_matches(choice: str, answer_text: str) -> bool:
 # WRITTEN_TEXT_QUESTION_NUMBERS: every question with NO fixed choice list at
 # all - a genuinely open write-in/handwritten field (an ID number, a code, an
 # address, a date, a comment, an age) rather than a checkbox/circle choice.
-# Derived directly from SURVEY_QUESTIONS (any entry whose `choices` field has
-# no " / " in it) rather than hand-maintained separately, so it can never
-# drift out of sync with the question list itself.
+# Derived directly from SURVEY_QUESTIONS (any entry whose `choices` field
+# isn't a choice list at all - see pipeline_config.is_choice_list()) rather
+# than hand-maintained separately, so it can never drift out of sync with the
+# question list itself.
 #
 # This matters because NONE of these seven questions can be checked by
 # cross_check_answer() (there's no choices list to compare a mark_position
@@ -1356,7 +1354,7 @@ def _choice_matches(choice: str, answer_text: str) -> bool:
 # --------------------------------------------------------------------------
 WRITTEN_TEXT_QUESTION_NUMBERS = {
     number for number, _group_key, _sub_text, choices in SURVEY_QUESTIONS
-    if " / " not in choices
+    if not pipeline_config.is_choice_list(choices)
 }
 # {"H1", "H2", "H4", "H5", "H6", "24", "26"}
 
@@ -1885,6 +1883,15 @@ class QARow:
     # its answer (see rule 11 in build_extraction_prompt()) - kept purely for auditability/debugging;
     # "" for pixel-only entries, older callers, or if the model didn't return one. Never used to
     # decide needs_review or override anything - only pixel readings and cross_check_answer() do that.
+    answer_english_translation: str = ""  # explicit user request: for an open handwritten-text
+    # question (agency/address/comment - never a fixed choice, ID, code, or date) whose written
+    # answer is in a language OTHER than English, the model's own English translation of survey_
+    # answer (see rule 17 in build_extraction_prompt()). "" whenever the answer is already English,
+    # blank, or this isn't a written-text question - i.e. for nearly every row. survey_answer itself
+    # is ALWAYS the untouched, verbatim original-language transcription, regardless of this field -
+    # this is purely an additive convenience column, never used by any cross-check/needs_review
+    # logic (Cloud Vision's OCR of the page is in the original language, so every existing
+    # cross_check_written_field_with_vision() comparison still runs against survey_answer unchanged).
     model_confidence: Optional[float] = None  # the model's own self-reported confidence (0.0-1.0)
     # for THIS specific answer (see rule 15 in build_extraction_prompt()); None if the model didn't
     # return a parseable one (e.g. an older/mocked response predating this field). Recorded for every
@@ -1936,7 +1943,7 @@ class QARow:
     # else looked up from pdf_manifest_list's source_page_range for this file - see
     # _build_needs_review_row().
     survey_link: str = ""  # SURVEY_LINK_BASE_URL + file_name with its ".pdf" extension stripped
-    # (e.g. "http://localhost:8080/surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2") -
+    # (e.g. "https://ladph.syntasa.ai/surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2") -
     # a direct link to this survey in the review UI. Populated on every row.
     # NOTE: correct_answer/updated_with_feedback/feedback_updated_time are NOT columns here -
     # they only exist in BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK (see BQ_SURVEY_RESPONSES_
@@ -2052,7 +2059,15 @@ def build_extraction_prompt() -> str:
         "8. When the marked choice for a checkbox question is an \"(specify)\" "
         "option (e.g. \"Other (specify)\"), look for handwritten or typed text "
         "next to or below that choice and APPEND it to the answer in the format "
-        "\"Other (specify): <text>\" (e.g. \"Other (specify): Mexican\"). If that "
+        "\"Other (specify): <text>\". CRITICAL: handwritten text on a "
+        "\"(specify)\" line is NOT by itself evidence that the choice is "
+        "marked. Respondents very often write on that line WITHOUT ever "
+        "marking its box. Decide whether the \"(specify)\" box is marked using "
+        "rule 1 and the box alone, exactly as you would for any other choice, "
+        "and IGNORE the presence of nearby handwriting when making that "
+        "decision. Only if the box itself passes rule 1 do you report the "
+        "choice at all and append its text. If the box is not marked, do not "
+        "report that choice even though something is written beside it. If that "
         "choice is marked but nothing is actually written next to it, report "
         "just the choice text on its own (e.g. \"Other (specify)\") - do not "
         "invent text. This applies even on multi-select questions: only the "
@@ -2164,8 +2179,8 @@ def build_extraction_prompt() -> str:
         "and write that choice's real printed text instead.",
         "14. Return ONLY a JSON array, one object per question, with exactly "
         'these keys in this order: "question_number", "reasoning", '
-        '"mark_position", "answer", "confidence". No extra commentary outside '
-        "the JSON array.",
+        '"mark_position", "answer", "english_translation", "confidence". No '
+        "extra commentary outside the JSON array.",
         "15. \"confidence\": a number from 0.0 to 1.0 for how CERTAIN you are "
         "that YOUR OWN answer to THIS question is correct, based purely on how "
         "clear and unambiguous the ink/handwriting evidence was - not on how "
@@ -2201,6 +2216,21 @@ def build_extraction_prompt() -> str:
         "what you can actually read and lower \"confidence\" (rule 15) "
         "accordingly - never invent an extra digit or a date component just to "
         "force the format to match.",
+        "17. \"english_translation\": for an open HANDWRITTEN-text question "
+        "(an agency name, an address, or a comment - never a fixed checkbox/"
+        "circle choice, an ID number, a code, or a date), if what the "
+        "respondent actually wrote is in a language OTHER than English, give "
+        "a natural English translation of it here. Leave this \"\" (empty "
+        "string) for every other question, AND for a written-text question "
+        "whose answer is already in English, AND whenever \"answer\" itself "
+        "is blank (nothing was written) - never translate a blank into "
+        "something like \"(blank)\" or invent text that wasn't written. "
+        "Critically, \"answer\" itself must ALWAYS stay the exact, verbatim "
+        "original-language transcription (per rule 1) no matter what language "
+        "it's in - NEVER put a translation into \"answer\", and never skip "
+        "transcribing the original just because you're also translating it "
+        "here; \"english_translation\" is an ADDITIONAL field, not a "
+        "replacement.",
         "",
         "Questions:",
     ]
@@ -6552,7 +6582,7 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                 matcher = difflib.SequenceMatcher(None, compact_target, compact_value)
                 matched_chars = sum(block.size for block in matcher.get_matching_blocks())
                 coverage = (matched_chars / len(compact_target)) if compact_target else 0.0
-                if coverage >= H2_CHAR_OVERLAP_THRESHOLD:
+                if coverage >= VISION_FREEFORM_COVERAGE_THRESHOLD:
                     return True, "", coverage, anchored_value
                 return False, (
                     f"model read {model_answer!r} for {question_number}, but the text Cloud "
@@ -6595,7 +6625,7 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                     matcher = difflib.SequenceMatcher(None, target, compact_tok)
                     matched_chars = sum(block.size for block in matcher.get_matching_blocks())
                     best_coverage = max(best_coverage, matched_chars / len(target))
-                if best_coverage >= H2_CHAR_OVERLAP_THRESHOLD:
+                if best_coverage >= VISION_FREEFORM_COVERAGE_THRESHOLD:
                     return True, "", best_coverage, token_snippet
             return False, (
                 f"model read {model_answer!r} for {question_number}, but no individual "
@@ -6791,12 +6821,12 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
             # (right digit count, one digit wrong) and the extra-digit
             # case _remove_spurious_separator_ones() targets (too MANY
             # digits). Character-level (not word-level) difflib matching,
-            # same style as H2_CHAR_OVERLAP_THRESHOLD's check, since digit
+            # same style as VISION_FREEFORM_COVERAGE_THRESHOLD's check, since digit
             # ORDER matters for a date the way it doesn't for free text.
             digit_matcher = difflib.SequenceMatcher(None, target_digits, found_digits, autojunk=False)
             matched_digits = sum(block.size for block in digit_matcher.get_matching_blocks())
             digit_coverage = matched_digits / max(len(target_digits), len(found_digits))
-            if digit_coverage >= H6_DIGIT_COVERAGE_THRESHOLD:
+            if digit_coverage >= VISION_FREEFORM_COVERAGE_THRESHOLD:
                 return True, "", round(digit_coverage, 4), (
                     f"{text_snippet} ({digit_coverage:.0%} digit overlap with model's answer)"
                 )
@@ -6932,7 +6962,7 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         if coverage >= VISION_FREEFORM_COVERAGE_THRESHOLD:
             return True, "", round(coverage, 4), text_snippet
 
-        # H4 character-overlap fallback - see H4_CHAR_OVERLAP_THRESHOLD's
+        # H4 character-overlap fallback - see VISION_FREEFORM_COVERAGE_THRESHOLD's
         # comment. Scoped to the anchored path only (never the whole-page
         # fallback, where a short answer's characters could trivially
         # "match" somewhere in unrelated printed page text).
@@ -6942,7 +6972,7 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
             if compact_answer:
                 char_matcher = difflib.SequenceMatcher(None, compact_full, compact_answer)
                 char_coverage = sum(b.size for b in char_matcher.get_matching_blocks()) / len(compact_answer)
-                if char_coverage >= H4_CHAR_OVERLAP_THRESHOLD:
+                if char_coverage >= VISION_FREEFORM_COVERAGE_THRESHOLD:
                     return True, "", round(char_coverage, 4), text_snippet
 
         return False, (
@@ -7277,6 +7307,7 @@ def extract_qa_from_pdf(
                 "answer": str(item.get("answer", "") or "").strip(),
                 "mark_position": str(item.get("mark_position", "") or "").strip(),
                 "reasoning": str(item.get("reasoning", "") or "").strip(),
+                "english_translation": str(item.get("english_translation", "") or "").strip(),
                 "confidence": _parse_confidence(item.get("confidence")),
             }
 
@@ -7679,6 +7710,7 @@ def answers_to_qa_rows(
             model_answer = entry.get("answer", "") or ""
             model_position = entry.get("mark_position", "") or ""
             model_reasoning = entry.get("reasoning", "") or ""
+            model_answer_translation = entry.get("english_translation", "") or ""
             model_confidence = entry.get("confidence")
             pixel_position = entry.get("pixel_position")
             pixel_margin = entry.get("pixel_margin")
@@ -7708,6 +7740,7 @@ def answers_to_qa_rows(
             model_answer = str(entry)
             model_position = ""
             model_reasoning = ""
+            model_answer_translation = ""
             model_confidence = None
             pixel_position = None
             pixel_margin = None
@@ -8412,6 +8445,26 @@ def answers_to_qa_rows(
                 )
                 review_reasons.append(f"answer is blank - confirm genuine skip. ({readings})")
 
+        # Explicit user request: when the model transcribed a written answer
+        # in a language other than English and supplied its own translation
+        # (rule 17 in build_extraction_prompt()), the ENGLISH text becomes
+        # survey_answer so every consumer - the review UI, the feedback
+        # workbook, any downstream aggregate - reads one language. The
+        # verbatim original is not discarded: it moves into review_note, and
+        # the row is flagged needs_review so a human confirms the translation
+        # against the scan rather than trusting it silently. answer_english_
+        # translation still carries the translation too, so the pair stays
+        # queryable without parsing review_note.
+        if model_answer_translation.strip() and answer.strip():
+            original_answer = answer
+            answer = model_answer_translation.strip()
+            needs_review = True
+            review_reasons.append(
+                "answer was written in a language other than English - survey_answer "
+                f"holds the model's English translation; the verbatim original reads: "
+                f"{original_answer!r}. Confirm the translation against the scan."
+            )
+
         review_note = "; ".join(review_reasons)
 
         rows.append(
@@ -8429,6 +8482,7 @@ def answers_to_qa_rows(
                 review_note=review_note,
                 detection_method=detection_method,
                 model_reasoning=model_reasoning,
+                answer_english_translation=model_answer_translation,
                 model_confidence=model_confidence,
                 vision_cross_check=vision_cross_check,
                 # Recorded unconditionally (even "" / None rows) so every row
@@ -8461,6 +8515,7 @@ BQ_SURVEY_RESPONSES_SCHEMA = [
     ("review_note", "STRING", "Why needs_review is TRUE; empty otherwise. May combine more than one reason, semicolon-separated."),
     ("detection_method", "STRING", "'pixel_grid' (deterministic ink-density read of the Q1-18 checkbox grid), 'pixel_yesno_box' (same idea for the isolated Q21/22/27/32 Yes/No(/Unknown) rows and the Q25/Q29/Q35 single-choice lists), 'pixel_h3_circle' (H3's round radio buttons), or 'model' (vision-model reading, self-checked against its own mark_position). Pixel readings are trusted over the model."),
     ("model_reasoning", "STRING", "The model's own one-sentence account of the visual evidence for its answer (see rule 11 in build_extraction_prompt()). For auditability/debugging only - empty for pixel-only entries, and never used to decide needs_review or to override anything."),
+    ("answer_english_translation", "STRING", "For an open handwritten-text question (agency/address/comment - never a fixed choice, ID, code, or date) whose written answer is in a language OTHER than English, the model's own English translation of survey_answer (see rule 17 in build_extraction_prompt()). Empty whenever the answer is already English, blank, or this isn't a written-text question - i.e. for nearly every row. When this IS populated, survey_answer holds this same ENGLISH text (explicit user request) and the verbatim original-language transcription is preserved in review_note, with needs_review=TRUE so a human confirms the translation against the scan."),
     ("model_confidence", "FLOAT", "The model's own self-reported confidence (0.0-1.0) for this specific answer (see rule 15 in build_extraction_prompt()). NULL if not reported (e.g. a pre-upgrade row, or the model omitted/malformed it). Below MODEL_CONFIDENCE_THRESHOLD (default 0.8) sets needs_review=TRUE, unless a pixel detector already confidently resolved this question."),
     ("vision_cross_check", "STRING", "For the seven handwritten/write-in questions with no fixed choice list (H1, H2, H4, H5, H6, 24, 26): 'agree' or 'disagree' from an independent Cloud Vision OCR cross-check of the same page (see cross_check_written_field_with_vision()). Empty for every other question, or when Vision was unavailable/found nothing to compare against."),
     ("confidence_threshold", "FLOAT", "The value of MODEL_CONFIDENCE_THRESHOLD actually in effect when this row was extracted - recorded on every row (regardless of detection_method) as an audit trail, so a query can directly compare model_confidence against confidence_threshold per row, including historical rows extracted under a different threshold value if it's retuned later."),
@@ -8469,7 +8524,7 @@ BQ_SURVEY_RESPONSES_SCHEMA = [
     ("pdf_quality_route", "STRING", "This file's 'recommended_route' ('pixel'/'vision'/'fallback') from classify_pdf_quality.py's upstream pdf_quality table at extraction time, or NULL if no quality row was found / routing was disabled for this run. 'vision'/'fallback' force needs_review=TRUE on every question for this file regardless of that question's own signals - see review_note for the specific note when that happened."),
     ("destination_gcs_uri", "STRING", "This file's own gs:// URI - the same value step1_merge_pdf.py recorded as destination_gcs_uri in pdf_manifest_list for this file, so a row here can be joined back to its manifest row without a separate lookup."),
     ("source_page_range", "STRING", "e.g. '5-6' - which pages inside this survey's ORIGINAL combined source PDF this file's survey unit occupies. Parsed from the file name's trailing '_pages_{range}.pdf', or looked up from pdf_manifest_list's source_page_range when the file name doesn't carry it. Empty if unknown."),
-    ("survey_link", "STRING", "SURVEY_LINK_BASE_URL + file_name with its '.pdf' extension stripped - a direct link to this survey in the review UI, e.g. 'http://localhost:8080/surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2'. Populated on every row."),
+    ("survey_link", "STRING", "SURVEY_LINK_BASE_URL + file_name with its '.pdf' extension stripped - a direct link to this survey in the review UI, e.g. 'https://ladph.syntasa.ai/surveys/2025_Nov_10_16_TPS_4813_NEEDS_REVIEW_pages_1-2'. Populated on every row."),
 ]
 # BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK's schema: every BQ_SURVEY_RESPONSES_SCHEMA column,
 # plus the three feedback-loop columns that only exist on THIS table (survey_responses
