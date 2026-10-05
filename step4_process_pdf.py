@@ -1883,7 +1883,7 @@ class QARow:
     # its answer (see rule 11 in build_extraction_prompt()) - kept purely for auditability/debugging;
     # "" for pixel-only entries, older callers, or if the model didn't return one. Never used to
     # decide needs_review or override anything - only pixel readings and cross_check_answer() do that.
-    answer_english_translation: str = ""  # explicit user request: for an open handwritten-text
+    answer_language: str = ""  # explicit user request: for an open handwritten-text
     # question (agency/address/comment - never a fixed choice, ID, code, or date) whose written
     # answer is in a language OTHER than English, the model's own English translation of survey_
     # answer (see rule 17 in build_extraction_prompt()). "" whenever the answer is already English,
@@ -2179,7 +2179,7 @@ def build_extraction_prompt() -> str:
         "and write that choice's real printed text instead.",
         "14. Return ONLY a JSON array, one object per question, with exactly "
         'these keys in this order: "question_number", "reasoning", '
-        '"mark_position", "answer", "english_translation", "confidence". No '
+        '"mark_position", "answer", "answer_language", "confidence". No '
         "extra commentary outside the JSON array.",
         "15. \"confidence\": a number from 0.0 to 1.0 for how CERTAIN you are "
         "that YOUR OWN answer to THIS question is correct, based purely on how "
@@ -2216,21 +2216,18 @@ def build_extraction_prompt() -> str:
         "what you can actually read and lower \"confidence\" (rule 15) "
         "accordingly - never invent an extra digit or a date component just to "
         "force the format to match.",
-        "17. \"english_translation\": for an open HANDWRITTEN-text question "
+        "17. \"answer_language\": for an open HANDWRITTEN-text question "
         "(an agency name, an address, or a comment - never a fixed checkbox/"
         "circle choice, an ID number, a code, or a date), if what the "
-        "respondent actually wrote is in a language OTHER than English, give "
-        "a natural English translation of it here. Leave this \"\" (empty "
-        "string) for every other question, AND for a written-text question "
-        "whose answer is already in English, AND whenever \"answer\" itself "
-        "is blank (nothing was written) - never translate a blank into "
-        "something like \"(blank)\" or invent text that wasn't written. "
-        "Critically, \"answer\" itself must ALWAYS stay the exact, verbatim "
-        "original-language transcription (per rule 1) no matter what language "
-        "it's in - NEVER put a translation into \"answer\", and never skip "
-        "transcribing the original just because you're also translating it "
-        "here; \"english_translation\" is an ADDITIONAL field, not a "
-        "replacement.",
+        "respondent actually wrote is in a language OTHER than English, name "
+        "that language here in English, as a single word (e.g. \"Spanish\", "
+        "\"Korean\", \"Armenian\"). Leave this \"\" (empty string) for every "
+        "other question, AND for a written-text question whose answer is "
+        "already in English, AND whenever \"answer\" itself is blank (nothing "
+        "was written). Do NOT translate anything: \"answer\" must ALWAYS stay "
+        "the exact, verbatim original-language transcription (per rule 1), "
+        "and there is no translation field - this field names the language "
+        "only, so a human reviewer knows what they are looking at.",
         "",
         "Questions:",
     ]
@@ -7307,7 +7304,7 @@ def extract_qa_from_pdf(
                 "answer": str(item.get("answer", "") or "").strip(),
                 "mark_position": str(item.get("mark_position", "") or "").strip(),
                 "reasoning": str(item.get("reasoning", "") or "").strip(),
-                "english_translation": str(item.get("english_translation", "") or "").strip(),
+                "answer_language": str(item.get("answer_language", "") or "").strip(),
                 "confidence": _parse_confidence(item.get("confidence")),
             }
 
@@ -7710,7 +7707,7 @@ def answers_to_qa_rows(
             model_answer = entry.get("answer", "") or ""
             model_position = entry.get("mark_position", "") or ""
             model_reasoning = entry.get("reasoning", "") or ""
-            model_answer_translation = entry.get("english_translation", "") or ""
+            model_answer_language = entry.get("answer_language", "") or ""
             model_confidence = entry.get("confidence")
             pixel_position = entry.get("pixel_position")
             pixel_margin = entry.get("pixel_margin")
@@ -7740,7 +7737,7 @@ def answers_to_qa_rows(
             model_answer = str(entry)
             model_position = ""
             model_reasoning = ""
-            model_answer_translation = ""
+            model_answer_language = ""
             model_confidence = None
             pixel_position = None
             pixel_margin = None
@@ -8445,25 +8442,19 @@ def answers_to_qa_rows(
                 )
                 review_reasons.append(f"answer is blank - confirm genuine skip. ({readings})")
 
-        # Explicit user request: when the model transcribed a written answer
-        # in a language other than English and supplied its own translation
-        # (rule 17 in build_extraction_prompt()), the ENGLISH text becomes
-        # survey_answer so every consumer - the review UI, the feedback
-        # workbook, any downstream aggregate - reads one language. The
-        # verbatim original is not discarded: it moves into review_note, and
-        # the row is flagged needs_review so a human confirms the translation
-        # against the scan rather than trusting it silently. answer_english_
-        # translation still carries the translation too, so the pair stays
-        # queryable without parsing review_note.
-        if model_answer_translation.strip() and answer.strip():
-            original_answer = answer
-            answer = model_answer_translation.strip()
-            needs_review = True
+        # Explicit user request: a written answer in a language other than
+        # English is stored AS WRITTEN - survey_answer keeps the verbatim
+        # original-language transcription, exactly like any other written
+        # answer. Nothing is translated (there is no translation step: see
+        # rule 17, which only NAMES the language). The row is flagged
+        # needs_review so a human reads the original against the scan and
+        # decides what to do with it.
+        if model_answer_language.strip() and answer.strip():
             review_reasons.append(
-                "answer was written in a language other than English - survey_answer "
-                f"holds the model's English translation; the verbatim original reads: "
-                f"{original_answer!r}. Confirm the translation against the scan."
+                f"answer is handwritten in {model_answer_language.strip()}, not English - "
+                "survey_answer holds the original text exactly as written. Needs review."
             )
+            needs_review = True
 
         review_note = "; ".join(review_reasons)
 
@@ -8482,7 +8473,7 @@ def answers_to_qa_rows(
                 review_note=review_note,
                 detection_method=detection_method,
                 model_reasoning=model_reasoning,
-                answer_english_translation=model_answer_translation,
+                answer_language=model_answer_language,
                 model_confidence=model_confidence,
                 vision_cross_check=vision_cross_check,
                 # Recorded unconditionally (even "" / None rows) so every row
@@ -8515,7 +8506,7 @@ BQ_SURVEY_RESPONSES_SCHEMA = [
     ("review_note", "STRING", "Why needs_review is TRUE; empty otherwise. May combine more than one reason, semicolon-separated."),
     ("detection_method", "STRING", "'pixel_grid' (deterministic ink-density read of the Q1-18 checkbox grid), 'pixel_yesno_box' (same idea for the isolated Q21/22/27/32 Yes/No(/Unknown) rows and the Q25/Q29/Q35 single-choice lists), 'pixel_h3_circle' (H3's round radio buttons), or 'model' (vision-model reading, self-checked against its own mark_position). Pixel readings are trusted over the model."),
     ("model_reasoning", "STRING", "The model's own one-sentence account of the visual evidence for its answer (see rule 11 in build_extraction_prompt()). For auditability/debugging only - empty for pixel-only entries, and never used to decide needs_review or to override anything."),
-    ("answer_english_translation", "STRING", "For an open handwritten-text question (agency/address/comment - never a fixed choice, ID, code, or date) whose written answer is in a language OTHER than English, the model's own English translation of survey_answer (see rule 17 in build_extraction_prompt()). Empty whenever the answer is already English, blank, or this isn't a written-text question - i.e. for nearly every row. When this IS populated, survey_answer holds this same ENGLISH text (explicit user request) and the verbatim original-language transcription is preserved in review_note, with needs_review=TRUE so a human confirms the translation against the scan."),
+    ("answer_language", "STRING", "For an open handwritten-text question (agency/address/comment - never a fixed choice, ID, code, or date) whose written answer is in a language OTHER than English, the name of that language as the model identified it, e.g. 'Spanish' (see rule 17 in build_extraction_prompt()). Empty whenever the answer is already English, blank, or this isn't a written-text question - i.e. for nearly every row. Nothing is translated: survey_answer ALWAYS holds the verbatim original-language transcription exactly as written. When this is populated the row is flagged needs_review=TRUE so a human reads the original against the scan."),
     ("model_confidence", "FLOAT", "The model's own self-reported confidence (0.0-1.0) for this specific answer (see rule 15 in build_extraction_prompt()). NULL if not reported (e.g. a pre-upgrade row, or the model omitted/malformed it). Below MODEL_CONFIDENCE_THRESHOLD (default 0.8) sets needs_review=TRUE, unless a pixel detector already confidently resolved this question."),
     ("vision_cross_check", "STRING", "For the seven handwritten/write-in questions with no fixed choice list (H1, H2, H4, H5, H6, 24, 26): 'agree' or 'disagree' from an independent Cloud Vision OCR cross-check of the same page (see cross_check_written_field_with_vision()). Empty for every other question, or when Vision was unavailable/found nothing to compare against."),
     ("confidence_threshold", "FLOAT", "The value of MODEL_CONFIDENCE_THRESHOLD actually in effect when this row was extracted - recorded on every row (regardless of detection_method) as an audit trail, so a query can directly compare model_confidence against confidence_threshold per row, including historical rows extracted under a different threshold value if it's retuned later."),
