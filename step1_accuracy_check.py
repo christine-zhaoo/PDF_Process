@@ -244,23 +244,35 @@ def process_source(bucket, bq_rows_for_source: list, source_gcs_uri: str) -> lis
                     [f"no manifest row at all for page range {page_range} of this source PDF"],
                 ))
         else:
-            issues.append((
-                {
-                    "source_file": bq_rows_for_source[0].get("source_file") if bq_rows_for_source else None,
-                    "source_gcs_uri": source_gcs_uri,
-                    "destination_folder": None,
-                    "destination_gcs_uri": None,
-                    "source_page_range": None,
-                    "output_category": None,
-                    "rejected": None,
-                    "rejected_reason": None,
-                    "needs_review": None,
-                    "needs_review_reason": None,
-                    "moved_at": None,
-                },
-                [f"source PDF has {page_count} page(s), not a multiple of {pages_per_survey} - "
-                 "cannot verify completeness by page range"],
-            ))
+            # Already correctly handled by step1 itself (see split_combined_pdf()'s
+            # whole-source-failure branch) when there's exactly one manifest row for
+            # this source, rejected, with a reason naming the actual malformed page
+            # count - not a real discrepancy, so don't flag it.
+            already_correctly_rejected = (
+                len(bq_rows_for_source) == 1
+                and bq_rows_for_source[0].get("rejected")
+                and bq_rows_for_source[0].get("rejected_reason")
+                and f"{page_count} page(s)" in bq_rows_for_source[0]["rejected_reason"]
+                and "not a multiple of" in bq_rows_for_source[0]["rejected_reason"]
+            )
+            if not already_correctly_rejected:
+                issues.append((
+                    {
+                        "source_file": bq_rows_for_source[0].get("source_file") if bq_rows_for_source else None,
+                        "source_gcs_uri": source_gcs_uri,
+                        "destination_folder": None,
+                        "destination_gcs_uri": None,
+                        "source_page_range": None,
+                        "output_category": None,
+                        "rejected": None,
+                        "rejected_reason": None,
+                        "needs_review": None,
+                        "needs_review_reason": None,
+                        "moved_at": None,
+                    },
+                    [f"source PDF has {page_count} page(s), not a multiple of {pages_per_survey} - "
+                     "cannot verify completeness by page range"],
+                ))
     finally:
         source_doc.close()
     return issues
@@ -297,45 +309,55 @@ def main():
     def worker(source_uri):
         return process_source(bucket, by_source[source_uri], source_uri)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
-        future_to_source = {executor.submit(worker, uri): uri for uri in source_uris}
-        for future in concurrent.futures.as_completed(future_to_source):
-            source_uri = future_to_source[future]
-            try:
-                issues = future.result()
-            except Exception as error:  # noqa: BLE001
-                issues = [({
-                    "source_file": None, "source_gcs_uri": source_uri,
-                    "destination_folder": None, "destination_gcs_uri": None,
-                    "source_page_range": None, "output_category": None,
-                    "rejected": None, "rejected_reason": None,
-                    "needs_review": None, "needs_review_reason": None, "moved_at": None,
-                }, [f"check failed with an exception: {error}"])]
-            with lock:
-                all_issues.extend(issues)
-                completed += 1
-                if completed % 25 == 0 or completed == total:
-                    log("Progress: %d/%d source PDFs checked, %d issue(s) found so far.",
-                        completed, total, len(all_issues))
+    csv_file = open(args.out, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        "source_file", "source_gcs_uri", "destination_folder", "destination_gcs_uri",
+        "source_page_range", "output_category", "rejected", "rejected_reason",
+        "needs_review", "needs_review_reason", "moved_at", "issues",
+    ])
+    csv_file.flush()
 
-    log("Done. %d issue(s) found across %d source PDFs. Writing %s...",
-        len(all_issues), total, args.out)
-
-    with open(args.out, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "source_file", "source_gcs_uri", "destination_folder", "destination_gcs_uri",
-            "source_page_range", "output_category", "rejected", "rejected_reason",
-            "needs_review", "needs_review_reason", "moved_at", "issues",
+    def write_issue_row(row, problems):
+        csv_writer.writerow([
+            row.get("source_file"), row.get("source_gcs_uri"), row.get("destination_folder"),
+            row.get("destination_gcs_uri"), row.get("source_page_range"), row.get("output_category"),
+            row.get("rejected"), row.get("rejected_reason"), row.get("needs_review"),
+            row.get("needs_review_reason"), row.get("moved_at"), " | ".join(problems),
         ])
-        for row, problems in all_issues:
-            writer.writerow([
-                row.get("source_file"), row.get("source_gcs_uri"), row.get("destination_folder"),
-                row.get("destination_gcs_uri"), row.get("source_page_range"), row.get("output_category"),
-                row.get("rejected"), row.get("rejected_reason"), row.get("needs_review"),
-                row.get("needs_review_reason"), row.get("moved_at"), " | ".join(problems),
-            ])
-    log("Wrote %s.", args.out)
+        csv_file.flush()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            future_to_source = {executor.submit(worker, uri): uri for uri in source_uris}
+            for future in concurrent.futures.as_completed(future_to_source):
+                source_uri = future_to_source[future]
+                try:
+                    issues = future.result()
+                except Exception as error:  # noqa: BLE001
+                    issues = [({
+                        "source_file": None, "source_gcs_uri": source_uri,
+                        "destination_folder": None, "destination_gcs_uri": None,
+                        "source_page_range": None, "output_category": None,
+                        "rejected": None, "rejected_reason": None,
+                        "needs_review": None, "needs_review_reason": None, "moved_at": None,
+                    }, [f"check failed with an exception: {error}"])]
+                with lock:
+                    all_issues.extend(issues)
+                    completed += 1
+                    for row, problems in issues:
+                        log("ISSUE [%s] (%s): %s",
+                            row.get("source_file") or row.get("source_gcs_uri"),
+                            row.get("source_page_range"), " | ".join(problems))
+                        write_issue_row(row, problems)
+                    if completed % 10 == 0 or completed == total:
+                        log("Progress: %d/%d source PDFs checked, %d issue(s) found so far.",
+                            completed, total, len(all_issues))
+    finally:
+        csv_file.close()
+
+    log("Done. %d issue(s) found across %d source PDFs. Wrote %s.",
+        len(all_issues), total, args.out)
 
 
 if __name__ == "__main__":

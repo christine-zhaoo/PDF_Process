@@ -1,0 +1,5 @@
+source_file,source_gcs_uri,destination_folder,destination_gcs_uri,source_page_range,output_category,rejected,rejected_reason,needs_review,needs_review_reason,moved_at,issues
+tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_1.pdf,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_1.pdf,,,,,,,,,,"source PDF has 1 page(s), not a multiple of 2 - cannot verify completeness by page range"
+tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_2.pdf,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_2.pdf,,,,,,,,,,"source PDF has 1 page(s), not a multiple of 2 - cannot verify completeness by page range"
+tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_3.pdf,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_3.pdf,,,,,,,,,,"source PDF has 1 page(s), not a multiple of 2 - cannot verify completeness by page range"
+tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_4.pdf,gs://tps_survey/TPS_Scanned_2025/Nov 23 2025/Nov23_4.pdf,,,,,,,,,,"source PDF has 1 page(s), not a multiple of 2 - cannot verify completeness by page range"

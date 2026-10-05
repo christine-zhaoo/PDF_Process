@@ -331,6 +331,26 @@ def parse_date_folder_name(folder_name: str) -> Optional[datetime.date]:
         return None
 
 
+def build_output_file_name(year, source_stem: str, start_page_index: int) -> str:
+    """The ONE place a split survey's output file name is built.
+
+    Shape (explicit user request): "{year}_{source_stem}_p{first page}.pdf",
+    e.g. source Nov10_1.pdf in the 2025 folder, first survey ->
+    "2025_Nov10_1_p1.pdf"; the survey starting at page 3 -> "2025_Nov10_1_p3.pdf".
+    The page number is the 1-based FIRST page of the survey unit, not a range -
+    a 2-page survey starting at page 3 is "_p3", not "_p3-4".
+
+    Centralised deliberately: this name is built in three places (the splitter,
+    the already-split completeness check, and the manifest reconciliation), and
+    when those three drifted apart before, the completeness check stopped
+    recognising files the splitter had just written and silently re-uploaded
+    them under a second name. Every caller must use this function.
+
+    start_page_index is 0-based (as the page loops use); the name is 1-based.
+    """
+    return f"{year}_{source_stem}_p{start_page_index + 1}.pdf"
+
+
 def parse_file_name_date(file_name: str) -> Optional[tuple]:
     """Parses a loose source file's own name for its destination
     month/day - e.g. "Dec14_1_TPS_4223.pdf" -> (12, 14). Returns None for a
@@ -884,9 +904,12 @@ def split_combined_pdf(
                 raise ValueError("max_surveys must be at least 1")
             survey_starts = list(survey_starts)[:max_surveys]
 
+        folder_date = parse_date_folder_name(date_folder)
+        output_year = folder_date.year if folder_date else datetime.datetime.utcnow().year
+
         for start in survey_starts:
             page_range = f"{start + 1}-{start + pages_per_survey}"
-            output_name = f"{source_stem}_Page_{page_range}.pdf"
+            output_name = build_output_file_name(output_year, source_stem, start)
 
             # Language is gated first, but - explicit user request - is NO LONGER a
             # rejection reason: a non-English survey is still accepted/uploaded like
@@ -1037,7 +1060,7 @@ def combined_source_is_complete(
 
     for start in range(0, page_count, PAGES_PER_SURVEY):
         page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-        file_name = f"{source_stem}_Page_{page_range}.pdf"
+        file_name = build_output_file_name(year, source_stem, start)
         if not any(bucket.blob(f"{root}{file_name}").exists() for root in category_roots):
             return False
     return True
@@ -1134,7 +1157,7 @@ def reconcile_manifest_rows_for_complete_source(
     try:
         for start in range(0, page_count, PAGES_PER_SURVEY):
             page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-            file_name = f"{source_stem}_Page_{page_range}.pdf"
+            file_name = build_output_file_name(year, source_stem, start)
             for category, root in category_roots.items():
                 if bucket.blob(f"{root}{file_name}").exists():
                     destination_uri = f"gs://{bucket.name}/{root}{file_name}"
