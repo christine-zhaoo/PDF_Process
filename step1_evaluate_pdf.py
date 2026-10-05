@@ -87,11 +87,11 @@ Revision notes (this pass)
   duplicate-TPS collision handling (verify_same_tps_number()) are all
   removed - a survey unit's identity is now purely its source file name +
   page range (see split_combined_pdf()), which needs no OCR and can never
-  collide. assess_page_content_and_declined() now distinguishes a written
-  "Declined" WORD (accepted, uploaded to a new "Declined" subfolder, flagged
-  needs_review) from a bare cancellation SCRIBBLE with no word (REJECTED,
-  uploaded to a new "Rejected" subfolder instead of being discarded as
-  before). A non-English survey (validate_survey_language()) is no longer a
+  collide. assess_page_content_and_declined() distinguishes a written
+  "Declined" WORD from a bare cancellation SCRIBBLE with no word, but
+  (explicit user request) BOTH are now accepted into the "Declined"
+  subfolder and flagged needs_review - a scribble is a human voiding their
+  response, so it is reviewed rather than discarded. A non-English survey (validate_survey_language()) is no longer a
   rejection either - it's accepted into its normal destination, just flagged
   needs_review. See ManifestRow's new output_category field.
 """
@@ -597,18 +597,19 @@ def assess_page_content_and_declined(
       "Decline"/"Refused" word is written, "SCRIBBLE" when a large
       cancellation mark (scribble/loop/strikethrough) is drawn across the
       answer grid with NO such word, or None when neither is present.
-      Explicit user request: these two are now treated very differently by
-      the caller - a WORD is an explicit, legible decline so the survey is
-      still split/uploaded (into a dedicated "Declined" folder) and merely
-      flagged needs_review=True for a human to confirm; a bare SCRIBBLE with
-      no word is NOT a confirmed decline (could be a stray mark, a
-      correction, anything) and is instead REJECTED outright (routed to a
-      "Rejected" folder) rather than guessed at.
+      Explicit user request: BOTH route the survey to the dedicated
+      "Declined" folder with needs_review=True - a WORD is an explicit,
+      legible decline, and a bare SCRIBBLE is a human intentionally voiding
+      their response. Neither is rejected: a scribble could be a stray mark
+      or a correction, so it is put in front of a reviewer rather than
+      discarded unseen. Only the REASON text differs between them.
 
-    content_issue takes priority over decline_marking at the call site
-    (split_combined_pdf() checks content_issue first) - a survey that is
+    decline_marking takes priority over content_issue at the call site
+    (split_combined_pdf() checks WORD then SCRIBBLE first) - a survey that is
     BOTH marked declined/scribbled AND has no actual survey answers selected
-    anywhere is rejected as BLANK, not merely as a decline. The BLANK
+    anywhere goes to Declined/ for review, NOT rejected as BLANK - a declined
+    survey is legitimately empty, so letting BLANK win first discarded real
+    declines (confirmed on Nov10_4.pdf pages 39-40). The BLANK
     criterion above is judged purely by whether any individual answer field
     was filled in, deliberately not counting a decline scribble/strikethrough
     over page 1's grid as a "mark" that would disqualify BLANK.
@@ -633,6 +634,18 @@ def assess_page_content_and_declined(
         if second_page is not None else
         "on this page - the numbered-question answer grid (Strongly Agree / "
         "Agree / etc.)."
+    )
+    # Explicit user request: a respondent's "Declined" is very often written
+    # at the TOP of the page (above the printed header) or on page 2, not
+    # across the answer grid - the earlier wording ("written across page 1")
+    # was read literally and missed those, rejecting real declines as
+    # "empty - no data to process". Look anywhere on EITHER page.
+    decline_scope = (
+        "ANYWHERE on EITHER page - across the answer grid, in the margins, "
+        "above the printed header at the very top of the page, or on page 2"
+        if second_page is not None else
+        "ANYWHERE on the page - across the answer grid, in the margins, or "
+        "above the printed header at the very top"
     )
     prompt = (
         f"Look at {page_description} as a whole and answer two "
@@ -673,8 +686,23 @@ def assess_page_content_and_declined(
         "visual evidence the respondent intentionally invalidated/crossed "
         "out the survey.\n\n"
         "Respond DECLINED_WORD if a large handwritten word such as "
-        "'Declined', 'Decline', or 'Refused' is prominently written across "
-        "page 1.\n\n"
+        f"'Declined', 'Decline', or 'Refused' is written {decline_scope}. "
+        "It does NOT have to cross the answer grid, and it does NOT have to "
+        "be on page 1 - a 'Declined' written small at the top edge above the "
+        "header counts just as much as one written large across the "
+        "questions.\n"
+        "CRITICAL - try to READ the mark as a word BEFORE calling it a "
+        "scribble. A large cancellation mark written in CURSIVE/script "
+        "handwriting, especially one written diagonally or sideways across "
+        "the grid, looks at first glance like a meaningless loop or "
+        "scribble, but is very often the word 'Declined' written in "
+        "longhand. Trace the strokes and ask whether they spell out "
+        "letters. If they spell a word like 'Declined'/'Decline'/'Refused' "
+        "- or its equivalent in the survey's own language, e.g. "
+        "'Rechazado'/'Rehusado'/'No acepto' on a Spanish form - the answer "
+        "is DECLINED_WORD, NOT DECLINED_SCRIBBLE, no matter how loopy, "
+        "slanted or stylized the handwriting is. Only fall through to "
+        "DECLINED_SCRIBBLE when the ink genuinely does not spell anything.\n\n"
         "Otherwise respond DECLINED_SCRIBBLE if there is a clearly "
         "intentional cancellation mark consisting of ADDITIONAL continuous "
         "ink drawn across the answer grid, visually distinguishable from "
@@ -741,7 +769,7 @@ def assess_page_content_and_declined(
         if content_word == "UNREADABLE":
             content_issue = "Gemini could not read the page content"
         elif content_word == "BLANK":
-            content_issue = "the PDF is empty - there's no data to process"
+            content_issue = "The PDF is empty - there's no data to process"
         decline_marking = None
         if declined_word == "DECLINED_WORD":
             decline_marking = "WORD"
@@ -756,16 +784,22 @@ def assess_page_content_and_declined(
 def split_combined_pdf(
     pdf_bytes: bytes,
     source_name: str,
-    year: int,
+    date_folder: str,
     dry_run: bool,
     pages_per_survey: int = PAGES_PER_SURVEY,
     max_surveys: Optional[int] = None,
     only_page_range: Optional[tuple] = None,
 ) -> list:
     """Builds one two-page PDF per survey unit, named purely from its source
-    file name and page range (e.g. "2025_Nov_10_1_Page_1-2.pdf" for pages
-    1-2 of Nov10_1.pdf) - explicit user request: step1 no longer reads any
-    handwritten TPS number at all. That extraction, its confusable-digit
+    file name and page range (e.g. "Nov10_1_Page_1-2.pdf" for pages 1-2 of
+    Nov10_1.pdf) - explicit user request: "I don't need the file name to be
+    specific date, the process can just extract the pdf name as it is...
+    combine the pdf name with the page number, which is the original
+    logic." This function no longer parses (or requires) a date out of
+    source_name at all - date_folder (which destination date-folder this
+    source's survey units are routed under) is entirely the caller's
+    concern now, since organize_combined_pdf() already resolves it from the
+    source's own folder context. That extraction, its confusable-digit
     cross-checks, and the duplicate-TPS collision handling it existed for
     are all gone - a survey unit's identity now comes entirely from its own
     position in the source PDF, which needs no OCR and can never collide or
@@ -804,11 +838,7 @@ def split_combined_pdf(
 
     if pages_per_survey < 1:
         raise ValueError("pages_per_survey must be at least 1")
-    source_date = parse_file_name_date(source_name)
-    if source_date is None:
-        raise ValueError(f"cannot determine survey date from {source_name!r}")
-    month, day = source_date
-    date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
+    source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
     source_doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     try:
         if len(source_doc) % pages_per_survey:
@@ -854,16 +884,9 @@ def split_combined_pdf(
                 raise ValueError("max_surveys must be at least 1")
             survey_starts = list(survey_starts)[:max_surveys]
 
-        batch_match = _COMBINED_FILE_RE.fullmatch(source_name)
-        if batch_match is None:
-            raise ValueError(f"cannot determine batch suffix from {source_name!r}")
-        batch_suffix = batch_match.group("batch")
-
         for start in survey_starts:
             page_range = f"{start + 1}-{start + pages_per_survey}"
-            output_name = (
-                f"{year}_{_MONTH_NAMES[month]}_{day}_{batch_suffix}_Page_{page_range}.pdf"
-            )
+            output_name = f"{source_stem}_Page_{page_range}.pdf"
 
             # Language is gated first, but - explicit user request - is NO LONGER a
             # rejection reason: a non-English survey is still accepted/uploaded like
@@ -879,20 +902,44 @@ def split_combined_pdf(
             second_page = source_doc[start + 1] if start + 1 < len(source_doc) else None
             content_issue, decline_marking = assess_page_content_and_declined(source_doc[start], second_page)
 
-            if content_issue:
-                output_category, reason = "rejected", content_issue
-            elif decline_marking == "SCRIBBLE":
-                output_category, reason = "rejected", (
-                    "a large hand-drawn strikethrough/scribble was detected across "
-                    "the answer grid on this survey page, with no 'Declined' word "
-                    "written - treated as a voided/cancelled response rather than a "
-                    "confirmed decline."
-                )
-            elif decline_marking == "WORD":
+            # Rule priority (explicit user request, in this order):
+            #   1. A written 'Declined' word wins over EVERYTHING - including
+            #      a BLANK/empty verdict and any language finding. A declined
+            #      survey is legitimately empty (that's the point of
+            #      declining), so letting content_issue win first - as this
+            #      used to - rejected real declines as "empty - no data to
+            #      process". Confirmed on Nov10_4.pdf pages 39-40, a Spanish
+            #      survey with 'Declined' written in cursive across the grid.
+            #   2. No declined word + empty/unreadable -> rejected, whatever
+            #      the language.
+            #   3. No declined word + non-English + actually filled in ->
+            #      accepted as normal, flagged needs_review with the language.
+            #   4. Everything else -> normal.
+            if decline_marking == "WORD":
                 output_category = "declined"
                 reason = "a large handwritten 'Declined' marking was detected on this survey page."
                 if language_note:
                     reason = f"{reason} Also, {language_note}."
+            elif decline_marking == "SCRIBBLE":
+                # Explicit user request: a scribbled-out survey is a human
+                # intentionally voiding their response - the same intent as
+                # writing 'Declined', just without the word - so it is NOT
+                # rejected. It goes to Declined/ flagged needs_review so a
+                # person decides, rather than being discarded unseen. Checked
+                # BEFORE content_issue for the same reason WORD is: a
+                # scribbled survey has no answer marks, so the blank check
+                # would otherwise reject it as "empty - no data to process".
+                output_category = "declined"
+                reason = (
+                    "a large hand-drawn strikethrough/scribble was detected across "
+                    "the answer grid on this survey page, with no 'Declined' word "
+                    "written - treated as a voided/cancelled response; needs review "
+                    "to confirm the respondent meant to decline."
+                )
+                if language_note:
+                    reason = f"{reason} Also, {language_note}."
+            elif content_issue:
+                output_category, reason = "rejected", content_issue
             else:
                 output_category = "normal"
                 reason = language_note
@@ -962,27 +1009,25 @@ def combined_source_is_complete(
     source_date = folder_date or parse_file_name_date(source_name)
     if source_date is None:
         return False
-    combined_match = _COMBINED_FILE_RE.fullmatch(source_name)
-    if combined_match is None:
-        return False
-    if folder_date:
-        source_name = (
-            f"{_MONTH_NAMES[folder_date.month]}{folder_date.day}_"
-            f"{combined_match.group('batch')}.pdf"
-        )
-    source_date = parse_file_name_date(source_name)
-    if source_date is None:
-        return False
-    month, day = source_date
+    month, day = (
+        (source_date.month, source_date.day)
+        if isinstance(source_date, datetime.date)
+        else source_date
+    )
     source_bytes = blob.download_as_bytes()
     with pymupdf.open(stream=source_bytes, filetype="pdf") as source_doc:
         page_count = len(source_doc)
     if page_count < PAGES_PER_SURVEY or page_count % PAGES_PER_SURVEY:
         return False
 
+    # Explicit user request: the destination file name is now just the
+    # source file's own stem + page range (see split_combined_pdf()), no
+    # longer reconstructed from year/month/day/batch - so the subfolder and
+    # expected file name are both derived directly from source_name here,
+    # matching organize_combined_pdf() exactly.
     date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
-    batch_suffix = combined_match.group("batch")
-    subfolder = survey_batch_subfolder(month, day, batch_suffix)
+    source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
+    subfolder = source_stem
     normalized_destination = _normalize_prefix(destination_prefix)
     category_roots = (
         f"{normalized_destination}{date_folder}/{subfolder}/",
@@ -992,7 +1037,7 @@ def combined_source_is_complete(
 
     for start in range(0, page_count, PAGES_PER_SURVEY):
         page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-        file_name = f"{year}_{_MONTH_NAMES[month]}_{day}_{batch_suffix}_Page_{page_range}.pdf"
+        file_name = f"{source_stem}_Page_{page_range}.pdf"
         if not any(bucket.blob(f"{root}{file_name}").exists() for root in category_roots):
             return False
     return True
@@ -1057,19 +1102,14 @@ def reconcile_manifest_rows_for_complete_source(
         None,
     )
     folder_date = parse_date_folder_name(source_folder) if source_folder else None
-    source_name_for_date = source_name
-    combined_match = _COMBINED_FILE_RE.fullmatch(source_name)
-    if combined_match is None:
-        return []
-    if folder_date:
-        source_name_for_date = (
-            f"{_MONTH_NAMES[folder_date.month]}{folder_date.day}_"
-            f"{combined_match.group('batch')}.pdf"
-        )
-    source_date = parse_file_name_date(source_name_for_date)
+    source_date = folder_date or parse_file_name_date(source_name)
     if source_date is None:
         return []
-    month, day = source_date
+    month, day = (
+        (source_date.month, source_date.day)
+        if isinstance(source_date, datetime.date)
+        else source_date
+    )
     source_bytes = blob.download_as_bytes()
     source_doc = pymupdf.open(stream=source_bytes, filetype="pdf")
     page_count = len(source_doc)
@@ -1077,9 +1117,12 @@ def reconcile_manifest_rows_for_complete_source(
         source_doc.close()
         return []
 
+    # Explicit user request: destination file names are now just the source
+    # file's own stem + page range (see split_combined_pdf()) - matching
+    # combined_source_is_complete() and organize_combined_pdf() exactly.
     date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
-    batch_suffix = combined_match.group("batch")
-    subfolder = survey_batch_subfolder(month, day, batch_suffix)
+    source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
+    subfolder = source_stem
     normalized_destination = _normalize_prefix(destination_prefix)
     category_roots = {
         "normal": f"{normalized_destination}{date_folder}/{subfolder}/",
@@ -1091,7 +1134,7 @@ def reconcile_manifest_rows_for_complete_source(
     try:
         for start in range(0, page_count, PAGES_PER_SURVEY):
             page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-            file_name = f"{year}_{_MONTH_NAMES[month]}_{day}_{batch_suffix}_Page_{page_range}.pdf"
+            file_name = f"{source_stem}_Page_{page_range}.pdf"
             for category, root in category_roots.items():
                 if bucket.blob(f"{root}{file_name}").exists():
                     destination_uri = f"gs://{bucket.name}/{root}{file_name}"
@@ -1126,20 +1169,27 @@ def reconcile_manifest_rows_for_complete_source(
                     needs_review_reason = None
                     if category == "rejected":
                         rejected_reason = content_issue or (
-                            "a large hand-drawn strikethrough/scribble was detected across "
-                            "the answer grid on this survey page, with no 'Declined' word "
-                            "written - treated as a voided/cancelled response rather than a "
-                            "confirmed decline."
-                            if decline_marking == "SCRIBBLE"
-                            else "this file sits under this source's Rejected/ subfolder, but "
+                            "this file sits under this source's Rejected/ subfolder, but "
                             "re-checking its pages found no current reason to reject it - "
                             "the ORIGINAL reason from the run that first produced it was "
                             "never stored outside that run's own manifest row"
                         )
                     elif category == "declined":
-                        needs_review_reason = (
-                            "a large handwritten 'Declined' marking was detected on this survey page."
-                        )
+                        # Both a written 'Declined' and a bare cancellation
+                        # scribble live under Declined/ (see
+                        # split_combined_pdf()) - report whichever this
+                        # survey actually shows.
+                        if decline_marking == "SCRIBBLE":
+                            needs_review_reason = (
+                                "a large hand-drawn strikethrough/scribble was detected across "
+                                "the answer grid on this survey page, with no 'Declined' word "
+                                "written - treated as a voided/cancelled response; needs review "
+                                "to confirm the respondent meant to decline."
+                            )
+                        else:
+                            needs_review_reason = (
+                                "a large handwritten 'Declined' marking was detected on this survey page."
+                            )
                         if language_note:
                             needs_review_reason = f"{needs_review_reason} Also, {language_note}."
                     else:
@@ -1430,38 +1480,28 @@ def organize_combined_pdf(
     source_date = folder_date or parse_file_name_date(source_name)
     if source_date is None:
         raise ValueError(f"cannot determine source date from {blob.name!r}")
-    source_name_for_split = source_name
-    if folder_date:
-        combined_match = _COMBINED_FILE_RE.fullmatch(source_name)
-        if combined_match is None:
-            raise ValueError(f"combined source name is not recognized: {source_name!r}")
-        source_name_for_split = (
-            f"{_MONTH_NAMES[folder_date.month]}{folder_date.day}_"
-            f"{combined_match.group('batch')}.pdf"
-        )
-    outputs = split_combined_pdf(
-        pdf_bytes, source_name_for_split, year, dry_run,
-        max_surveys=max_surveys, only_page_range=only_page_range,
-    )
-    seen_names = set()
-    destination_prefix = _normalize_prefix(destination_prefix)
-
     month, day = (
         (source_date.month, source_date.day)
         if isinstance(source_date, datetime.date)
         else source_date
     )
+    date_folder_name = f"{_MONTH_NAMES[month]} {day} {year}"
+    outputs = split_combined_pdf(
+        pdf_bytes, source_name, date_folder_name, dry_run,
+        max_surveys=max_surveys, only_page_range=only_page_range,
+    )
+    seen_names = set()
+    destination_prefix = _normalize_prefix(destination_prefix)
 
-    # Every survey unit split out of this one source PDF shares the same batch
-    # subfolder (see survey_batch_subfolder()) - derived here once from
-    # source_name_for_split the same way split_combined_pdf() derives it
-    # internally for each survey unit (both match against _COMBINED_FILE_RE),
-    # so this is guaranteed consistent with what split_combined_pdf() itself used.
-    combined_match_for_split = _COMBINED_FILE_RE.fullmatch(source_name_for_split)
-    if combined_match_for_split is None:
-        raise ValueError(f"combined source name is not recognized: {source_name_for_split!r}")
-    batch_suffix = combined_match_for_split.group("batch")
-    subfolder = survey_batch_subfolder(month, day, batch_suffix)
+    # Explicit user request: "the process can just extract the pdf name as
+    # it is... combine the pdf name with the page number, which is the
+    # original logic" - every survey unit split out of this one source PDF
+    # shares a batch subfolder named after the source file's own stem,
+    # instead of a reconstructed "Mon{day}_{batch}" name - matching
+    # split_combined_pdf()'s own output_name formula exactly (both derive
+    # from source_name's stem), so this stays guaranteed consistent with
+    # what split_combined_pdf() actually produced.
+    subfolder = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
 
     # Explicit user request: "declined" and "rejected" survey units are routed to
     # their own dedicated subfolders under destination_prefix, instead of the
