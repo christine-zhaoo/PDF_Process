@@ -1764,10 +1764,8 @@ _REPORT_DATE_FORMATS = ["%b %d %Y", "%B %d %Y", "%b %d, %Y", "%B %d, %Y"]
 
 
 def parse_report_date(folder_name: str) -> Optional[datetime.date]:
-    # folder_name is now "<Date folder>/<batch subfolder>", e.g.
-    # "Nov 23 2025/Nov23_1" (see list_date_folders()) - the report date only
-    # ever lives in the first segment, so only that part is parsed; the
-    # batch subfolder deliberately plays no part in report_date.
+    # Older layouts use "<Date folder>/<batch subfolder>"; newer layouts use
+    # the source PDF name as the folder, so fall back to the run date.
     date_part = folder_name.split("/", 1)[0]
     cleaned = " ".join(date_part.split())  # collapse repeated/odd whitespace
     for fmt in _REPORT_DATE_FORMATS:
@@ -1775,72 +1773,45 @@ def parse_report_date(folder_name: str) -> Optional[datetime.date]:
             return datetime.datetime.strptime(cleaned, fmt).date()
         except ValueError:
             continue
-    err(
-        "Could not parse a report_date out of folder name %r (tried formats %s); "
-        "report_date will be NULL for files in this folder.",
-        folder_name,
-        _REPORT_DATE_FORMATS,
-    )
-    return None
+    return datetime.date.today()
 
 
 def list_date_folders(bucket, root_prefix: str) -> list:
-    """Return "<Date folder>/<batch subfolder>" names, e.g. "Nov 23 2025/
-    Nov23_1" - one per batch subfolder each split survey now lives under
-    (see step1_merge_pdf.py's survey_batch_subfolder()), not one per date
-    folder. Each batch subfolder is its own "folder_name" unit for BigQuery
-    purposes (see extract_to_bigquery()/delete_existing_rows_for_folder()),
-    matching the granularity step1 now uploads at - a whole-date-folder unit
-    would mix rows from many unrelated source PDFs (one per batch) under a
-    single folder_name, making a --folders rerun of just one batch impossible
-    without also reloading every other batch scanned that same day.
+    """Return one folder_name for each directory containing PDFs.
 
-    GCS has no real folders, so this lists with '/' as a delimiter, once for
-    the date folders and once more per date folder for its batch
-    subfolders."""
+    This supports the current source-name layout as well as older nested
+    date/batch layouts. Grouping at the PDF's parent directory keeps each
+    source survey independently replaceable in BigQuery.
+    """
     if root_prefix and not root_prefix.endswith("/"):
         root_prefix += "/"
-    iterator = bucket.client.list_blobs(bucket, prefix=root_prefix, delimiter="/")
-    # Have to exhaust the iterator before .prefixes is populated.
-    loose_files = [b.name for b in iterator if not b.name.endswith("/")]
-    date_folder_prefixes = sorted(iterator.prefixes, key=natural_sort_key)
-    date_folders = [p[len(root_prefix):].rstrip("/") for p in date_folder_prefixes]
+    folders = set()
+    loose_files = []
+    for blob in bucket.client.list_blobs(bucket, prefix=root_prefix):
+        if blob.name.endswith("/") or not blob.name.lower().endswith(".pdf"):
+            continue
+        relative_name = blob.name[len(root_prefix):]
+        if "/" not in relative_name:
+            loose_files.append(blob.name)
+            continue
+        folders.add(relative_name.rsplit("/", 1)[0])
+
     if loose_files:
         err(
-            "%d file(s) sit directly under %s (not inside a date folder) and "
+            "%d file(s) sit directly under %s (not inside a source folder) and "
             "will be SKIPPED by this script: %s",
             len(loose_files),
             root_prefix,
             ", ".join(loose_files[:5]) + (" ..." if len(loose_files) > 5 else ""),
         )
 
-    folders = []
-    loose_in_date_folder = []
-    for date_folder in date_folders:
-        date_prefix = f"{root_prefix}{date_folder}/"
-        batch_iterator = bucket.client.list_blobs(bucket, prefix=date_prefix, delimiter="/")
-        loose_in_date_folder.extend(b.name for b in batch_iterator if not b.name.endswith("/"))
-        batch_prefixes = sorted(batch_iterator.prefixes, key=natural_sort_key)
-        folders.extend(
-            f"{date_folder}/{p[len(date_prefix):].rstrip('/')}" for p in batch_prefixes
-        )
-    if loose_in_date_folder:
-        err(
-            "%d file(s) sit directly under a date folder (not inside a batch "
-            "subfolder) and will be SKIPPED by this script: %s",
-            len(loose_in_date_folder),
-            ", ".join(loose_in_date_folder[:5]) + (" ..." if len(loose_in_date_folder) > 5 else ""),
-        )
+    folders = sorted(folders, key=natural_sort_key)
     status("[GCS] Found %d batch folder(s) under gs://%s/%s: %s", len(folders), bucket.name, root_prefix, folders)
     return folders
 
 
 def list_pdfs_in_folder(bucket, root_prefix: str, folder: str) -> list:
-    # folder is now a full "<Date folder>/<batch subfolder>" leaf path (see
-    # list_date_folders()), so every PDF found here already belongs to just
-    # this one batch - no further recursion needed, but listing without a
-    # delimiter is still harmless (and cheaper than an extra prefixes pass)
-    # since nothing sits deeper than this leaf.
+    # list_date_folders() returns the relative parent directory of each PDF.
     prefix = f"{root_prefix.rstrip('/')}/{folder}/"
     blobs = list(bucket.client.list_blobs(bucket, prefix=prefix))
     pdfs = [b for b in blobs if b.name.lower().endswith(".pdf")]
@@ -2308,7 +2279,6 @@ def build_calibration_reference_note(calibration_profile: Optional[dict]) -> str
     return " ".join(parts)
 
 
-_VERTEX_INITIALIZED = False
 _RENDER_DPI = 300  # PDF native resolution is 72 dpi; render well above that for small/rotated text
 
 # Per-file border/shadow hints from classify_pdf_quality.py's pdf_quality
@@ -7246,8 +7216,8 @@ def extract_qa_from_pdf(
     same convention as calibration_profile above - never required, never
     itself a source of needs_review, and None/empty behaves exactly like
     before this parameter existed."""
-    import vertexai
-    from vertexai.generative_models import GenerationConfig, GenerativeModel, Part
+    from google import genai
+    from google.genai import types
 
     # Set once per file, for the whole duration of this call - not reset
     # afterward because each ThreadPoolExecutor worker thread (see
@@ -7275,23 +7245,19 @@ def extract_qa_from_pdf(
     # without any separate blanket force).
     force_review = False
 
-    global _VERTEX_INITIALIZED
-    if not _VERTEX_INITIALIZED:
-        vertexai.init(project=project, location=location)
-        _VERTEX_INITIALIZED = True
-
     page_images = render_pdf_to_images(pdf_bytes)
-    image_parts = [Part.from_data(data=img, mime_type="image/png") for img in page_images]
+    image_parts = [types.Part.from_bytes(data=img, mime_type="image/png") for img in page_images]
 
     prompt_parts = [get_extraction_prompt()]
     calibration_note = build_calibration_reference_note(calibration_profile)
     if calibration_note:
         prompt_parts.append(calibration_note)
 
-    model = GenerativeModel(model_name)
-    response = model.generate_content(
-        [*prompt_parts, *image_parts],
-        generation_config=GenerationConfig(temperature=0, response_mime_type="application/json"),
+    client = genai.Client(vertexai=True, project=project, location=location)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[*prompt_parts, *image_parts],
+        config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"),
     )
     raw_text = response.text
     parsed = json.loads(raw_text)  # let a malformed response raise -> caller decides how to handle
@@ -8983,7 +8949,7 @@ _CORRECTIONS_ROOT_CAUSE_CATEGORIES = {
 # change and aren't really "calibration" in the pixel-detection sense this
 # revision targets. Also EXCLUDED: pure runtime state flags that are never
 # meant to be hand-tuned (_GRID_DEPS_CHECKED, _VISION_DEPS_CHECKED,
-# _VERTEX_INITIALIZED, _EXTRACTION_PROMPT).
+# _EXTRACTION_PROMPT).
 # --------------------------------------------------------------------------
 _PIPELINE_CONFIG_DEFAULTS = {
     "_INK_THRESHOLD": _INK_THRESHOLD,
@@ -10036,25 +10002,22 @@ def extract_one_file_to_bigquery(
         root = root_prefix.rstrip("/")
         blob_name = file_path if file_path.startswith(root + "/") else f"{root}/{file_path}"
 
-    # folder_name is the first TWO path segments directly under root_prefix -
-    # "<Date folder>/<batch subfolder>", e.g. "Nov 23 2025/Nov23_5" - same
-    # "folder_name" value list_date_folders()/extract_to_bigquery() use for
-    # every other row of this file's own batch, so a per-file delete here
-    # can never orphan rows under a different folder_name spelling.
+    # Match list_date_folders() by using the PDF's parent directory relative
+    # to root_prefix as folder_name.
     root = root_prefix.rstrip("/") + "/"
     if not blob_name.startswith(root):
         err("[FILE] %r does not sit under root_prefix %r - cannot determine its folder_name.", blob_name, root_prefix)
         sys.exit(1)
     remainder = blob_name[len(root):]
     remainder_parts = remainder.split("/")
-    if len(remainder_parts) < 3:
+    if len(remainder_parts) < 2:
         err(
-            "[FILE] %r does not sit inside a <date folder>/<batch subfolder>/ path under "
+            "[FILE] %r does not sit inside a source folder under "
             "root_prefix %r - cannot determine its folder_name.",
             blob_name, root_prefix,
         )
         sys.exit(1)
-    folder = "/".join(remainder_parts[:2])
+    folder = "/".join(remainder_parts[:-1])
     file_name = Path(blob_name).name
     report_date = parse_report_date(folder)
 

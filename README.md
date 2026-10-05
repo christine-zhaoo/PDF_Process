@@ -35,10 +35,10 @@ step1_merge_pdf.py          step2_pdf_calibration.py     step3_pdf_quality_check
 ```
 
 ### Step 1 — `step1_merge_pdf.py`: Organize & split scans
-Organizes loose scanned survey PDFs sitting in a GCS bucket into per-date folders. Combined scans containing multiple surveys are split by reading each survey's handwritten TPS number and re-saved as individual two-page PDFs (e.g. `2025_Nov_17_10_TPS_6558.pdf`) under a per-batch subfolder (e.g. `Nov 17 2025/Nov17_10/`); single-survey files are moved unchanged into `Month D YYYY` folders.
+Processes PDFs in GCS without depending on their naming/date format. Step 1 splits each source into two-page survey PDFs and stores them in a folder named after the original PDF's filename stem (for example, `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf`). The current date is recorded in the manifest, not used as an output folder.
 
 - **Input:** loose PDFs under `gs://<bucket>/<root-prefix>/` (defaults from `pipeline_config.py`'s `GCS_BUCKET`/`GCS_RAW_PREFIX`)
-- **Output:** reorganized PDFs in per-date GCS folders; a manifest loaded to BigQuery (default table `pdf_manifest_list`, from `pipeline_config.py`'s `BQ_TABLE_MANIFEST`, partitioned by `moved_date`); optional failure log CSV (`step1_failed_sources*.csv`)
+- **Output:** reorganized PDFs in per-source-name folders; a manifest loaded to BigQuery (default table `pdf_manifest_list`, from `pipeline_config.py`'s `BQ_TABLE_MANIFEST`, partitioned by `moved_date`); optional failure log CSV (`step1_failed_sources*.csv`)
 - **Usage:**
   ```
   python step1_merge_pdf.py --bucket <bucket> --root-prefix <prefix> [--year 2025] [--dry-run] \
@@ -87,7 +87,7 @@ The largest and core script: reads each survey PDF with a Vertex AI Gemini visio
       [--no-vision-check] [--question N] [--file NAME] [--root-cause CATEGORY] \
       [--corrections-limit N] [--list-corrections]
   ```
-- **Key deps:** `google-cloud-storage`, `google-cloud-aiplatform` (Vertex AI/Gemini), `google-cloud-bigquery`, `google-cloud-vision`, `pypdf`, `pymupdf` (fitz), `opencv-python-headless`, `numpy`
+- **Key deps:** `google-cloud-storage`, `google-genai` (Vertex AI/Gemini), `google-cloud-bigquery`, `google-cloud-vision`, `pypdf`, `pymupdf` (fitz), `opencv-python-headless`, `numpy`
 
 ### Step 5 — `step5_file_quality.py`: Needs-review rollup
 Reads BigQuery's `survey_responses` table (from step 4) and builds a `file_quality_review` table — one row per source file summarizing all `needs_review=TRUE` questions for quick triage.
@@ -128,19 +128,15 @@ This section documents the actual decision rules, thresholds, and edge-case hand
 - **Confidence downgrade:** a self-reported HIGH reading is downgraded to LOW if it differs from the expected `+1` sequence by exactly one digit that's a member of a confusable pair: `{1,4}, {1,7}, {3,8}, {5,6}, {0,6}, {0,8}, {0,9}, {6,8}, {8,9}, {2,7}` — but only once the bank actually has templates for *both* candidate digits from another survey (`has_templates_for()`), so a digit with no real competition isn't wrongly downgraded.
 - **Confidence upgrade (reverse check):** a self-reported LOW reading is upgraded to HIGH if every confusable-pair digit it contains has bank templates for both candidates and every one matches the claimed digit, not the alternative — independent pixel evidence overriding the model's own hedging on an otherwise-legible reading. A TPS number with no confusable-pair digits, or with any digit lacking bank coverage, stays LOW. Digits are otherwise never silently corrected, only confidence-adjusted either direction.
 
-**Splitting logic.** Whether a scan is "combined" (needs splitting) is decided purely by filename pattern (`Nov17_10.pdf`-style), not content. Combined scans are split into fixed, non-overlapping 2-page chunks (`PAGES_PER_SURVEY = 2`) — there's no blank-page or marker detection. If total pages isn't a multiple of 2, the whole source is rejected as unsplittable.
+**Splitting logic and naming.** Every input PDF is split into fixed, non-overlapping 2-page surveys; source filename patterns and dates are not used to decide whether or how to split. Each output keeps the source stem as its enclosing folder and gets a one-based survey index. For example, `TPS 2026 Adult English_Filled.pdf` produces `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf` for source pages 1–2. The current date is recorded in the manifest only. If the source page count is not divisible by two, that source is recorded as unsplittable.
 
-**Content checks (per survey unit).** `assess_page_content_and_declined()` judges the whole 2-page survey when a second page is available (checked before TPS collision logic, so a bad survey is never blamed as a "duplicate"): BLANK requires *neither* page to have any mark anywhere — page 1's answer grid AND page 2's Q24 comment box / Q25-35 fields all have to be empty. Falls back to page-1-only judging when there's no reliable second page (e.g. an odd page count). Also flags a large handwritten "Declined/Refused" word or a genuine cancellation scribble — the latter doesn't reject the survey but flags it `needs_review`. The prompt explicitly excludes two look-alike patterns from counting as DECLINED: (1) a respondent consistently marking the same answer column down every row (can visually look like a diagonal streak), and (2) a checkmark drawn with a long diagonal "tail" flourish whose stroke happens to touch a neighboring row/column — the prompt's test is whether an ink segment can be traced back to originating from an individual checkbox as that checkbox's own mark; only ink that can't be is a real cancellation.
+**Content checks (per survey unit).** Each 2-page unit continues through the language and blank/declined-content checks. Outputs are routed to the normal, `Declined/`, or `Rejected/` category locations and the manifest records the source page range and any review/rejection reason.
 
-**Duplicate TPS handling.** If a TPS number repeats within one source PDF: HIGH-confidence collisions trigger a second Gemini call (`verify_same_tps_number`) comparing both crops side-by-side. Every verdict — including `SAME` — now results in both surveys kept and split, renamed `..._NEEDS_REVIEW...pdf`; nothing is auto-rejected as a "confirmed duplicate" anymore. (Previously a `SAME` verdict silently rejected the newer survey; this was reversed after a confirmed real case of no genuine duplicate existing in a batch — the visual-verification call itself can misread two different, similarly-shaped handwritten TPS numbers as the same, and rejecting on that basis permanently and silently lost real respondent data.) `DIFFERENT` / `AMBIGUOUS` / any LOW-confidence collision are unchanged — always flagged for review, never auto-resolved.
+**Failure logging (`step1_failed_sources*.csv`).** Rows are logged for unsplittable source PDFs, rejected survey units, and unhandled per-source errors. Filenames without a date are not failures.
 
-**Naming.** Destination folders: `"<Month> <D> <YYYY>"` (e.g. `Dec 14 2025`). Year is never in the filename — it's inferred once per run from the most common year among existing date folders (`--year` overrides). Every split survey unit is written under its own batch subfolder, `survey_batch_subfolder()`: `"<Mon><D, no leading zero>_<batch suffix>"` (e.g. `Nov6_36`, from combined source `Nov6_36.pdf`) — matching a one-time manual reorganization already done directly against the bucket, so new runs stay consistent with the existing layout instead of writing back into the old flat per-date structure. Full destination: `<date folder>/<batch subfolder>/{year}_{Mon}_{DD}_{batch}_TPS_{tps}.pdf`, with `_NEEDS_REVIEW` inserted for flagged surveys.
+**Dry-run.** Runs the content checks and computes the manifest but skips GCS uploads and BigQuery writes. It also bypasses the already-processed optimization, so each PDF is evaluated again.
 
-**Failure logging (`step1_failed_sources*.csv`).** Rows are logged for: unsplittable page count, `TpsRejected` (unreadable/non-English/unparseable), BLANK/NON_ENGLISH/UNREADABLE content, confirmed duplicates, output-name collisions, and any unhandled exception per source PDF.
-
-**Dry-run.** Still runs all Gemini calls (TPS extraction, content checks, duplicate verification) and computes the full manifest — it only skips the actual GCS copy/upload and skips BigQuery entirely. Dry-run also always bypasses the "already fully processed" skip-optimization, so it re-evaluates every combined source from scratch.
-
-**Key thresholds:** `TPS_EXTRACTION_MAX_ATTEMPTS=3`, retry delay 2s; `SOURCE_PDF_WORKERS=4` concurrent files; `MAX_CONCURRENT_VERTEX_CALLS=4`; Gemini rate-limit backoff `min(2.0 × 2^(attempt-1), 60.0)`s, up to 5 attempts.
+**Key thresholds:** content/language Gemini calls retry up to `TPS_EXTRACTION_MAX_ATTEMPTS=3` with a 2s delay; `SOURCE_PDF_WORKERS=4` concurrent source PDFs; `MAX_CONCURRENT_VERTEX_CALLS=4`.
 
 **Manifest schema (`organize_manifest`/`pdf_manifest_list`):** `source_file, source_gcs_uri, parsed_month_day, destination_folder, destination_gcs_uri, moved_at, moved_date (partition), source_page_range, rejected, rejected_reason, needs_review, needs_review_reason`. Re-running replaces rows only for the same `(source_gcs_uri, source_page_range)`, not the whole file/folder.
 

@@ -2,12 +2,10 @@
 """
 merge_pdfs_to_folder process:
 
-Standalone script that organizes loose survey PDFs into per-date folders. A
-normal individual survey is moved unchanged. A combined scan such as
-``Nov17_10.pdf`` is treated as a sequence of two-page surveys: no handwritten
-content is read to identify a survey unit at all - each one's identity is
-purely its source file name + page range (e.g. pages 1-2 of ``Nov10_1.pdf``
-becomes ``2025_Nov_10_1_Page_1-2.pdf``), placed in ``Nov 10 2025``.
+Standalone script that organizes survey PDFs into source-name
+folders. Every source PDF is split into two-page survey PDFs, regardless of
+its filename. Each output is named from the original PDF's stem and a
+one-based survey index, e.g. ``TPS Form/TPS Form_p1.pdf`` for source pages 1-2.
 
 Each survey unit is still read by Gemini for two things that DO require
 looking at the page content: a language check (English vs. not - a non-
@@ -15,7 +13,7 @@ English survey is accepted and flagged for review, never rejected) and a
 content-quality/decline check. A survey unit lands in exactly one of three
 destination categories (see split_combined_pdf()'s docstring for the full
 decision logic):
-  - normal date folder: the common case.
+  - normal source-name folder: the common case.
   - ``Declined/`` subfolder: a large handwritten "Declined"/"Decline"/
     "Refused" word is written - still uploaded, flagged needs_review.
   - ``Rejected/`` subfolder: the page is blank/unreadable, OR there's a
@@ -28,28 +26,17 @@ What it does
 Given a bucket laid out like:
 
 gs://<BUCKET>/<ROOT_PREFIX>/
-    Dec14_1.pdf
-    Nov 18 2025/            <- an existing, already-organized date folder
-        2025_Nov_18_1_Page_1-2.pdf
-        ...
+    TPS 2026 Adult English_Filled.pdf
 
-Every PDF directly under ROOT_PREFIX (i.e. NOT already inside a date
-subfolder) is treated as unorganized. For each one:
-
-1. A combined name matching ``<Mon><D[D]>_<batch>.pdf`` is split into
-   two-page survey PDFs, named purely from the source file name and each
-   one's own page range (see split_combined_pdf()).
-2. An individual name's destination date is parsed from the leading
-   "<Mon><D[D]>" token (e.g. "Dec14" -> month=Dec). See parse_file_name_date().
-3. The year for that date is the year inferred once per run from this bucket/root's existing date folders (see infer_survey_year()) — the file
-   name itself never carries a year.
-3. The file is moved into gs://<BUCKET>/<ROOT_PREFIX>/<Month> <D> <YYYY>/(that folder is created on first use; an already-existing folder is
-   reused, never recreated/overwritten).
+Every source PDF under ROOT_PREFIX is processed as one or more two-page
+surveys, regardless of its filename or any date-like folder it is in. Outputs
+go under ``<source filename without extension>/``; the original source is not
+changed or deleted. The current run date is recorded in the manifest only.
 
 --------------------------------------------------------------------------
 Manifest destination
 --------------------------------------------------------------------------
-For every moved file, one row — source_file, source_gcs_uri, parsed_month_day, destination_folder, destination_gcs_uri, moved_at,
+For every split survey, one row — source_file, source_gcs_uri, parsed_month_day, destination_folder, destination_gcs_uri, moved_at,
 moved_date — is loaded into a BigQuery table (default: organize_manifest), partitioned by moved_date (DATE(moved_at)).
 
 --------------------------------------------------------------------------
@@ -63,14 +50,9 @@ Setup
 --------------------------------------------------------------------------
 Revision notes (this pass)
 --------------------------------------------------------------------------
-- Single GCS listing per run: infer_survey_year() and list_loose_pdfs() used
-  to each call bucket.client.list_blobs() against the same prefix/delimiter
-  independently, doubling the round trip to GCS every run for no reason.
-  They're now backed by one list_root_contents() call whose result (loose
-  PDF blobs + existing date-folder names) is computed once in run() and
-  passed down to both.
-- Removed a dead `loose_files` local in the old infer_survey_year() that was
-  computed and never used.
+- Every PDF is now processed regardless of its file-name date convention;
+  outputs are placed by source-name folder and survey index, while the
+  current run date is recorded only in the manifest.
 - partition_field now consistently matches the manifest schema. Previously
   the table was declared partitioned on "event_partition" — a column that
   doesn't exist anywhere in BQ_MANIFEST_SCHEMA — while the Spark load path
@@ -86,7 +68,7 @@ Revision notes (this pass)
   (_DigitTemplateBank/_extract_digit_crops/_CONFUSABLE_DIGIT_PAIRS), and the
   duplicate-TPS collision handling (verify_same_tps_number()) are all
   removed - a survey unit's identity is now purely its source file name +
-  page range (see split_combined_pdf()), which needs no OCR and can never
+  survey index (see split_combined_pdf()), which needs no OCR and can never
   collide. assess_page_content_and_declined() distinguishes a written
   "Declined" WORD from a bare cancellation SCRIBBLE with no word, but
   (explicit user request) BOTH are now accepted into the "Declined"
@@ -810,20 +792,12 @@ def split_combined_pdf(
     max_surveys: Optional[int] = None,
     only_page_range: Optional[tuple] = None,
 ) -> list:
-    """Builds one two-page PDF per survey unit, named purely from its source
-    file name and page range (e.g. "Nov10_1_Page_1-2.pdf" for pages 1-2 of
-    Nov10_1.pdf) - explicit user request: "I don't need the file name to be
-    specific date, the process can just extract the pdf name as it is...
-    combine the pdf name with the page number, which is the original
-    logic." This function no longer parses (or requires) a date out of
-    source_name at all - date_folder (which destination date-folder this
-    source's survey units are routed under) is entirely the caller's
-    concern now, since organize_combined_pdf() already resolves it from the
-    source's own folder context. That extraction, its confusable-digit
-    cross-checks, and the duplicate-TPS collision handling it existed for
-    are all gone - a survey unit's identity now comes entirely from its own
-    position in the source PDF, which needs no OCR and can never collide or
-    be misread.
+    """Builds one two-page PDF per survey unit, named from its source stem
+    and one-based survey index (e.g. "TPS Form_p1.pdf" for pages 1-2 of
+    "TPS Form.pdf"). No date or filename convention is required to split the
+    PDF; date_folder is the enclosing folder named after the source PDF.
+    A survey unit's identity comes entirely from its position in the source
+    PDF, which needs no OCR and can never collide or be misread.
 
     Every survey unit falls into exactly one output_category, each routed
     by organize_combined_pdf() to its own destination subfolder - unlike
@@ -909,7 +883,8 @@ def split_combined_pdf(
 
         for start in survey_starts:
             page_range = f"{start + 1}-{start + pages_per_survey}"
-            output_name = build_output_file_name(output_year, source_stem, start)
+            survey_index = start // pages_per_survey + 1
+            output_name = f"{source_stem}_p{survey_index}.pdf"
 
             # Language is gated first, but - explicit user request - is NO LONGER a
             # rejection reason: a non-English survey is still accepted/uploaded like
@@ -1005,10 +980,11 @@ def combined_source_is_complete(
     destination_prefix: str,
     year: int,
     blob,
+    moved_at: Optional[datetime.datetime] = None,
 ) -> bool:
     """Return whether every survey unit already has a destination PDF - now a
     purely deterministic check, since every survey unit's output file name is
-    derived entirely from (year, month, day, batch, page range), with no
+    derived entirely from the source stem and survey index, with no
     OCR-dependent content (see split_combined_pdf()'s docstring) - so each
     one's expected name can be checked directly for existence, across all
     three possible destination subfolders it could have landed in (the
@@ -1023,44 +999,24 @@ def combined_source_is_complete(
     import pymupdf
 
     source_name = blob.name.rsplit("/", 1)[-1]
-    relative_parts = blob.name[len(_normalize_prefix(root_prefix)):].split("/")
-    source_folder = next(
-        (part for part in relative_parts[:-1] if parse_date_folder_name(part)),
-        None,
-    )
-    folder_date = parse_date_folder_name(source_folder) if source_folder else None
-    source_date = folder_date or parse_file_name_date(source_name)
-    if source_date is None:
-        return False
-    month, day = (
-        (source_date.month, source_date.day)
-        if isinstance(source_date, datetime.date)
-        else source_date
-    )
     source_bytes = blob.download_as_bytes()
     with pymupdf.open(stream=source_bytes, filetype="pdf") as source_doc:
         page_count = len(source_doc)
     if page_count < PAGES_PER_SURVEY or page_count % PAGES_PER_SURVEY:
         return False
 
-    # Explicit user request: the destination file name is now just the
-    # source file's own stem + page range (see split_combined_pdf()), no
-    # longer reconstructed from year/month/day/batch - so the subfolder and
-    # expected file name are both derived directly from source_name here,
-    # matching organize_combined_pdf() exactly.
-    date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
     source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
     subfolder = source_stem
     normalized_destination = _normalize_prefix(destination_prefix)
     category_roots = (
-        f"{normalized_destination}{date_folder}/{subfolder}/",
-        f"{normalized_destination}Declined/{date_folder}/{subfolder}/",
-        f"{normalized_destination}Rejected/{date_folder}/{subfolder}/",
+        f"{normalized_destination}{subfolder}/",
+        f"{normalized_destination}Declined/{subfolder}/",
+        f"{normalized_destination}Rejected/{subfolder}/",
     )
 
     for start in range(0, page_count, PAGES_PER_SURVEY):
-        page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-        file_name = build_output_file_name(year, source_stem, start)
+        survey_index = start // PAGES_PER_SURVEY + 1
+        file_name = f"{source_stem}_p{survey_index}.pdf"
         if not any(bucket.blob(f"{root}{file_name}").exists() for root in category_roots):
             return False
     return True
@@ -1074,65 +1030,17 @@ def reconcile_manifest_rows_for_complete_source(
     blob,
     moved_at: Optional[datetime.datetime] = None,
 ) -> list:
-    """Explicit user request ("have the logic to always update the records
-    once step 1 runs"): combined_source_is_complete() returning True makes
-    the caller skip this source ENTIRELY - no Gemini call (the whole point,
-    to avoid burning Vertex quota on a source nothing changed about) but
-    also, as a side effect, no manifest row emission at all. That means
-    once a source is ever judged complete, NOTHING ever updates its
-    manifest rows again - confirmed as the real cause of a reported stale
-    pdf_manifest_list row (gs://.../2025_Nov_18_1_TPS_6947.pdf) that kept
-    pointing at a destination file which no longer existed, because
-    whatever renamed it to the current _Page_21-22.pdf naming never ran
-    through this script's own delete-then-load path at all.
-
-    Call this INSTEAD of returning empty when combined_source_is_complete()
-    is True: it finds each survey unit's ACTUAL current destination file
-    (same deterministic filename/category-root search that function
-    already does) and returns one ManifestRow per unit describing exactly
-    what's really there right now - no re-upload and no re-split, but it
-    DOES re-run the per-survey gates (see below) - enough for
-    load_manifest_rows_into_bq()'s existing delete_existing_manifest_rows_
-    for_sources() step to replace any stale row for the same (source_gcs_
-    uri, source_page_range) key with one that matches current reality.
-
-    The ORIGINAL reason text from the run that first split this source was
-    never stored outside that run's own manifest row, so it can't be read
-    back. Instead of guessing at it from the file's name/folder, this
-    RE-RUNS the same gates split_combined_pdf() runs (validate_survey_
-    language() + assess_page_content_and_declined()) against the source's
-    real pages, so a reconciled row carries a genuine, Gemini-backed
-    judgment. The file's category (normal/Declined/Rejected) still comes
-    from which subfolder it physically sits in - that was decided by the
-    earlier run and isn't second-guessed here; only the REASON is recomputed.
-
-    This costs the same Gemini calls a fresh split would have made, so it is
-    no longer "no Gemini call" cheap. That's deliberate: the previous
-    filename-based shortcut ("_NEEDS_REVIEW" in file_name) silently stopped
-    working when outputs were renamed to
-    "{year}_{Mon}_{day}_{batch}_Page_{range}.pdf", leaving every reconciled
-    "normal" unit with needs_review_reason=None - including confirmed
-    non-English surveys."""
+    """Rebuild manifest rows for a source whose split files already exist.
+    Output paths use the source stem and one-based survey index. The category
+    is read from the existing output
+    location; language/content review reasons are recomputed from the source
+    pages so refreshed rows reflect the current checks."""
     import pymupdf
 
     moved_at = moved_at or datetime.datetime.utcnow()
     source_name = blob.name.rsplit("/", 1)[-1]
     source_path = f"{bucket.name}/{blob.name}"
     source_uri = f"gs://{bucket.name}/{blob.name}"
-    relative_parts = blob.name[len(_normalize_prefix(root_prefix)):].split("/")
-    source_folder = next(
-        (part for part in relative_parts[:-1] if parse_date_folder_name(part)),
-        None,
-    )
-    folder_date = parse_date_folder_name(source_folder) if source_folder else None
-    source_date = folder_date or parse_file_name_date(source_name)
-    if source_date is None:
-        return []
-    month, day = (
-        (source_date.month, source_date.day)
-        if isinstance(source_date, datetime.date)
-        else source_date
-    )
     source_bytes = blob.download_as_bytes()
     source_doc = pymupdf.open(stream=source_bytes, filetype="pdf")
     page_count = len(source_doc)
@@ -1140,24 +1048,22 @@ def reconcile_manifest_rows_for_complete_source(
         source_doc.close()
         return []
 
-    # Explicit user request: destination file names are now just the source
-    # file's own stem + page range (see split_combined_pdf()) - matching
-    # combined_source_is_complete() and organize_combined_pdf() exactly.
-    date_folder = f"{_MONTH_NAMES[month]} {day} {year}"
+    month, day = moved_at.month, moved_at.day
     source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
     subfolder = source_stem
     normalized_destination = _normalize_prefix(destination_prefix)
     category_roots = {
-        "normal": f"{normalized_destination}{date_folder}/{subfolder}/",
-        "declined": f"{normalized_destination}Declined/{date_folder}/{subfolder}/",
-        "rejected": f"{normalized_destination}Rejected/{date_folder}/{subfolder}/",
+        "normal": f"{normalized_destination}{subfolder}/",
+        "declined": f"{normalized_destination}Declined/{subfolder}/",
+        "rejected": f"{normalized_destination}Rejected/{subfolder}/",
     }
 
     rows = []
     try:
         for start in range(0, page_count, PAGES_PER_SURVEY):
             page_range = f"{start + 1}-{start + PAGES_PER_SURVEY}"
-            file_name = build_output_file_name(year, source_stem, start)
+            survey_index = start // PAGES_PER_SURVEY + 1
+            file_name = f"{source_stem}_p{survey_index}.pdf"
             for category, root in category_roots.items():
                 if bucket.blob(f"{root}{file_name}").exists():
                     destination_uri = f"gs://{bucket.name}/{root}{file_name}"
@@ -1223,7 +1129,7 @@ def reconcile_manifest_rows_for_complete_source(
                             source_file=source_path,
                             source_gcs_uri=source_uri,
                             parsed_month_day=f"{month:02d}/{day:02d}",
-                            destination_folder=date_folder,
+                            destination_folder=subfolder,
                             destination_gcs_uri=destination_uri,
                             moved_at=moved_at,
                             moved_date=moved_at.date(),
@@ -1335,7 +1241,7 @@ def infer_survey_year(
 class ManifestRow:
     source_file: str
     source_gcs_uri: str
-    parsed_month_day: str  # e.g. "12/14" - the (month, day) parsed from the file name, for auditability
+    parsed_month_day: str  # e.g. "12/14" - date from source name/folder, or today's date when absent
     destination_folder: str  # e.g. "Dec 14 2025"
     destination_gcs_uri: Optional[str]  # None only for a whole-source failure that couldn't be split into survey units at all (malformed page count); every per-survey-unit row - rejected, declined, or normal - IS still split/uploaded, just to that category's own destination subfolder (see organize_combined_pdf())
     moved_at: Optional[datetime.datetime] = None  # when this ETL run moved the file
@@ -1375,13 +1281,9 @@ def organize_loose_pdfs(
     pdf_blobs: list,
     moved_at: Optional[datetime.datetime] = None,
 ) -> OrganizeResult:
-    """Copies every loose PDF in `pdf_blobs` into
-    its "<Month> <D> <YYYY>" date folder, based on the (month, day) parsed
-    from each file's own name (see parse_file_name_date()) plus the given
-    `year`. The source object is never deleted; the destination folder is
-    created implicitly when the first file is copied (GCS has no real
-    folders). Skips (not fatal) any file
-    whose name doesn't parse."""
+    """Splits every PDF in `pdf_blobs` into two-page surveys, placing outputs
+    under today's date and a folder named after each source PDF's stem.
+    Original source PDFs are never deleted."""
     moved_at = moved_at or datetime.datetime.utcnow()
     moved_date = moved_at.date()
     result = OrganizeResult(moved_rows=[], skipped_files=[])
@@ -1389,80 +1291,20 @@ def organize_loose_pdfs(
     if not pdf_blobs:
         return result
 
-    destination_prefix = _normalize_prefix(destination_prefix)
-
     for blob in pdf_blobs:
-        file_name = blob.name.rsplit("/", 1)[-1]
-        source_path = f"{bucket.name}/{blob.name}"
-        relative_parts = blob.name[len(_normalize_prefix(root_prefix)):].split("/")
-        source_folder = next(
-            (part for part in relative_parts[:-1] if parse_date_folder_name(part)),
-            None,
+        pdf_result = organize_combined_pdf(
+            bucket,
+            root_prefix,
+            destination_prefix,
+            year,
+            dry_run,
+            blob,
+            moved_at=moved_at,
         )
-        folder_date = parse_date_folder_name(source_folder) if source_folder else None
-        parsed = (folder_date.month, folder_date.day) if folder_date else parse_file_name_date(file_name)
-        source_uri = f"gs://{bucket.name}/{blob.name}"
-        if parsed is None:
-            err(
-                "[ORGANIZE] SKIPPING %s: file name doesn't start with a recognizable "
-                "<Mon><Day> token (e.g. \"Dec14\") - can't determine its date folder.",
-                source_uri,
-            )
-            result.skipped_files.append(blob.name)
-            continue
-
-        month, day = parsed
-        try:
-            file_date = datetime.date(year, month, day)
-        except ValueError as e:
-            err("[ORGANIZE] SKIPPING %s: parsed month=%d day=%d year=%d is not a real date (%s).", source_uri, month, day, year, e)
-            result.skipped_files.append(blob.name)
-            continue
-
-        destination_folder = f"{_MONTH_NAMES[month]} {day} {year}"
-        destination_blob_name = f"{destination_prefix}{destination_folder}/{file_name}"
-        destination_uri = f"gs://{bucket.name}/{destination_blob_name}"
-
-        # A destination that already exists is not re-copied, but the manifest
-        # row for it is still (re-)appended below rather than skipped outright -
-        # load_manifest_rows_into_bq() deletes-then-reinserts by
-        # (source_gcs_uri, source_page_range), so skipping the append here would
-        # mean this file's BQ row is never refreshed again once it's first
-        # organized, permanently going stale on every later run even though the
-        # file itself is still there and correctly organized.
-        already_present = bucket.blob(destination_blob_name).exists()
-        if already_present:
-            status("[ORGANIZE] Already present; recording manifest row without re-copying %s", destination_uri)
-        elif dry_run:
-            status("[ORGANIZE] [dry-run] would move %s -> %s", source_uri, destination_uri)
-        else:
-            try:
-                bucket.copy_blob(blob, bucket, destination_blob_name)
-                status("[ORGANIZE] Copied %s -> %s", source_uri, destination_uri)
-            except Exception as e:  # noqa: BLE001 - keep going across a batch of files
-                err("[ORGANIZE] FAILED moving %s -> %s: %s", source_uri, destination_uri, e)
-                result.skipped_files.append(blob.name)
-                continue
-
-        result.moved_rows.append(
-            ManifestRow(
-                source_file=source_path,
-                source_gcs_uri=source_uri,
-                parsed_month_day=f"{month:02d}/{day:02d}",
-                destination_folder=destination_folder,
-                destination_gcs_uri=destination_uri,
-                moved_at=moved_at,
-                moved_date=moved_date,
-            )
-        )
+        result.moved_rows.extend(pdf_result.moved_rows)
+        result.skipped_files.extend(pdf_result.skipped_files)
 
     return result
-
-
-_COMBINED_FILE_RE = re.compile(
-    r"^(?P<month>[A-Za-z]{3})(?P<day>\d{1,2})_(?P<batch>\d+)\.pdf$",
-    re.IGNORECASE,
-)
 
 
 def organize_combined_pdf(
@@ -1476,12 +1318,9 @@ def organize_combined_pdf(
     max_surveys: Optional[int] = None,
     only_page_range: Optional[tuple] = None,
 ) -> OrganizeResult:
-    """Splits one combined scan and uploads named survey PDFs, each routed to
-    its own destination subfolder by output_category (see split_combined_
-    pdf()'s docstring): "normal" -> <date folder>/<batch subfolder>/,
-    "declined" -> Declined/<date folder>/<batch subfolder>/, "rejected" ->
-    Rejected/<date folder>/<batch subfolder>/ - all three still under
-    destination_prefix.
+    """Splits one source PDF into two-page surveys and uploads them under
+    <source PDF stem>/<source stem>_pN.pdf, routing declined
+    and rejected units under their respective category subfolders.
 
     The source is never modified or deleted. Existing destination objects are
     never overwritten.
@@ -1494,43 +1333,20 @@ def organize_combined_pdf(
     source_path = f"{bucket.name}/{blob.name}"
     source_uri = f"gs://{bucket.name}/{blob.name}"
     pdf_bytes = blob.download_as_bytes()
-    relative_parts = blob.name[len(_normalize_prefix(root_prefix)):].split("/")
-    source_folder = next(
-        (part for part in relative_parts[:-1] if parse_date_folder_name(part)),
-        None,
-    )
-    folder_date = parse_date_folder_name(source_folder) if source_folder else None
-    source_date = folder_date or parse_file_name_date(source_name)
-    if source_date is None:
-        raise ValueError(f"cannot determine source date from {blob.name!r}")
-    month, day = (
-        (source_date.month, source_date.day)
-        if isinstance(source_date, datetime.date)
-        else source_date
-    )
-    date_folder_name = f"{_MONTH_NAMES[month]} {day} {year}"
+    month, day = moved_at.month, moved_at.day
+    source_stem = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
     outputs = split_combined_pdf(
-        pdf_bytes, source_name, date_folder_name, dry_run,
+        pdf_bytes, source_name, source_stem, dry_run,
         max_surveys=max_surveys, only_page_range=only_page_range,
     )
     seen_names = set()
     destination_prefix = _normalize_prefix(destination_prefix)
 
-    # Explicit user request: "the process can just extract the pdf name as
-    # it is... combine the pdf name with the page number, which is the
-    # original logic" - every survey unit split out of this one source PDF
-    # shares a batch subfolder named after the source file's own stem,
-    # instead of a reconstructed "Mon{day}_{batch}" name - matching
-    # split_combined_pdf()'s own output_name formula exactly (both derive
-    # from source_name's stem), so this stays guaranteed consistent with
-    # what split_combined_pdf() actually produced.
+    # Every source PDF gets its own folder, independent of its naming format.
     subfolder = source_name.rsplit(".", 1)[0] if "." in source_name else source_name
 
-    # Explicit user request: "declined" and "rejected" survey units are routed to
-    # their own dedicated subfolders under destination_prefix, instead of the
-    # normal <date folder>/<batch subfolder>/ path - category_subdir is prepended
-    # to that same path, so each category still keeps its own per-date/per-batch
-    # structure, just nested one level deeper under "Declined"/"Rejected".
+    # Declined and rejected surveys use category subfolders, while each source
+    # PDF keeps its own stem-named folder beneath that category.
     category_subdir = {"normal": "", "declined": "Declined/", "rejected": "Rejected/"}
 
     for output in outputs:
@@ -1597,7 +1413,7 @@ def organize_combined_pdf(
         needs_review_reason = output.get("needs_review_reason")
         destination_blob_name = (
             f"{destination_prefix}{category_subdir.get(output_category, '')}"
-            f"{output['date_folder']}/{subfolder}/{output_name}"
+            f"{subfolder}/{output_name}"
         )
         destination_uri = f"gs://{bucket.name}/{destination_blob_name}"
         destination_blob = bucket.blob(destination_blob_name)
@@ -1653,8 +1469,8 @@ def organize_combined_pdf(
 BQ_MANIFEST_SCHEMA = [
     ("source_file", "STRING", "The loose source PDF's original file name."),
     ("source_gcs_uri", "STRING", "gs:// URI the source PDF was moved FROM."),
-    ("parsed_month_day", "STRING", "The MM/DD parsed from the file name (year is inferred separately - see infer_survey_year())."),
-    ("destination_folder", "STRING", "The date-folder name this file was moved into, e.g. 'Dec 14 2025'."),
+    ("parsed_month_day", "STRING", "The MM/DD of the current run date used for this output."),
+    ("destination_folder", "STRING", "The source-PDF-name folder this output was placed in, e.g. 'TPS 2026 Adult English_Filled'."),
     ("destination_gcs_uri", "STRING", "gs:// URI the source PDF was moved TO."),
     ("moved_at", "TIMESTAMP", "When this ETL run moved the file."),
     ("moved_date", "DATE", "DATE(moved_at); the table's partitioning column."),
@@ -2018,6 +1834,7 @@ def _process_source_pdf(
     total_pdfs: int,
     failure_log: str,
     only_page_range: Optional[tuple] = None,
+    moved_at: Optional[datetime.datetime] = None,
 ) -> OrganizeResult:
     """Processes exactly one source PDF (combined or loose) end to end -
     the body of run()'s former sequential per-blob loop, pulled out so it
@@ -2031,38 +1848,25 @@ def _process_source_pdf(
     source_uri = f"gs://{bucket.name}/{blob.name}"
     status("[PROGRESS] Starting source PDF %d/%d: %s", pdf_index, total_pdfs, source_uri)
     try:
-        if _COMBINED_FILE_RE.fullmatch(blob.name.rsplit("/", 1)[-1]):
-            # only_page_range is an explicit request to (re)process one specific
-            # survey unit, so it always runs even if combined_source_is_complete()
-            # would otherwise consider this whole source PDF already done.
-            if only_page_range is None and not dry_run and combined_source_is_complete(
+        if only_page_range is None and not dry_run and combined_source_is_complete(
+            bucket, root_prefix, DESTINATION_PREFIX, resolved_year, blob,
+            moved_at=moved_at,
+        ):
+            status(
+                "[PROGRESS] Fully processed; skipping Vertex for source PDF %d/%d: %s",
+                pdf_index, total_pdfs, source_uri,
+            )
+            reconciled_rows = reconcile_manifest_rows_for_complete_source(
                 bucket, root_prefix, DESTINATION_PREFIX, resolved_year, blob,
-            ):
-                status(
-                    "[PROGRESS] Fully processed; skipping Vertex for source PDF %d/%d: %s",
-                    pdf_index, total_pdfs, source_uri,
-                )
-                # Explicit user request: "always update the records once
-                # step1 runs" - skipping Vertex here must not ALSO mean
-                # skipping the manifest table. Without this, a source that's
-                # ever judged complete can never have its manifest rows
-                # refreshed again by any later run - see
-                # reconcile_manifest_rows_for_complete_source()'s own
-                # docstring for the real stale-row case this fixes. Still
-                # zero Gemini calls - this only lists/confirms GCS objects
-                # combined_source_is_complete() just confirmed exist.
-                reconciled_rows = reconcile_manifest_rows_for_complete_source(
-                    bucket, root_prefix, DESTINATION_PREFIX, resolved_year, blob,
-                )
-                return OrganizeResult(moved_rows=reconciled_rows, skipped_files=[])
-            pdf_result = organize_combined_pdf(
-                bucket, root_prefix, DESTINATION_PREFIX, resolved_year, dry_run, blob,
-                max_surveys=max_surveys, only_page_range=only_page_range,
+                moved_at=moved_at,
             )
-        else:
-            pdf_result = organize_loose_pdfs(
-                bucket, root_prefix, DESTINATION_PREFIX, resolved_year, dry_run, [blob],
-            )
+            return OrganizeResult(moved_rows=reconciled_rows, skipped_files=[])
+        pdf_result = organize_combined_pdf(
+            bucket, root_prefix, DESTINATION_PREFIX, resolved_year, dry_run, blob,
+            moved_at=moved_at,
+            max_surveys=max_surveys,
+            only_page_range=only_page_range,
+        )
         for row in pdf_result.moved_rows:
             reason = row.rejected_reason or row.needs_review_reason
             if not reason:
@@ -2132,7 +1936,10 @@ def run(
     if only_page_range is not None and not only_file:
         err("[GCS] --only-pages requires --only-file (a page range only makes sense within one specific source PDF) - nothing to do.")
         return
-    resolved_year = year if year is not None else infer_survey_year(folder_names, bucket_name, root_prefix)
+    resolved_year = datetime.datetime.utcnow().year
+    if year is not None:
+        status("[YEAR] --year is ignored; Step 1 uses the current run date.")
+    run_at = datetime.datetime.utcnow()
 
     result = OrganizeResult(moved_rows=[], skipped_files=[])
     total_pdfs = len(pdf_blobs)
@@ -2148,7 +1955,7 @@ def run(
                 _process_source_pdf,
                 bucket, root_prefix, resolved_year, dry_run, blob,
                 max_surveys, pdf_index, total_pdfs, failure_log,
-                only_page_range,
+                only_page_range, run_at,
             ): blob
             for pdf_index, blob in enumerate(pdf_blobs, start=1)
         }
@@ -2168,14 +1975,14 @@ def run(
 
     if dry_run:
         status(
-            "[ORGANIZE] Dry run complete. %d file(s) would have been moved into date folders (year=%d); %d file(s) would have been skipped.",
-            len(result.moved_rows), resolved_year, len(result.skipped_files),
+            "[ORGANIZE] Dry run complete. %d two-page survey output(s) would be created; %d source(s) failed.",
+            len(result.moved_rows), len(result.skipped_files),
         )
         return
 
     if not result.moved_rows:
         if result.skipped_files:
-            err("[ORGANIZE] Nothing was moved — all %d loose file(s) failed to parse/move.", len(result.skipped_files))
+            err("[ORGANIZE] No survey outputs were created; %d source PDF(s) failed.", len(result.skipped_files))
         return
 
     if manifest_table:
@@ -2219,8 +2026,8 @@ def run(
     if result.skipped_files:
         err("[ORGANIZE] Skipped %d file(s) (unparseable name or move failure): %s", len(result.skipped_files), ", ".join(result.skipped_files))
     status(
-        "[ORGANIZE] Done. %d file(s) moved into date folders (year=%d), %d file(s) skipped.",
-        len(result.moved_rows), resolved_year, len(result.skipped_files),
+        "[ORGANIZE] Done. %d two-page survey output(s) created, %d source PDF(s) failed.",
+        len(result.moved_rows), len(result.skipped_files),
     )
 
 
@@ -2232,8 +2039,7 @@ def main():
         "--year",
         type=int,
         default=None,
-        help="Year to use for every parsed file-name date this run (e.g. 2025). "
-        "Defaults to inferring it from existing date folders under --root-prefix (see infer_survey_year()).",
+        help="Deprecated; destination folders always use the current run date.",
     )
     ap.add_argument(
         "--dry-run",

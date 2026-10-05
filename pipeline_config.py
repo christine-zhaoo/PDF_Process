@@ -50,7 +50,7 @@ import io
 # edit + redeploy, unlike everything else below.
 # ==========================================================================
 _CONFIG_GCS_BUCKET = "tps_survey"
-_CONFIG_GCS_BLOB = "Pipeline_Config/pipeline_configuration_2025.xlsx"
+_CONFIG_GCS_BLOB = "Pipeline_Config/pipeline_configuration_2027.xlsx"
 
 # ==========================================================================
 # GCS locations

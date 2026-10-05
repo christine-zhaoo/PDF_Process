@@ -101,7 +101,7 @@ def check_folder_placement(row: dict) -> list:
     if destination_folder and not rel_path.startswith(f"{destination_folder}/"):
         problems.append(
             f"destination_folder={destination_folder!r} doesn't match destination_gcs_uri's "
-            f"own date-folder segment: {rel_path!r}"
+            f"source-name folder segment: {rel_path!r}"
         )
     return problems
 
