@@ -13,7 +13,6 @@ DATE-partitioned table on this column, so a write only ever touches the partitio
 
 """
 import datetime as _dt
-import importlib
 import json
 import os
 import re
@@ -43,7 +42,7 @@ INK_THRESHOLD = 165
 GRID_COLUMN_CENTERS = (1661.75, 1790.4, 1919.6, 2049.9, 2179.6, 2309.1)
 GRID_BOX_EXPECTED_SIZE = 40
 
-_LEGACY_YESNO_BOX_GEOMETRY = {
+_CURRENT_TPS_YESNO_BOX_GEOMETRY = {
     "19": (0, {
         "None": (658, 704, 2446, 2490),
         "Very little": (882, 928, 2446, 2490),
@@ -124,7 +123,7 @@ _LEGACY_YESNO_BOX_GEOMETRY = {
     }),
 }
 
-_LEGACY_MULTISELECT_BOX_GEOMETRY = {
+_CURRENT_TPS_MULTISELECT_BOX_GEOMETRY = {
     "33": (1, {
         "American Indian/Alaskan Native": (1357, 1392, 1618, 1652),
         "Asian": (1357, 1392, 1671, 1705),
@@ -153,6 +152,7 @@ H3_CIRCLE_CALIBRATION = (0, {
     "Detox/WM": (1715, 1744, 304, 332),
     "Recovery Services": (1956, 1984, 303, 332),
 })
+_CURRENT_TPS_H3_CIRCLE_CALIBRATION = H3_CIRCLE_CALIBRATION
 
 # The public calibration contract is semantic: question number, page, and
 # answer labels. Pixel coordinates are discovered from each PDF at runtime.
@@ -177,12 +177,13 @@ MULTISELECT_BOX_CALIBRATION = {
 }
 
 
+_CONFIGURED_CONTROL_GEOMETRY = {}
+
+
 def _apply_configured_control_calibration() -> None:
     global H3_CIRCLE_CALIBRATION
     if not pipeline_config.FORM_CONTROL_CALIBRATION:
         if pipeline_config.FORM_PROFILE_CONFIGURED:
-            _LEGACY_YESNO_BOX_GEOMETRY.clear()
-            _LEGACY_MULTISELECT_BOX_GEOMETRY.clear()
             YESNO_BOX_CALIBRATION.clear()
             MULTISELECT_BOX_CALIBRATION.clear()
             H3_CIRCLE_CALIBRATION = (0, {})
@@ -191,12 +192,7 @@ def _apply_configured_control_calibration() -> None:
                 number for number, _group, _text, choices in pipeline_config.SURVEY_QUESTIONS
                 if pipeline_config.is_choice_list(choices)
             }
-            for calibration in (
-                _LEGACY_YESNO_BOX_GEOMETRY,
-                _LEGACY_MULTISELECT_BOX_GEOMETRY,
-                YESNO_BOX_CALIBRATION,
-                MULTISELECT_BOX_CALIBRATION,
-            ):
+            for calibration in (YESNO_BOX_CALIBRATION, MULTISELECT_BOX_CALIBRATION):
                 for question in list(calibration):
                     if question not in active_choices:
                         del calibration[question]
@@ -236,10 +232,22 @@ def _apply_configured_control_calibration() -> None:
                 **({"layouts": len(candidates)} if len(candidates) > 1 else {}),
             }
 
-    _LEGACY_YESNO_BOX_GEOMETRY.clear()
-    _LEGACY_YESNO_BOX_GEOMETRY.update(yesno_geometry)
-    _LEGACY_MULTISELECT_BOX_GEOMETRY.clear()
-    _LEGACY_MULTISELECT_BOX_GEOMETRY.update(multiselect_geometry)
+    _CONFIGURED_CONTROL_GEOMETRY.clear()
+    _CONFIGURED_CONTROL_GEOMETRY.update({
+        question: (page, boxes, "multiselect")
+        for question, (page, boxes) in multiselect_geometry.items()
+    })
+    _CONFIGURED_CONTROL_GEOMETRY.update({
+        question: (
+            candidates[0][0],
+            candidates[0][1],
+            "yesno_box",
+            candidates,
+        ) if isinstance(candidates, list) else (
+            candidates[0], candidates[1], "yesno_box",
+        )
+        for question, candidates in yesno_geometry.items()
+    })
     YESNO_BOX_CALIBRATION.clear()
     YESNO_BOX_CALIBRATION.update(yesno_semantics)
     MULTISELECT_BOX_CALIBRATION.clear()
@@ -271,13 +279,55 @@ def all_box_questions():
     """Every (question, page_idx, candidate_idx, {label: rect}, kind) the
     calibrator should emit a profile for."""
     out = []
-    for q, raw in _LEGACY_YESNO_BOX_GEOMETRY.items():
+    if pipeline_config.FORM_CALIBRATION_REFERENCE:
+        grouped = {}
+        for item in pipeline_config.FORM_CALIBRATION_REFERENCE:
+            if item["control_type"] != "checkbox":
+                continue
+            grouped.setdefault(item["question"], {}).setdefault(
+                item["layout"], (item["page"], {})
+            )[1][item["label"]] = item["rect"]
+        if grouped:
+            for question, layouts in grouped.items():
+                kind = (
+                    "multiselect"
+                    if question in pipeline_config.MULTI_SELECT_QUESTION_NUMBERS
+                    else "yesno_box"
+                )
+                for index, (_layout, (page, boxes)) in enumerate(sorted(layouts.items())):
+                    out.append((question, page, index, boxes, kind))
+            return out
+
+    if _CONFIGURED_CONTROL_GEOMETRY:
+        for question, geometry in _CONFIGURED_CONTROL_GEOMETRY.items():
+            page, boxes, kind = geometry[:3]
+            candidates = geometry[3] if len(geometry) > 3 else [(page, boxes)]
+            for index, (candidate_page, candidate_boxes) in enumerate(candidates):
+                out.append((question, candidate_page, index, candidate_boxes, kind))
+        return out
+
+    if pipeline_config.FORM_PROFILE_CONFIGURED:
+        return out
+
+    active_choices = {
+        number for number, _group, _text, choices in pipeline_config.SURVEY_QUESTIONS
+        if pipeline_config.is_choice_list(choices)
+    }
+    for q, raw in _CURRENT_TPS_YESNO_BOX_GEOMETRY.items():
+        if q not in active_choices:
+            continue
         cands = raw if isinstance(raw, list) else [raw]
         for ci, (pg, boxes) in enumerate(cands):
             out.append((q, pg, ci, boxes, "yesno_box"))
-    for q, (pg, boxes) in _LEGACY_MULTISELECT_BOX_GEOMETRY.items():
+    for q, (pg, boxes) in _CURRENT_TPS_MULTISELECT_BOX_GEOMETRY.items():
+        if q not in active_choices:
+            continue
         out.append((q, pg, 0, boxes, "multiselect"))
     return out
+
+
+def _has_multiple_box_layouts(question):
+    return sum(item[0] == question for item in all_box_questions()) > 1
 
 
 # Per-question baseline correction for questions whose baseline rect was measured
@@ -324,7 +374,7 @@ MANUAL_GEOMETRY_REFERENCE = {
 
 def _validate_box_calibration_labels() -> None:
     """Fails loudly, at import time, if this file's pixel geometry
-    (_LEGACY_YESNO_BOX_GEOMETRY, _LEGACY_MULTISELECT_BOX_GEOMETRY,
+    (_CURRENT_TPS_YESNO_BOX_GEOMETRY, _CURRENT_TPS_MULTISELECT_BOX_GEOMETRY,
     H3_CIRCLE_CALIBRATION) or its "public contract" label lists
     (YESNO_BOX_CALIBRATION, MULTISELECT_BOX_CALIBRATION) have drifted out
     of sync with the live SURVEY_QUESTIONS choice list each belongs to.
@@ -339,13 +389,9 @@ def _validate_box_calibration_labels() -> None:
     and nothing ever reports why. Only checks labels, never the pixel
     coordinates themselves (those still require a human re-measuring a
     real scan when the form's physical layout changes)."""
-    try:
-        survey_questions = importlib.import_module("step4_process_pdf").SURVEY_QUESTIONS
-    except (ImportError, AttributeError):
-        return  # step4 not importable in this environment - nothing to check against
     choice_lists = {
         number: pipeline_config.split_choices(choices)
-        for number, _group_key, _text, choices in survey_questions
+        for number, _group_key, _text, choices in pipeline_config.SURVEY_QUESTIONS
         if pipeline_config.is_choice_list(choices)
     }
     problems = []
@@ -379,12 +425,11 @@ def _validate_box_calibration_labels() -> None:
                 "choice was removed/renamed) without updating this file."
             )
 
-    for qnum, raw in _LEGACY_YESNO_BOX_GEOMETRY.items():
-        for _page, boxes in (raw if isinstance(raw, list) else [raw]):
-            _check(qnum, boxes.keys(), "_LEGACY_YESNO_BOX_GEOMETRY")
-    for qnum, (_page, boxes) in _LEGACY_MULTISELECT_BOX_GEOMETRY.items():
-        _check(qnum, boxes.keys(), "_LEGACY_MULTISELECT_BOX_GEOMETRY")
-    _check("H3", H3_CIRCLE_CALIBRATION[1].keys(), "H3_CIRCLE_CALIBRATION")
+    if not pipeline_config.FORM_CALIBRATION_REFERENCE:
+        for qnum, _page, _candidate, boxes, _kind in all_box_questions():
+            _check(qnum, boxes.keys(), "Calibration Reference")
+    if not pipeline_config.FORM_PROFILE_CONFIGURED:
+        _check("H3", H3_CIRCLE_CALIBRATION[1].keys(), "H3_CIRCLE_CALIBRATION")
     for qnum, info in YESNO_BOX_CALIBRATION.items():
         _check(qnum, info["labels"], "YESNO_BOX_CALIBRATION")
     for qnum, info in MULTISELECT_BOX_CALIBRATION.items():
@@ -419,20 +464,17 @@ QUESTION_SEMANTICS = {
 
 
 def survey_semantics_reference(survey_questions=None):
-    """Normalize step4's SURVEY_QUESTIONS for calibration artifacts.
+    """Normalize pipeline_config's question schema for calibration artifacts.
 
     Geometry remains independent (and the manual geometry remains the runtime
-    fallback), but labels and answer kinds must come from the same template
+    fallback for old configurations), but labels and answer kinds come from
+    the same template
     definition that extraction uses.  Importing lazily keeps this generator
     usable in small calibration/test environments where step4's optional
     runtime dependencies are not installed.
     """
     if survey_questions is None:
-        try:
-            survey_questions = importlib.import_module(
-                "step4_process_pdf").SURVEY_QUESTIONS
-        except (ImportError, AttributeError):
-            survey_questions = ()
+        survey_questions = pipeline_config.SURVEY_QUESTIONS
     result = {}
     for number, _group_key, text, choices in survey_questions:
         # Delegate to the one shared parser rather than hand-splitting on
@@ -503,8 +545,7 @@ def build_semantics_prompts():
     """Generate a review prompt for every manually referenced question."""
     prompts = []
     for question, page_idx, candidate_idx, boxes, kind in all_box_questions():
-        key = f"{question}#{candidate_idx}" if isinstance(
-            _LEGACY_YESNO_BOX_GEOMETRY.get(question), list) else question
+        key = f"{question}#{candidate_idx}" if _has_multiple_box_layouts(question) else question
         semantics = QUESTION_SEMANTICS.get(question)
         if semantics and semantics.get("status") == "reviewed":
             status = "Already reviewed semantics; verify the geometry."
@@ -594,8 +635,7 @@ def discover_geometry(pdf_sources, dpi=RENDER_DPI, min_confirm_rate=0.8,
                 geometry.get("boxes_confirmed", 0) /
                 geometry.get("boxes_total", 1) >= min_confirm_rate)
             candidates.setdefault(key, []).append(item)
-    expected = {f"{q}#{ci}" if isinstance(_LEGACY_YESNO_BOX_GEOMETRY.get(q), list)
-                else q
+    expected = {f"{q}#{ci}" if _has_multiple_box_layouts(q) else q
                 for q, _pg, ci, _boxes, _kind in all_box_questions()}
     for key in sorted(expected | set(candidates)):
         observations = candidates.get(key, [])
@@ -915,6 +955,116 @@ def _auto_map_question_controls(observations, semantic_reference):
     return {"maps": assigned, "unresolved": unresolved}
 
 
+REFERENCE_MATCH_MAX_CENTER_DELTA_PX = 80.0
+
+
+def _current_step2_reference_targets():
+    targets = []
+    for question, raw in _CURRENT_TPS_YESNO_BOX_GEOMETRY.items():
+        candidates = raw if isinstance(raw, list) else [raw]
+        for layout_index, (page, boxes) in enumerate(candidates, start=1):
+            for label, rect in boxes.items():
+                targets.append({
+                    "question": question, "page": page, "control_type": "checkbox",
+                    "label": label, "rect": rect, "layout": str(layout_index),
+                })
+    for question, (page, boxes) in _CURRENT_TPS_MULTISELECT_BOX_GEOMETRY.items():
+        for label, rect in boxes.items():
+            targets.append({
+                "question": question, "page": page, "control_type": "checkbox",
+                "label": label, "rect": rect, "layout": "1",
+            })
+    page, circles = _CURRENT_TPS_H3_CIRCLE_CALIBRATION
+    for label, rect in circles.items():
+        targets.append({
+            "question": "H3", "page": page, "control_type": "circle",
+            "label": label, "rect": rect, "layout": "1",
+        })
+    return targets
+
+
+def _reference_rows_for_current_layout(observation):
+    """Match PDF-detected controls to current labeled targets by page/location."""
+    detected_by_page = {
+        page["page"] - 1: page
+        for page in observation["pages"]
+    }
+    targets = _current_step2_reference_targets()
+    groups = {}
+    for target in targets:
+        groups.setdefault(
+            (target["question"], target["control_type"], target["page"]),
+            {},
+        ).setdefault(target["layout"], []).append(target)
+
+    matched = []
+    expected_count = 0
+    available_layout_count = 0
+    for (_question, control_type, page_number), layouts in groups.items():
+        page_data = detected_by_page.get(page_number)
+        if page_data is None:
+            continue
+        detected = page_data["circles"] if control_type == "circle" else page_data["boxes"]
+        available_layout_count += len(layouts)
+        candidates = []
+        for layout, layout_targets in layouts.items():
+            pairs = []
+            for target_index, target in enumerate(layout_targets):
+                target_rect = target["rect"]
+                tx = (target_rect[0] + target_rect[1]) / 2
+                ty = (target_rect[2] + target_rect[3]) / 2
+                for detected_index, rect in enumerate(detected):
+                    dx = (rect[0] + rect[1]) / 2
+                    dy = (rect[2] + rect[3]) / 2
+                    delta = ((tx - dx) ** 2 + (ty - dy) ** 2) ** 0.5
+                    if delta <= REFERENCE_MATCH_MAX_CENTER_DELTA_PX:
+                        pairs.append((delta, target_index, detected_index, rect))
+
+            used_targets, used_detections, layout_matches = set(), set(), []
+            for delta, target_index, detected_index, rect in sorted(pairs):
+                if target_index in used_targets or detected_index in used_detections:
+                    continue
+                used_targets.add(target_index)
+                used_detections.add(detected_index)
+                layout_matches.append((layout_targets[target_index], rect, delta))
+            candidates.append((layout, layout_targets, layout_matches))
+
+        selected_layout, layout_targets, layout_matches = max(
+            candidates,
+            key=lambda candidate: (
+                len(candidate[2]),
+                -sum(match[2] for match in candidate[2]),
+                candidate[0],
+            ),
+        )
+        expected_count += len(layout_targets)
+        for target, rect, delta in layout_matches:
+            matched.append({
+                **target,
+                "rect": rect,
+                "source_pdf": observation["file"],
+                "confidence": round(max(0.0, 1.0 - delta / REFERENCE_MATCH_MAX_CENTER_DELTA_PX), 3),
+                "_center_delta_px": delta,
+            })
+
+    detected_count = sum(
+        len(page["boxes"]) + len(page["circles"])
+        for page in observation["pages"]
+    )
+    deltas = [row.pop("_center_delta_px") for row in matched]
+    return matched, {
+        "expected_controls": expected_count,
+        "available_layout_candidates": available_layout_count,
+        "detected_controls": detected_count,
+        "matched_controls": len(matched),
+        "unmatched_expected_controls": expected_count - len(matched),
+        "unmatched_detected_controls": detected_count - len(matched),
+        "mean_center_delta_px": round(sum(deltas) / len(deltas), 2) if deltas else None,
+        "max_center_delta_px": round(max(deltas), 2) if deltas else None,
+        "match_max_center_delta_px": REFERENCE_MATCH_MAX_CENTER_DELTA_PX,
+    }
+
+
 
 def generate_calibration_artifact(pdf_sources, dpi=RENDER_DPI,
                                   output_path=None, survey_questions=None):
@@ -985,6 +1135,24 @@ def generate_calibration_artifact(pdf_sources, dpi=RENDER_DPI,
         "QUESTION_SEMANTICS": semantic_reference,
         "page_geometry": [page for item in observations for page in item["pages"]],
     }
+    reference_rows = []
+    if observations:
+        reference_rows, comparison = _reference_rows_for_current_layout(
+            observations[0]
+        )
+    else:
+        comparison = {
+            "expected_controls": len(_current_step2_reference_targets()),
+            "detected_controls": 0,
+            "matched_controls": 0,
+            "unmatched_expected_controls": len(_current_step2_reference_targets()),
+            "unmatched_detected_controls": 0,
+            "mean_center_delta_px": None,
+            "max_center_delta_px": None,
+            "match_max_center_delta_px": REFERENCE_MATCH_MAX_CENTER_DELTA_PX,
+        }
+    generated["CONTROL_CALIBRATION_REFERENCE"] = reference_rows
+    generated["REFERENCE_COMPARISON"] = comparison
     # Labels cannot be safely inferred from pixels. Preserve detected controls
     # in visual order and reference the canonical semantic catalog in the
     # review record rather than inventing a question/box mapping.
@@ -1028,9 +1196,9 @@ def generate_calibration_artifact(pdf_sources, dpi=RENDER_DPI,
             "step4_process_pdf.SURVEY_QUESTIONS"
             if survey_questions is None else "caller.survey_questions"
         ),
-        # Page/choice keys are deliberately not promoted to step4's
-        # question-keyed runtime maps until a reviewer maps them. Consumers
-        # must continue using their built-in manual geometry as fallback.
+        # The generated control reference is used by Step 2 for calibration
+        # measurements and comparison only. It is separate from the approved
+        # Step 4 detector geometry.
         "runtime_compatible": False,
         "generated": generated,
         "generated_python": generated_python,
@@ -1376,7 +1544,7 @@ def profile_pdf_bytes(pdf_bytes, name="(bytes)", source=None, folder=None, dpi=R
                 q_ratios.append(r)
             else:
                 rects[label] = [int(ax0), int(ax1), int(ay0), int(ay1)]
-        key = f"{q}#{cand_idx}" if isinstance(_LEGACY_YESNO_BOX_GEOMETRY.get(q), list) else q
+        key = f"{q}#{cand_idx}" if _has_multiple_box_layouts(q) else q
         result["questions"][key] = {
             "question": q, "page_idx": pg_idx, "candidate": cand_idx, "kind": kind,
             "boxes_total": len(boxes), "boxes_confirmed": confirmed,
@@ -1389,11 +1557,18 @@ def profile_pdf_bytes(pdf_bytes, name="(bytes)", source=None, folder=None, dpi=R
     # strongest confirmed geometry.  Keep inactive candidates in the profile
     # for diagnostics, but exclude them from file-level totals.
     active_keys = set(result["questions"])
-    for question, raw in _LEGACY_YESNO_BOX_GEOMETRY.items():
-        if not isinstance(raw, list):
-            continue
-        keys = [f"{question}#{index}" for index in range(len(raw))
-                if f"{question}#{index}" in result["questions"]]
+    questions_with_alternatives = {
+        question for question, *_rest in all_box_questions()
+        if _has_multiple_box_layouts(question)
+    }
+    for question in questions_with_alternatives:
+        keys = [
+            f"{question}#{index}"
+            for index, (_q, _pg, _candidate, _boxes, _kind) in enumerate(
+                item for item in all_box_questions() if item[0] == question
+            )
+            if f"{question}#{index}" in result["questions"]
+        ]
         if not keys:
             continue
         active = max(

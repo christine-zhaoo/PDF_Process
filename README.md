@@ -11,30 +11,114 @@ Every step imports its settings — GCS bucket/prefixes, GCP project, BigQuery d
 - **Form Setup** — form identity, pages per survey, detection mode, language, decline keywords, and reviewed measurement settings.
 - **Survey Questions** — one row per question, answer choices/type, page, optional format constraints, and optional Vision label anchors.
 - **Control Calibration** — reviewer-approved question/choice-to-control coordinate mappings.
-- **Calibration Review** — detected geometry suggestions, kept pending until a human maps and approves them.
+- **Calibration Reference** — automatically detected control geometry stored as a Step 2 baseline, separate from active Step 4 detector mappings.
+- **Calibration Review** — setup review items and detected geometry evidence; reference-only geometry rows do not block runtime.
 
 The question schema is required: if the workbook cannot be read, the pipeline stops with an error rather than processing with an empty or stale schema. Older workbooks without the new optional form-profile tabs remain readable using legacy defaults.
 
 Regenerate the workbook's starting point (e.g. after adding a brand-new setting to `pipeline_config.py`) with `generate_pipeline_config_doc.py`; it pre-fills from whatever the live workbook already has, so regenerating never silently discards someone's edits.
 
-python3 generate_pipeline_config_doc.py pipeline_configuration_2026.xlsx \
-  --report-year 2026 \
-  --question-overrides tps_2026_question_overrides.json \
-  --upload-blob Pipeline_Config/pipeline_configuration_2026.xlsx
-  
+```sh
+python3 generate_pipeline_config_doc.py pipeline_configuration_draft.xlsx
+```
+
+For a new form, use `--setup-from-pdf blank_form.pdf` to generate a draft. The generated control geometry is stored as a reference baseline and compared with the current Step 2 layout; it does not need separate approval and does not activate Step 4 detectors. Review the question schema and approve the form profile before uploading it to the configured pipeline workbook location; the pipeline refuses to run an unapproved profile.
 
 Some detector algorithms remain specialized to known layouts, but approved registration marks, grid parameters, and control rectangles are workbook-driven. For a new form, start in `model_only` mode; geometry detection provides suggestions only. Do not activate `hybrid` detectors until question-to-control mappings have been reviewed and approved.
 
-To start a new form from a local blank template, run:
+To start a new form from a local template, run:
 ```sh
 python3 generate_pipeline_config_doc.py pipeline_configuration_new.xlsx --setup-from-pdf blank_form.pdf
 ```
-Review every extracted question and page number, then map detected control rectangles to exact question/choice labels in **Control Calibration**. Mark each reviewed suggestion in **Calibration Review** `APPROVED`, and mark any runtime control mapping `APPROVED` before enabling `hybrid`. Keep `FORM_SETUP_STATUS` as `DRAFT` until the schema and geometry review are complete; the runtime loader refuses draft or partially reviewed profiles. The command can upload the draft workbook with `--upload-blob`, but uploading a draft does not make it runnable.
+Review the extracted question schema and page numbers. The detected rectangles and their comparison metrics are saved in **Calibration Reference** for Step 2 only; they are not approval-gated or used by Step 4. If enabling `hybrid` detection, add exact question/choice mappings to **Control Calibration** and mark those rows `APPROVED`. Keep `FORM_SETUP_STATUS` as `DRAFT` until the form schema is reviewed; the runtime loader refuses draft profiles. The command can upload the draft workbook with `--upload-blob`, but uploading a draft does not make it runnable.
+
+## Run the pipeline — configuration through Step 6
+
+Run commands from the repository root, in order. Every pipeline step loads the current workbook from the GCS location configured in `pipeline_config.py`; edit and approve the workbook there before starting. Set the bucket and prefixes below to match its `GCS_BUCKET`, `GCS_RAW_PREFIX`, and `GCS_SPLIT_PREFIX` values. Enter prefixes without a leading or trailing slash.
+
+```sh
+BUCKET="your-configured-bucket"
+RAW_PREFIX="your-raw-pdf-prefix"
+SPLIT_PREFIX="your-step1-output-prefix"
+```
+
+1. **Step 1 — organize and split the raw scans.** Preview first; `--dry-run` does not upload PDFs or write the manifest.
+   ```sh
+   python3 step1_evaluate_pdf.py --bucket "$BUCKET" --root-prefix "$RAW_PREFIX" --dry-run
+   python3 step1_evaluate_pdf.py --bucket "$BUCKET" --root-prefix "$RAW_PREFIX"
+   ```
+2. **Step 2 — calibrate all split PDFs.** This module has no command-line interface, so call `run()` with the configured output prefix. By default it appends rows to the calibration table.
+   ```sh
+   python3 -c "import step2_pdf_calibration as s; s.run('gs://${BUCKET}/${SPLIT_PREFIX}/', dry_run=True)"
+   python3 -c "import step2_pdf_calibration as s; s.run('gs://${BUCKET}/${SPLIT_PREFIX}/')"
+   ```
+3. **Step 3 — classify scan quality.** The first command previews without a BigQuery write. `vision=True` enables Gemini judging for files that need it; omit it to use pixel classification only.
+   ```sh
+   python3 -c "import step3_pdf_quality_check as s; s.run('gs://${BUCKET}/${SPLIT_PREFIX}/', dry_run=True)"
+   python3 -c "import step3_pdf_quality_check as s; s.run('gs://${BUCKET}/${SPLIT_PREFIX}/', vision=True)"
+   ```
+4. **Step 4 — extract answers.** Preview, then extract the configured questions from all split PDFs under the prefix. Extraction calls the configured model and writes BigQuery rows.
+   ```sh
+   python3 step4_process_pdf.py --bucket "$BUCKET" --root-prefix "$SPLIT_PREFIX" --dry-run
+   python3 step4_process_pdf.py --bucket "$BUCKET" --root-prefix "$SPLIT_PREFIX"
+   ```
+5. **Step 5 — build the needs-review file summary.** This queries the Step 4 response table and loads the file-quality summary. Add `--dry-run` to inspect results without writing.
+   ```sh
+   python3 step5_file_quality.py --dry-run
+   python3 step5_file_quality.py
+   ```
+6. **Export, review, and load corrections.** Step 4 exports the latest feedback workbook to its configured GCS bucket/prefix. A reviewer fills in the correction fields in that workbook; Step 6 reads the latest matching workbook and applies completed corrections to the feedback table.
+   ```sh
+   python3 step4_process_pdf.py --bucket "$BUCKET" --root-prefix "$SPLIT_PREFIX" \
+       --export-needs-review-feedback
+   # After a reviewer completes the exported workbook:
+   python3 step6_load_feedback.py
+   ```
+
+By default the pipeline uses project, dataset, table, and feedback destinations from the workbook; CLI options are available when a deliberate override is needed. Step 2 and Step 3 append their rows to BigQuery, so a rerun can add duplicate profile/QC records. Step 4's ordinary folder run replaces that folder's response rows; use its single-file option below when rerunning one PDF without replacing its sibling PDFs' rows.
+
+### Run one source PDF or one survey unit
+
+Step 1's `--only-file` matches the exact source PDF filename under the raw prefix. `--only-pages` uses **1-based, inclusive page numbers in the original source PDF** and selects one complete survey unit only: the range must match the configured `PAGES_PER_SURVEY` exactly (for example, `219-220` when that setting is 2). It does not extract arbitrary individual pages.
+
+```sh
+python3 step1_evaluate_pdf.py --bucket "$BUCKET" --root-prefix "$RAW_PREFIX" \
+    --only-file "combined_scan.pdf" --only-pages "219-220" --dry-run
+python3 step1_evaluate_pdf.py --bucket "$BUCKET" --root-prefix "$RAW_PREFIX" \
+    --only-file "combined_scan.pdf" --only-pages "219-220"
+```
+
+After Step 1, use the resulting split survey PDF's full GCS URI to restrict Steps 2 and 3 to that one file. These steps process every page in that PDF; they do not provide a page-range option.
+
+```sh
+ONE_PDF="gs://${BUCKET}/${SPLIT_PREFIX}/combined_scan/combined_scan_p110.pdf"
+python3 -c "import step2_pdf_calibration as s; s.run('${ONE_PDF}', dry_run=True)"
+python3 -c "import step2_pdf_calibration as s; s.run('${ONE_PDF}')"
+python3 -c "import step3_pdf_quality_check as s; s.run('${ONE_PDF}', dry_run=True)"
+python3 -c "import step3_pdf_quality_check as s; s.run('${ONE_PDF}', vision=True)"
+```
+
+Step 4 accepts a full GCS URI or a path relative to its `--root-prefix`. Its `--only-file` reloads only that PDF's rows (not the other PDFs in its source folder). It extracts all configured questions for the survey unit; there is no option to extract only selected pages or questions.
+
+```sh
+python3 step4_process_pdf.py --bucket "$BUCKET" --root-prefix "$SPLIT_PREFIX" \
+    --only-file "combined_scan/combined_scan_p110.pdf" --dry-run
+python3 step4_process_pdf.py --bucket "$BUCKET" --root-prefix "$SPLIT_PREFIX" \
+    --only-file "combined_scan/combined_scan_p110.pdf"
+```
+
+Step 5 can be limited to a folder name from the response rows (usually the source-name folder), but it summarizes all response files in that folder. Step 6 operates on the latest feedback workbook, not on a selected PDF; the workbook's row identifiers determine which corrections are applied.
+
+```sh
+python3 step5_file_quality.py --folders "combined_scan" --dry-run
+python3 step5_file_quality.py --folders "combined_scan"
+python3 step6_load_feedback.py
+```
 
 ## Pipeline overview
 
 ```
-step1_merge_pdf.py          step2_pdf_calibration.py     step3_pdf_quality_check.py     step4_process_pdf.py            step5_file_quality.py         step6_load_feedback.py
+step1_evaluate_pdf.py       step2_pdf_calibration.py     step3_pdf_quality_check.py     step4_process_pdf.py            step5_file_quality.py         step6_load_feedback.py
 (organize/split scans)  ->  (measure page geometry)  ->  (per-file quality check)   ->  (extract answers)           ->  (needs_review rollup)      ->  (apply human corrections)
         |                           |                            |                              |                                |                                |
   GCS: source-name folders BQ: pdf_calibration_profile   BQ: pdf_quality               BQ: survey_responses            BQ: file_quality_review        BQ: survey_responses_with_feedback
@@ -43,14 +127,14 @@ step1_merge_pdf.py          step2_pdf_calibration.py     step3_pdf_quality_check
                                                                                  ^ every step above imports from this
 ```
 
-### Step 1 — `step1_merge_pdf.py`: Organize & split scans
+### Step 1 — `step1_evaluate_pdf.py`: Organize & split scans
 Processes PDFs in GCS without depending on their naming/date format. Step 1 splits each source into units using configured `PAGES_PER_SURVEY` (two by default) and stores them in a folder named after the original PDF's filename stem (for example, `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf`). The current date is recorded in the manifest, not used as an output folder.
 
 - **Input:** loose PDFs under `gs://<bucket>/<root-prefix>/` (defaults from `pipeline_config.py`'s `GCS_BUCKET`/`GCS_RAW_PREFIX`)
 - **Output:** reorganized PDFs in per-source-name folders; a manifest loaded to BigQuery (default table `pdf_manifest_list`, from `pipeline_config.py`'s `BQ_TABLE_MANIFEST`, partitioned by `moved_date`); optional failure log CSV (`step1_failed_sources*.csv`)
 - **Usage:**
   ```
-  python step1_merge_pdf.py --bucket <bucket> --root-prefix <prefix> [--year 2025] [--dry-run] \
+  python3 step1_evaluate_pdf.py --bucket <bucket> --root-prefix <prefix> [--dry-run] \
       [--bq-project <p>] [--bq-dataset <d>] [--manifest-table pdf_manifest_list] [--no-manifest-table] \
       [--loose-only] [--only-file NAME] [--only-pages START-END] [--max-surveys N] \
       [--failure-log FILE] [--self-test]
@@ -84,18 +168,17 @@ Reads every PDF and writes one QC row per file: `overall_quality` (clear / uncle
 - **Key deps:** `numpy`, `google-cloud-bigquery`; optionally `vertexai` / `google-cloud-aiplatform` for vision-based judging
 
 ### Step 4 — `step4_process_pdf.py`: Extract answers
-The largest and core script: reads each survey PDF with a Vertex AI Gemini vision model (checkboxes/handwriting aren't in the text layer), with optional approved pixel calibration and Google Cloud Vision checks for configured written fields, flagging rows that `needs_review`. New form profiles default to `model_only`; pixel geometry is used only after reviewers approve the mappings and select hybrid mode. Files within a folder are extracted concurrently (`FILE_EXTRACTION_WORKERS` worker threads, from `pipeline_config.py`). Also owns the human-feedback export/sync (`--export-needs-review-feedback`, ingested by step 6 — see Commands below).
+The largest and core script: reads each survey PDF with a Vertex AI Gemini vision model (checkboxes/handwriting aren't in the text layer), with optional approved pixel calibration and Google Cloud Vision checks for configured written fields, flagging rows that `needs_review`. New form profiles default to `model_only`; pixel geometry is used only after reviewers approve the mappings and select hybrid mode. Files within a folder are extracted concurrently (`FILE_EXTRACTION_WORKERS` worker threads, from `pipeline_config.py`). Also owns the human-feedback export/sync (`--export-needs-review-feedback`, ingested by step 6 — see the feedback loop below).
 
 - **Input:** PDFs in source-name folders (output of step 1) in GCS; optionally step 2's `pdf_calibration_profile` as a per-file pixel-detection hint, and step 3's `pdf_quality` for routing
 - **Output:** rows in BigQuery `survey_responses` (columns include `survey_question`, `survey_answer`, `mark_position`, `needs_review`, `detection_method`, `model_confidence`, `vision_cross_check`)
 - **Usage:**
   ```
-  python step4_process_pdf.py --bucket <bucket> --root-prefix <prefix> \
-      --vertex-project <p> --vertex-location <loc> --gemini-model <model> \
-      --bq-project <p> --bq-dataset <d> --bq-table survey_responses \
-      [--no-vision-check] [--question N] [--file NAME] [--root-cause CATEGORY] \
-      [--corrections-limit N] [--list-corrections]
+  python3 step4_process_pdf.py --bucket <bucket> --root-prefix <prefix> \
+      [--only-file "source-folder/split-survey.pdf"] [--dry-run] \
+      [--no-vision-check] [--no-quality-routing] [--no-pipeline-config]
   ```
+  `--only-file` extracts and replaces rows for one PDF; it does not select individual pages or questions. The `--question`, `--file`, and `--root-cause` filters apply only to `--list-corrections`.
 - **Key deps:** `google-cloud-storage`, `google-genai` (Vertex AI/Gemini), `google-cloud-bigquery`, `google-cloud-vision`, `pypdf`, `pymupdf` (fitz), `opencv-python-headless`, `numpy`
 
 ### Step 5 — `step5_file_quality.py`: Needs-review rollup
@@ -105,7 +188,7 @@ Reads BigQuery's `survey_responses` table (from step 4) and builds a `file_quali
 - **Output:** BigQuery `file_quality_review` (partitioned by `refreshed_date`), replacing rows for processed folders each run
 - **Usage:**
   ```
-  python step5_file_quality.py --bq-project <p> --bq-dataset <d> \
+  python3 step5_file_quality.py --bq-project <p> --bq-dataset <d> \
       --survey-responses-table survey_responses --file-quality-table file_quality_review [--dry-run]
   ```
   Can also be called directly as `run(...)` from a Python shell (argparse doesn't work well in Jupyter).
@@ -118,7 +201,7 @@ Ingests the latest timestamped feedback workbook using the configured `FEEDBACK_
 - **Output:** BigQuery `survey_responses_with_feedback` — `survey_answer`/`correct_answer` overwritten, `updated_with_feedback=TRUE`, `feedback_updated_time`, `ingested_from` set on every row actually applied
 - **Usage:**
   ```
-  python step6_load_feedback.py [--bq-project <p>] [--bq-dataset <d>] \
+  python3 step6_load_feedback.py [--bq-project <p>] [--bq-dataset <d>] \
       [--survey-table survey_responses] [--feedback-table survey_responses_with_feedback] \
       [--feedback-bucket <bucket>] [--feedback-prefix <prefix>]
   ```
@@ -128,7 +211,7 @@ Ingests the latest timestamped feedback workbook using the configured `FEEDBACK_
 
 This section documents the actual decision rules, thresholds, and edge-case handling in each script, for maintainers who need to tune or debug the pipeline. The original TPS form's fixed-layout calibration and recognition rules remain as a legacy fallback for workbooks without a reviewed Form Setup profile. New form profiles use workbook-specified questions, pages, language, validation rules, anchors, and approved control geometry; they start in `model_only` mode.
 
-### Step 1 — `step1_merge_pdf.py`
+### Step 1 — `step1_evaluate_pdf.py`
 
 Step 1 does not extract or use a handwritten survey ID. It groups pages by configured `PAGES_PER_SURVEY`, preserves the input PDF stem in its output path, and records the run date only in the manifest. The language check uses `SURVEY_LANGUAGE`; a mismatch or failed check is retained for human review rather than used as a file-name/date filter. Step 1's Gemini model, language retry count, and retry delay are configurable in the Settings sheet.
 
@@ -233,7 +316,7 @@ All pixel thresholds are centrally defined and can be overridden at runtime from
 
 | File | Description |
 |---|---|
-| `step1_merge_pdf.py` … `step6_load_feedback.py` | Pipeline stages, described above |
+| `step1_evaluate_pdf.py` … `step6_load_feedback.py` | Pipeline stages, described above |
 | `pipeline_config.py` | Shared settings + survey schema, read by every step; downloads live overrides from a GCS-hosted Excel workbook at import time |
 | `generate_pipeline_config_doc.py` | Generates/regenerates that Excel workbook, pre-filled from the live workbook's current values (or `pipeline_config.py`'s built-in defaults) |
 | `generated_calibration.json` | Sample per-file geometry calibration output (step 2) |
@@ -248,24 +331,18 @@ with_feedback` (a copy of `survey_responses` plus `correct_answer`/`updated_with
 feedback`/`feedback_updated_time`/`ingested_from` - see `sync_survey_responses_with_feedback()` in
 `step4_process_pdf.py`), never `survey_responses` itself.
 
-1. **Extract one file in step 4** (or run a normal folder/full extraction instead -
-   this is just the single-file form):
+1. **Extract one file in step 4** (or run a normal folder/full extraction instead;
+   `BUCKET` and `SPLIT_PREFIX` are the values set in the run commands above):
    ```
-  python3 step4_process_pdf.py \
-    --bucket tps_survey \
-    --root-prefix "TPS_Scanned_2025_Reorgnized/" \
-    --only-file "Nov 23 2025/Nov23_5/2025_Nov_23_5_TPS_3996.pdf" \
-    --bq-project gcp-sapchoda-dev \
-    --bq-dataset ladph_tps \
-    --bq-table survey_responses \
-    --vertex-location global \
-    2>&1 | grep -Ei "ERROR|INFO.*QUALITY|INFO.*FILE|Loaded|survey_responses|Traceback" 
-
+   python3 step4_process_pdf.py \
+       --bucket "$BUCKET" \
+       --root-prefix "$SPLIT_PREFIX" \
+       --only-file "source-stem/source-stem_p1.pdf"
    ```
 
 2. **Generate the feedback Excel in step 4** - syncs `survey_responses_with_feedback`
    from `survey_responses`, then exports every `needs_review=TRUE` row not yet covered
-   by ingested feedback to a new `gs://tps_survey/TPS_Feedback/tps_feedback_{datetime}.xlsx`:
+   by ingested feedback to a new workbook under the configured feedback bucket/prefix:
    ```
    python3 step4_process_pdf.py --export-needs-review-feedback
    ```

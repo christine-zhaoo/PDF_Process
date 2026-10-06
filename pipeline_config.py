@@ -13,8 +13,9 @@ defining its own copy.
 Form-specific choices that can be reviewed safely (form page count,
 question validation metadata, detection mode, and approved control
 coordinates) are loaded from the workbook's Form Setup, Survey Questions,
-and Control Calibration tabs. A new form starts in DRAFT and cannot run
-until its extracted schema and calibration have been reviewed and approved.
+and Control Calibration tabs. Calibration Reference stores detected control
+geometry for Step 2 comparisons only. A new form starts in DRAFT and cannot
+run until its extracted schema and setup have been approved.
 
 WHERE THE VALUES BELOW ACTUALLY COME FROM: every constant below is a
 FALLBACK default for operational settings; the GCS-hosted workbook (see
@@ -82,6 +83,7 @@ FORM_INK_THRESHOLD = 165
 FORM_GRID_COLUMN_CENTERS = []
 FORM_GRID_BOX_EXPECTED_SIZE = 40
 FORM_CONTROL_CALIBRATION = []
+FORM_CALIBRATION_REFERENCE = []
 
 # ==========================================================================
 # GCP project / BigQuery dataset+tables
@@ -449,10 +451,18 @@ def _apply_survey_questions(rows: list) -> None:
             continue  # blank template/example row - skip rather than error
         group_key = row.get("Group Key") or None
         question_text = row.get("Question Text", "")
-        choices = _first_present(
-            row,
-            "Answer Choices (only for Single/Multiple Choice - separate with ' / ')",
-            "Answer Choices (separate with ' / ', leave blank for open write-in)",
+        choices_column = next(
+            (column for column in row if column.startswith("Answer Choices")),
+            None,
+        )
+        choices = (
+            row.get(choices_column, "")
+            if choices_column is not None
+            else _first_present(
+                row,
+                "Answer Choices (only for Single/Multiple Choice - separate with ' / ')",
+                "Answer Choices (separate with ' / ', leave blank for open write-in)",
+            )
         )
         survey_questions.append((number, group_key, question_text, choices))
 
@@ -677,6 +687,53 @@ def _apply_control_calibration(rows: list) -> None:
     globals()["FORM_CONTROL_CALIBRATION"] = calibration
 
 
+def _apply_calibration_reference(rows: list) -> None:
+    """Load generated per-control geometry used only as Step 2's reference."""
+    question_choices = {
+        number: split_choices(choices) if is_choice_list(choices) else []
+        for number, _group, _text, choices in SURVEY_QUESTIONS
+    }
+    reference = []
+    for _, row in rows.iterrows():
+        if not any(_clean(value) for value in row.values):
+            continue
+        question = _clean(row.get("Question Number", ""))
+        label = _clean(row.get("Choice Label", ""))
+        control_type = _clean(row.get("Control Type", "")).lower()
+        if not question or not label or control_type not in {"checkbox", "circle"}:
+            raise ValueError(
+                "Calibration Reference rows need a question number, choice "
+                "label, and Control Type of checkbox or circle."
+            )
+        if question not in question_choices or label not in question_choices[question]:
+            raise ValueError(
+                f"Calibration Reference for {question!r}/{label!r} does not "
+                "match a configured question and answer choice."
+            )
+        rect = tuple(float(row.get(column)) for column in ("Left", "Right", "Top", "Bottom"))
+        if not (rect[0] < rect[1] and rect[2] < rect[3]):
+            raise ValueError(
+                f"Invalid reference rectangle for question {question!r}, label {label!r}"
+            )
+        page = int(float(row.get("Page (1-based)"))) - 1
+        if page < 0 or page >= PAGES_PER_SURVEY:
+            raise ValueError(
+                f"Calibration Reference for question {question!r} uses page "
+                f"{page + 1}, outside the configured {PAGES_PER_SURVEY}-page form"
+            )
+        reference.append({
+            "question": question,
+            "page": page,
+            "control_type": control_type,
+            "label": label,
+            "rect": rect,
+            "layout": _clean(row.get("Layout", "")) or "1",
+            "source_pdf": _clean(row.get("Source PDF", "")),
+            "confidence": float(row.get("Confidence") or 0),
+        })
+    globals()["FORM_CALIBRATION_REFERENCE"] = reference
+
+
 def ink_cluster_limits() -> tuple[int, int, int]:
     """Return (minimum samples, minimum marks, maximum marks) for ink clustering.
 
@@ -717,11 +774,12 @@ def _validate_calibration_review(rows: list) -> None:
         _clean(row.get("Status", "")).upper()
         for _, row in rows.iterrows()
     }
-    if not statuses or statuses != {"APPROVED"}:
+    required_statuses = statuses - {"REFERENCE"}
+    if not statuses or (required_statuses and required_statuses != {"APPROVED"}):
         raise ValueError(
-            "An approved form profile requires every Calibration Review row to be "
-            "marked APPROVED. Suggested geometry must be explicitly reviewed before "
-            "the profile can run."
+            "An approved form profile requires every review item to be APPROVED; "
+            "rows marked REFERENCE are informational geometry baselines and do not "
+            "require approval."
         )
 
 
@@ -785,6 +843,13 @@ def _load_overrides() -> None:
                     "Hybrid mode's circle detector currently supports H3 only. "
                     "Use model_only until a circle mapping has a compatible detector."
                 )
+        if "Calibration Reference" in workbook.sheet_names:
+            reference_df = pd.read_excel(
+                io.BytesIO(data),
+                sheet_name="Calibration Reference",
+                keep_default_na=False,
+            )
+            _apply_calibration_reference(reference_df)
         if "Calibration Review" in workbook.sheet_names:
             review_df = pd.read_excel(io.BytesIO(data), sheet_name="Calibration Review")
             _validate_calibration_review(review_df)

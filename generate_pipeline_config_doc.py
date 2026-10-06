@@ -14,8 +14,9 @@ Usage:
 By default the workbook is pre-filled from the current settings and question
 schema. If the live workbook has no reviewed Form Setup profile, the new
 profile is deliberately DRAFT/model_only and has no active control geometry.
-Use --setup-from-pdf to generate a question and geometry-review draft for a
-new blank form; no suggestion is activated without human approval.
+Use --setup-from-pdf to generate a question-schema draft and a reference-only
+control geometry baseline for a new form. Reference geometry does not activate
+Step 4's calibrated detectors.
 """
 import argparse
 import io
@@ -339,7 +340,8 @@ def _form_setup_rows(overrides=None):
 
 
 def build_workbook(path: str, *, form_setup=None, calibration_review=None,
-                   control_rows=None, question_rows=None) -> None:
+                   control_rows=None, question_rows=None,
+                   calibration_reference_rows=None) -> None:
     wb = openpyxl.Workbook()
 
     # ---- Settings sheet ----
@@ -436,6 +438,29 @@ def build_workbook(path: str, *, form_setup=None, calibration_review=None,
     ws_cal.add_data_validation(approval_dv)
     approval_dv.add(f"J2:J{ws_cal.max_row + 200}")
 
+    ws_reference = wb.create_sheet("Calibration Reference")
+    ws_reference.append([
+        "Question Number", "Page (1-based)", "Control Type", "Choice Label",
+        "Left", "Right", "Top", "Bottom", "Layout", "Source PDF", "Confidence",
+    ])
+    selected_reference_rows = (
+        cfg.FORM_CALIBRATION_REFERENCE
+        if calibration_reference_rows is None
+        else calibration_reference_rows
+    )
+    for row in selected_reference_rows:
+        ws_reference.append([
+            row["question"], row["page"] + 1, row["control_type"], row["label"],
+            *row["rect"], row.get("layout", "1"), row.get("source_pdf", ""),
+            row.get("confidence", ""),
+        ])
+    for i, width in enumerate((18, 16, 18, 50, 14, 14, 14, 14, 12, 34, 14), start=1):
+        ws_reference.column_dimensions[get_column_letter(i)].width = width
+    _style_header(ws_reference, 11)
+    for row in ws_reference.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = WRAP
+
     ws_review = wb.create_sheet("Calibration Review")
     ws_review.append(CALIBRATION_REVIEW_HEADER)
     if calibration_review is None:
@@ -454,7 +479,14 @@ def build_workbook(path: str, *, form_setup=None, calibration_review=None,
                 "GRID_BOX_EXPECTED_SIZE",
             )
         }
-        ws_review.append(["Measured profile suggestions", "PENDING", json.dumps(summary)])
+        ws_review.append(["Measured profile reference", "REFERENCE", json.dumps(summary)])
+        comparison = generated.get("REFERENCE_COMPARISON")
+        if comparison is not None:
+            ws_review.append([
+                "Detected geometry vs current Step 2 geometry",
+                "REFERENCE",
+                json.dumps(comparison),
+            ])
         for page in calibration_review.get("page_geometry", []):
             geometry = {
                 key: page.get(key)
@@ -462,13 +494,13 @@ def build_workbook(path: str, *, form_setup=None, calibration_review=None,
             }
             ws_review.append([
                 f"Detected controls on page {page.get('page')}",
-                "PENDING",
+                "REFERENCE",
                 json.dumps(geometry),
             ])
         for item in calibration_review.get("review_prompts", []):
             ws_review.append([
                 item.get("prompt", "Review calibration"),
-                "PENDING",
+                "REFERENCE",
                 item.get("reason", ""),
             ])
     ws_review.column_dimensions["A"].width = 32
@@ -478,7 +510,9 @@ def build_workbook(path: str, *, form_setup=None, calibration_review=None,
     for row in ws_review.iter_rows(min_row=2):
         for cell in row:
             cell.alignment = WRAP
-    review_dv = DataValidation(type="list", formula1='"APPROVED,PENDING"', allow_blank=False)
+    review_dv = DataValidation(
+        type="list", formula1='"APPROVED,PENDING,REFERENCE"', allow_blank=False
+    )
     review_dv.error = "Approve only after reviewing the question/control mappings and measurements."
     review_dv.errorTitle = "Calibration review is required"
     ws_review.add_data_validation(review_dv)
@@ -507,8 +541,9 @@ def build_workbook(path: str, *, form_setup=None, calibration_review=None,
     )
     _row(
         "It contains operational Settings, a Form Setup profile, a Survey Questions schema, "
-        "reviewed Control Calibration, and a Calibration Review tab for machine-generated "
-        "geometry suggestions. New-form suggestions remain inactive until a human approves them."
+        "reviewed Control Calibration, a Step 2 Calibration Reference baseline, and a "
+        "Calibration Review tab with machine-generated evidence. The reference baseline does "
+        "not activate Step 4's detectors."
     )
     _row("")
     _row("HOW THE PIPELINE USES THIS DOCUMENT, STEP BY STEP", bold=True, size=12, fill=SECTION_FILL)
@@ -1073,14 +1108,17 @@ def main() -> None:
             calibration_review=review,
             control_rows=[],
             question_rows=question_rows,
+            calibration_reference_rows=generated.get("CONTROL_CALIBRATION_REFERENCE", []),
         )
         if args.upload_blob:
             upload_to_gcs(args.output, args.upload_blob, bucket_name=args.bucket)
         print(
             f"Created DRAFT setup for {form_setup['FORM_NAME']!r} with {len(question_rows)} "
             f"question(s) and {page_count} page(s). Review Form Setup, Survey Questions, and "
-            "Calibration Review; map controls in Control Calibration; then set FORM_SETUP_STATUS "
-            "to APPROVED. New forms default to model_only and never activate suggested geometry."
+            "Calibration Review. Detected control geometry is stored separately as a Step 2 "
+            "reference baseline and compared with the current Step 2 geometry; it does not "
+            "activate Step 4 detectors. Set FORM_SETUP_STATUS "
+            "to APPROVED. New forms default to model_only."
         )
         return
 

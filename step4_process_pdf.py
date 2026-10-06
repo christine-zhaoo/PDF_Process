@@ -4689,6 +4689,12 @@ def _validate_box_calibration_labels() -> None:
     TEXT - never touches the pixel coordinates themselves, which still have
     to be re-measured by hand against a real scan when a form's physical
     layout changes."""
+    if (
+        pipeline_config.FORM_PROFILE_CONFIGURED
+        and pipeline_config.FORM_DETECTION_MODE != "hybrid"
+    ):
+        return
+
     problems = []
 
     def _check(qnum, geometry_labels, source_name):
