@@ -41,6 +41,12 @@ MANIFEST_TABLE = "pdf_manifest_list"
 BUCKET_NAME = s1.BUCKET_NAME
 DESTINATION_PREFIX = s1._normalize_prefix(s1.DESTINATION_PREFIX)
 WORKERS = 6
+# Confirmed directly: a GCS call with no timeout can hang indefinitely on a
+# dropped connection (observed as stale CLOSE_WAIT sockets) instead of ever
+# raising - same failure mode fixed for the Gemini client in
+# step1_evaluate_pdf.py's _get_genai_client(). A bounded timeout turns a
+# silent hang into a raised exception the caller already handles.
+GCS_TIMEOUT_SECONDS = 60
 
 _print_lock = threading.Lock()
 
@@ -114,7 +120,7 @@ def check_destination_exists(bucket, row: dict) -> list:
     if not dest.startswith(prefix):
         return []
     blob_name = dest[len(prefix):]
-    if not bucket.blob(blob_name).exists():
+    if not bucket.blob(blob_name).exists(timeout=GCS_TIMEOUT_SECONDS):
         return [f"destination file does not exist in GCS: {dest}"]
     return []
 
@@ -190,13 +196,13 @@ def process_source(bucket, bq_rows_for_source: list, source_gcs_uri: str) -> lis
         return issues
     blob_name = source_gcs_uri[len(prefix):]
     blob = bucket.blob(blob_name)
-    if not blob.exists():
+    if not blob.exists(timeout=GCS_TIMEOUT_SECONDS):
         for row in bq_rows_for_source:
             issues.append((row, [f"source PDF no longer exists in GCS: {source_gcs_uri}"]))
         return issues
 
     try:
-        source_bytes = blob.download_as_bytes()
+        source_bytes = blob.download_as_bytes(timeout=GCS_TIMEOUT_SECONDS)
         source_doc = pymupdf.open(stream=source_bytes, filetype="pdf")
     except Exception as error:  # noqa: BLE001
         for row in bq_rows_for_source:
@@ -283,6 +289,12 @@ def main():
     parser.add_argument("--out", default="step1_accuracy_issues.csv")
     parser.add_argument("--limit-sources", type=int, default=None,
                          help="Only check the first N distinct source PDFs (for a quick test run).")
+    parser.add_argument("--resume", action="store_true",
+                         help="Skip source PDFs already recorded as done in <out>.done (a one-"
+                              "source-URI-per-line sidecar file), and append to --out instead of "
+                              "overwriting it - for continuing after an interrupted run (e.g. the "
+                              "machine slept mid-run) without re-spending Gemini calls on work "
+                              "already done.")
     args = parser.parse_args()
 
     bq_client = bigquery.Client(project=PROJECT)
@@ -299,6 +311,20 @@ def main():
     source_uris = sorted(by_source.keys(), key=lambda u: (u is None, u))
     if args.limit_sources:
         source_uris = source_uris[: args.limit_sources]
+
+    done_log_path = f"{args.out}.done"
+    already_done = set()
+    if args.resume:
+        try:
+            with open(done_log_path) as f:
+                already_done = {line.strip() for line in f if line.strip()}
+        except FileNotFoundError:
+            pass
+        before = len(source_uris)
+        source_uris = [uri for uri in source_uris if uri not in already_done]
+        log("Resuming: skipping %d already-checked source PDF(s), %d remaining.",
+            before - len(source_uris), len(source_uris))
+
     log("Checking %d distinct source PDFs across %d manifest rows.", len(source_uris), len(rows))
 
     all_issues = []
@@ -309,14 +335,17 @@ def main():
     def worker(source_uri):
         return process_source(bucket, by_source[source_uri], source_uri)
 
-    csv_file = open(args.out, "w", newline="")
+    csv_mode = "a" if (args.resume and already_done) else "w"
+    csv_file = open(args.out, csv_mode, newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        "source_file", "source_gcs_uri", "destination_folder", "destination_gcs_uri",
-        "source_page_range", "output_category", "rejected", "rejected_reason",
-        "needs_review", "needs_review_reason", "moved_at", "issues",
-    ])
-    csv_file.flush()
+    if csv_mode == "w":
+        csv_writer.writerow([
+            "source_file", "source_gcs_uri", "destination_folder", "destination_gcs_uri",
+            "source_page_range", "output_category", "rejected", "rejected_reason",
+            "needs_review", "needs_review_reason", "moved_at", "issues",
+        ])
+        csv_file.flush()
+    done_log_file = open(done_log_path, "a" if args.resume else "w")
 
     def write_issue_row(row, problems):
         csv_writer.writerow([
@@ -350,10 +379,13 @@ def main():
                             row.get("source_file") or row.get("source_gcs_uri"),
                             row.get("source_page_range"), " | ".join(problems))
                         write_issue_row(row, problems)
+                    done_log_file.write(f"{source_uri}\n")
+                    done_log_file.flush()
                     if completed % 10 == 0 or completed == total:
                         log("Progress: %d/%d source PDFs checked, %d issue(s) found so far.",
                             completed, total, len(all_issues))
     finally:
+        done_log_file.close()
         csv_file.close()
 
     log("Done. %d issue(s) found across %d source PDFs. Wrote %s.",

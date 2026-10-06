@@ -229,6 +229,85 @@ MANUAL_GEOMETRY_REFERENCE = {
     "grid_column_centers": GRID_COLUMN_CENTERS,
 }
 
+
+def _validate_box_calibration_labels() -> None:
+    """Fails loudly, at import time, if this file's pixel geometry
+    (_LEGACY_YESNO_BOX_GEOMETRY, _LEGACY_MULTISELECT_BOX_GEOMETRY,
+    H3_CIRCLE_CALIBRATION) or its "public contract" label lists
+    (YESNO_BOX_CALIBRATION, MULTISELECT_BOX_CALIBRATION) have drifted out
+    of sync with the live SURVEY_QUESTIONS choice list each belongs to.
+
+    Mirrors step4_process_pdf._validate_box_calibration_labels() - see its
+    docstring for the full rationale. The short version: every dict here
+    duplicates a choice's TEXT as a dictionary key or list entry, and
+    pipeline_config.py is supposed to be the ONLY place that text lives
+    (explicit user request). Without this check, an edited/renamed/removed
+    choice in the workbook silently stops matching here - this question's
+    box is dropped from all_box_questions(), gets no calibration profile,
+    and nothing ever reports why. Only checks labels, never the pixel
+    coordinates themselves (those still require a human re-measuring a
+    real scan when the form's physical layout changes)."""
+    try:
+        survey_questions = importlib.import_module("step4_process_pdf").SURVEY_QUESTIONS
+    except (ImportError, AttributeError):
+        return  # step4 not importable in this environment - nothing to check against
+    choice_lists = {
+        number: pipeline_config.split_choices(choices)
+        for number, _group_key, _text, choices in survey_questions
+        if pipeline_config.is_choice_list(choices)
+    }
+    problems = []
+
+    def _check(qnum, geometry_labels, source_name):
+        choice_labels = choice_lists.get(qnum)
+        if choice_labels is None:
+            problems.append(
+                f"{source_name}[{qnum!r}] has pixel geometry for a question that "
+                "isn't a choice-list question in the live SURVEY_QUESTIONS at all "
+                "(or that question number no longer exists) - this geometry is "
+                "now dead code."
+            )
+            return
+        geo_set, choice_set = set(geometry_labels), set(choice_labels)
+        missing = choice_set - geo_set
+        extra = geo_set - choice_set
+        if missing:
+            problems.append(
+                f"{source_name}[{qnum!r}]: SURVEY_QUESTIONS choice(s) {sorted(missing)} "
+                "have NO matching entry here - that choice will never get a "
+                "calibration profile."
+            )
+        if extra:
+            problems.append(
+                f"{source_name}[{qnum!r}]: entry exists here for label(s) "
+                f"{sorted(extra)} that are no longer in SURVEY_QUESTIONS's choice "
+                "list for this question - the workbook's wording changed (or a "
+                "choice was removed/renamed) without updating this file."
+            )
+
+    for qnum, raw in _LEGACY_YESNO_BOX_GEOMETRY.items():
+        for _page, boxes in (raw if isinstance(raw, list) else [raw]):
+            _check(qnum, boxes.keys(), "_LEGACY_YESNO_BOX_GEOMETRY")
+    for qnum, (_page, boxes) in _LEGACY_MULTISELECT_BOX_GEOMETRY.items():
+        _check(qnum, boxes.keys(), "_LEGACY_MULTISELECT_BOX_GEOMETRY")
+    _check("H3", H3_CIRCLE_CALIBRATION[1].keys(), "H3_CIRCLE_CALIBRATION")
+    for qnum, info in YESNO_BOX_CALIBRATION.items():
+        _check(qnum, info["labels"], "YESNO_BOX_CALIBRATION")
+    for qnum, info in MULTISELECT_BOX_CALIBRATION.items():
+        _check(qnum, info["labels"], "MULTISELECT_BOX_CALIBRATION")
+
+    if problems:
+        raise ValueError(
+            "Pixel-geometry/label calibration in step2_pdf_calibration.py has "
+            "drifted out of sync with the live SURVEY_QUESTIONS choice lists "
+            "loaded from the configuration workbook. Fix the affected entry "
+            "before running calibration, or the choice(s) below will silently "
+            "get no profile:\n  - " + "\n  - ".join(problems)
+        )
+
+
+_validate_box_calibration_labels()
+
 # Semantics are intentionally separate from geometry.  This records only
 # answers confirmed during review; printed wording remains pending until it is
 # supplied by a reviewer.
@@ -262,7 +341,12 @@ def survey_semantics_reference(survey_questions=None):
             survey_questions = ()
     result = {}
     for number, _group_key, text, choices in survey_questions:
-        labels = [part.strip() for part in choices.split(" / ")] if " / " in choices else []
+        # Delegate to the one shared parser rather than hand-splitting on
+        # " / " - that legacy separator still works today because the live
+        # workbook happens to still use it, but it silently returns labels=[]
+        # for every question the moment the workbook switches to the
+        # canonical "|" separator (see pipeline_config.CHOICE_SEPARATOR).
+        labels = pipeline_config.split_choices(choices)
         if labels:
             answer_type = (
                 "multi-select" if "mark all" in text.lower() else "single-choice"
