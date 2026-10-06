@@ -4517,6 +4517,84 @@ _H3_CONFIDENCE_MARGIN = 0.8  # deliberately generous - real margins measured 0.9
 _H3_BLANK_CEILING = 0.3  # winning circle's own center ink ratio below this = nothing filled in
 
 
+def _validate_box_calibration_labels() -> None:
+    """Fails loudly, at import time, if any hand-measured pixel-geometry
+    calibration dict (_YESNO_BOX_CALIBRATION, _MULTISELECT_BOX_CALIBRATION,
+    _H3_CIRCLE_CALIBRATION) has drifted out of sync with the live
+    SURVEY_QUESTIONS choice list it belongs to.
+
+    Why this exists: these calibration dicts duplicate each choice's TEXT as
+    a dictionary key (a hand-measured pixel rect keyed by the exact label
+    string, e.g. "Other (specify)") - a second copy of wording that
+    pipeline_config.py otherwise sources ENTIRELY from the configuration
+    workbook (explicit user request - see pipeline_config.py's own
+    docstring). If the workbook's wording for a choice changes, or a choice
+    is added/removed/reordered, this file's geometry is NOT updated by
+    that - it's hand-measured against one real scan and lives here
+    deliberately (see MANUAL_GEOMETRY_REFERENCE's own comment in
+    step2_pdf_calibration.py). Before this check, that drift was silent:
+    cross_check_answer()/detect_yesno_box_answers()/
+    detect_multiselect_ink_ratios() look up geometry by the NEW label text,
+    find nothing, and just treat that choice as unmeasured - no error, no
+    needs_review flag, just quietly worse pixel coverage. This turns that
+    into an import-time failure instead, so a workbook edit that breaks
+    calibration is caught immediately rather than discovered later as an
+    unexplained accuracy regression.
+
+    Only checks LABELS (dictionary keys) against SURVEY_QUESTIONS's choice
+    TEXT - never touches the pixel coordinates themselves, which still have
+    to be re-measured by hand against a real scan when a form's physical
+    layout changes."""
+    problems = []
+
+    def _check(qnum, geometry_labels, source_name):
+        choice_labels = CHOICE_LISTS_BY_NUMBER.get(qnum)
+        if choice_labels is None:
+            problems.append(
+                f"{source_name}[{qnum!r}] has pixel geometry for a question that "
+                "isn't a choice-list question in the live SURVEY_QUESTIONS at all "
+                "(or that question number no longer exists) - this geometry is "
+                "now dead code."
+            )
+            return
+        geo_set, choice_set = set(geometry_labels), set(choice_labels)
+        missing = choice_set - geo_set  # a real choice with no geometry measured
+        extra = geo_set - choice_set    # geometry for a choice that no longer exists
+        if missing:
+            problems.append(
+                f"{source_name}[{qnum!r}]: SURVEY_QUESTIONS choice(s) {sorted(missing)} "
+                "have NO matching pixel geometry entry - that choice's checkbox will "
+                "never be pixel-detected, only read by the model."
+            )
+        if extra:
+            problems.append(
+                f"{source_name}[{qnum!r}]: pixel geometry exists for label(s) "
+                f"{sorted(extra)} that are no longer in SURVEY_QUESTIONS's choice "
+                "list for this question - the workbook's wording changed (or a "
+                "choice was removed/renamed) without updating this file's "
+                "calibration."
+            )
+
+    for qnum, raw in _YESNO_BOX_CALIBRATION.items():
+        for _page, boxes in (raw if isinstance(raw, list) else [raw]):
+            _check(qnum, boxes.keys(), "_YESNO_BOX_CALIBRATION")
+    for qnum, (_page, boxes) in _MULTISELECT_BOX_CALIBRATION.items():
+        _check(qnum, boxes.keys(), "_MULTISELECT_BOX_CALIBRATION")
+    _check("H3", _H3_CIRCLE_CALIBRATION[1].keys(), "_H3_CIRCLE_CALIBRATION")
+
+    if problems:
+        raise ValueError(
+            "Pixel-geometry calibration has drifted out of sync with the live "
+            "SURVEY_QUESTIONS choice lists loaded from the configuration "
+            "workbook. Fix the calibration dict (re-measure/rename/remove the "
+            "affected entry) before running extraction, or the choice(s) below "
+            "will silently stop being pixel-detected:\n  - " + "\n  - ".join(problems)
+        )
+
+
+_validate_box_calibration_labels()
+
+
 def _locate_circle(binary_img, y0: int, y1: int, x0: int, x1: int,
                     expected_diam: float = _H3_CIRCLE_DIAM):
     """Within binary_img[y0:y1, x0:x1], finds the single circle-glyph-sized

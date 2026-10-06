@@ -152,6 +152,7 @@ MAX_CONCURRENT_VERTEX_CALLS = 4
 GEMINI_RATE_LIMIT_MAX_ATTEMPTS = 5
 GEMINI_BACKOFF_BASE_SECONDS = 2.0
 GEMINI_BACKOFF_MAX_SECONDS = 60.0
+GEMINI_REQUEST_TIMEOUT_SECONDS = 120
 
 _VERTEX_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_VERTEX_CALLS)
 _FAILURE_LOG_LOCK = threading.Lock()
@@ -399,13 +400,27 @@ def _get_genai_client():
     """Builds the Vertex-backed genai.Client used by every Gemini call site
     in this file - factored out since both call sites (language gating,
     content/declined assessment) constructed an identical client from the
-    same three constants."""
+    same three constants.
+
+    Sets an explicit per-request timeout (see GEMINI_REQUEST_TIMEOUT_SECONDS)
+    - confirmed directly running step1_accuracy_check.py (which calls these
+    same functions in a tight loop across many source PDFs): with no
+    timeout set, a single stalled network call hung indefinitely (visible as
+    stale CLOSE_WAIT sockets) instead of ever raising, so _generate_content_
+    with_limits()'s own retry/backoff logic never even got a chance to run -
+    each hung call just permanently occupied one worker thread, and the
+    whole run eventually stalled once enough threads were stuck this way.
+    A bounded timeout turns that silent hang into a raised exception
+    (handled like any other failure), rather than changing anything about a
+    normal, successful call."""
     from google import genai
+    from google.genai import types
 
     return genai.Client(
         vertexai=True,
         project=TPS_EXTRACTION_PROJECT,
         location=TPS_EXTRACTION_LOCATION,
+        http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_SECONDS * 1000),
     )
 
 
@@ -489,15 +504,30 @@ def validate_survey_language(
     ask a single, focused language question - so there's nothing else in
     the prompt to dilute the model's attention.
 
-    Returns True only when the survey is confidently identified as English.
-    Spanish, other languages, or uncertain language are rejected - i.e. this
-    is a fail-closed gate: an ambiguous model response, a response that
-    doesn't parse, or every retry attempt erroring out all return False
-    (reject), not True. This is deliberately the opposite of this module's
-    usual "advisory, never blocks the decision it supports" pattern (see
-    e.g. assess_page_content_and_declined()'s own docstring) - a language
-    gate that fails open would silently let exactly the kind of survey it
-    exists to catch through undetected."""
+    Judges ONLY the survey FORM's own printed language (the questions,
+    instructions, answer choices) - explicit user request: a respondent
+    handwriting their answer in Spanish on an English form, or vice versa
+    (an English comment on a Spanish form), is not what this gate exists to
+    catch and should NOT flag the survey for review. Only a Spanish-language
+    (or other non-English) PRINTED FORM itself - e.g. "Encuesta de la
+    Percepcion del Tratamiento" instead of "Treatment Perceptions Survey" -
+    means the survey needs a human who reads that language to review it.
+    Before this fix, the prompt judged "visible printed AND handwritten
+    text" together, so a single Spanish handwritten answer on an otherwise-
+    English form could flip the whole survey to NON_ENGLISH and flag it
+    needs_review for no real reason - confirmed against
+    step1_accuracy_check.py's findings.
+
+    Returns True only when the survey FORM is confidently identified as
+    English. A Spanish (or other non-English) form, or uncertain form
+    language, is rejected - i.e. this is a fail-closed gate: an ambiguous
+    model response, a response that doesn't parse, or every retry attempt
+    erroring out all return False (reject), not True. This is deliberately
+    the opposite of this module's usual "advisory, never blocks the
+    decision it supports" pattern (see e.g. assess_page_content_and_
+    declined()'s own docstring) - a language gate that fails open would
+    silently let exactly the kind of survey it exists to catch through
+    undetected."""
     import pymupdf
     from google.genai import types
 
@@ -505,12 +535,22 @@ def validate_survey_language(
         raise ValueError("max_attempts must be at least 1")
 
     prompt = (
-        "Look at this whole scanned survey page. Is the visible printed and "
-        "handwritten text written in English? Respond with exactly one "
-        "word: ENGLISH if all the visible text is in English, NON_ENGLISH "
-        "if any visible text (printed or handwritten) is written in a "
-        "different language, or UNCERTAIN if you cannot tell. No other "
-        "text, punctuation, or markdown."
+        "Look at this whole scanned survey page. Is the survey FORM ITSELF "
+        "- its printed questions, instructions, and answer choices (e.g. "
+        "'Strongly Agree'/'Agree'/etc., or the question text like 'Staff "
+        "treated me with respect') - written in English?\n\n"
+        "Judge ONLY the form's own printed text. Ignore the language of any "
+        "handwritten answers the respondent wrote in (a comment, an agency "
+        "name, an address) - a respondent writing their answer in Spanish "
+        "on an English form does NOT make this NON_ENGLISH, and a "
+        "respondent writing an English comment on a Spanish form does NOT "
+        "make this ENGLISH. Only the form's own printed language matters.\n\n"
+        "Respond with exactly one word: ENGLISH if the form's printed "
+        "questions/instructions/choices are in English, NON_ENGLISH if "
+        "they're written in a different language (e.g. a Spanish-language "
+        "form such as 'Encuesta de la Percepcion del Tratamiento'), or "
+        "UNCERTAIN if you cannot tell. No other text, punctuation, or "
+        "markdown."
     )
     last_error = None
     for attempt in range(1, max_attempts + 1):
