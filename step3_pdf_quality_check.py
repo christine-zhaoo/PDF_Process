@@ -81,7 +81,7 @@ FALLBACK_VISION_MODEL = None
 
 # Q27's first layout is absent from every reference file, so it is excluded
 # from the borders-readable denominator.
-_ABSENT_LAYOUTS = ("27#0",)
+_ABSENT_LAYOUTS = ("27#0",) if not pipeline_config.FORM_CONTROL_CALIBRATION else ()
 
 # ==========================================================================
 # calibration baseline — measured box geometry, identical to step2_pdf_
@@ -96,8 +96,16 @@ BASELINE_MARKS = {
     0: ((184.0, 223.0), (2384.0, 224.0), (176.0, 3120.0), (2374.0, 3119.0)),
     1: ((193.0, 211.0), (2380.0, 209.0), (200.0, 3107.0), (2377.0, 3106.0)),
 }
-INK_THRESHOLD = 165
-GRID_COLUMN_CENTERS = (1661.75, 1790.4, 1919.6, 2049.9, 2179.6, 2309.1)
+BASELINE_MARKS = (
+    pipeline_config.FORM_BASELINE_MARKS
+    if pipeline_config.FORM_PROFILE_CONFIGURED else BASELINE_MARKS
+)
+INK_THRESHOLD = pipeline_config.FORM_INK_THRESHOLD
+GRID_COLUMN_CENTERS = (
+    pipeline_config.FORM_GRID_COLUMN_CENTERS
+    if pipeline_config.FORM_PROFILE_CONFIGURED
+    else (1661.75, 1790.4, 1919.6, 2049.9, 2179.6, 2309.1)
+)
 
 YESNO_BOX_CALIBRATION = {
     "19": (0, {
@@ -160,6 +168,7 @@ YESNO_BOX_CALIBRATION = {
         "No criminal justice involvement": (1354, 1388, 2912, 2945),
     }),
 }
+
 MULTISELECT_BOX_CALIBRATION = {
     "33": (1, {
         "American Indian/Alaskan Native": (1357, 1392, 1618, 1652), "Asian": (1357, 1392, 1671, 1705),
@@ -176,7 +185,42 @@ MULTISELECT_BOX_CALIBRATION = {
         "Other (specify)": (1360, 1389, 2389, 2418), "None": (1360, 1389, 2444, 2473),
     }),
 }
-QUESTION_BASELINE_CORRECTION = {"31": (0.0, 23.0), "33": (0.0, 17.0), "34": (0.0, 16.0)}
+if pipeline_config.FORM_PROFILE_CONFIGURED:
+    configured_yesno = {}
+    configured_multiselect = {}
+    for item in pipeline_config.FORM_CONTROL_CALIBRATION:
+        if item["control_type"] != "checkbox":
+            continue
+        question = item["question"]
+        page = item["page"]
+        label = item["label"]
+        rect = item["rect"]
+        if question in pipeline_config.MULTI_SELECT_QUESTION_NUMBERS:
+            entry = configured_multiselect.setdefault(question, (page, {}))
+            if entry[0] != page:
+                raise ValueError(f"Multi-select question {question!r} spans multiple pages")
+            entry[1][label] = rect
+        else:
+            layout = str(item["layout"])
+            configured_yesno.setdefault(question, {}).setdefault(
+                layout, (page, {})
+            )[1][label] = rect
+
+    YESNO_BOX_CALIBRATION = {}
+    for question, layouts in configured_yesno.items():
+        candidates = [
+            calibration
+            for _layout, calibration in sorted(layouts.items(), key=lambda entry: entry[0])
+        ]
+        YESNO_BOX_CALIBRATION[question] = (
+            candidates if len(candidates) > 1 else candidates[0]
+        )
+    MULTISELECT_BOX_CALIBRATION = configured_multiselect
+QUESTION_BASELINE_CORRECTION = (
+    {}
+    if pipeline_config.FORM_PROFILE_CONFIGURED
+    else {"31": (0.0, 23.0), "33": (0.0, 17.0), "34": (0.0, 16.0)}
+)
 SEARCH_BOUND = 22
 REG_MARK_SIZE, REG_MARK_SIZE_TOL, REG_MARK_FILL = 74, 28, 0.75
 CONFIRM_PAD = 8
@@ -585,6 +629,8 @@ def _margin_shadow(binary, marks):
 def _grid_overflow_rows(binary):
     import cv2
     import numpy as np
+    if len(GRID_COLUMN_CENTERS) != 6:
+        return None
     H, W = binary.shape
     hk = cv2.getStructuringElement(cv2.MORPH_RECT, (60, 1))
     hl = cv2.dilate(cv2.erode(binary, hk), hk)
@@ -1329,8 +1375,3 @@ def explain(r):
 # ==========================================================================
 
 # df = run("gs://tps_survey/TPS_Scanned_2025_Reorgnized/Nov 23 2025/", vision=True)
-
-
-
-
-

@@ -148,6 +148,9 @@ _QUESTION_PAGE_NUMBER = {
     "24": 2, "25": 2, "26": 2, "27": 2, "28": 2, "29": 2, "30": 2,
     "31": 2, "32": 2, "33": 2, "34": 2, "35": 2,
 }
+for _question_number, _metadata in pipeline_config.QUESTION_METADATA_BY_NUMBER.items():
+    if "page" in _metadata:
+        _QUESTION_PAGE_NUMBER[_question_number] = int(_metadata["page"]) + 1
 
 
 def _question_number_from_text(survey_question: str, question_number_by_text: dict) -> str:

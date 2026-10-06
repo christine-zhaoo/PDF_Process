@@ -177,6 +177,96 @@ MULTISELECT_BOX_CALIBRATION = {
 }
 
 
+def _apply_configured_control_calibration() -> None:
+    global H3_CIRCLE_CALIBRATION
+    if not pipeline_config.FORM_CONTROL_CALIBRATION:
+        if pipeline_config.FORM_PROFILE_CONFIGURED:
+            _LEGACY_YESNO_BOX_GEOMETRY.clear()
+            _LEGACY_MULTISELECT_BOX_GEOMETRY.clear()
+            YESNO_BOX_CALIBRATION.clear()
+            MULTISELECT_BOX_CALIBRATION.clear()
+            H3_CIRCLE_CALIBRATION = (0, {})
+        else:
+            active_choices = {
+                number for number, _group, _text, choices in pipeline_config.SURVEY_QUESTIONS
+                if pipeline_config.is_choice_list(choices)
+            }
+            for calibration in (
+                _LEGACY_YESNO_BOX_GEOMETRY,
+                _LEGACY_MULTISELECT_BOX_GEOMETRY,
+                YESNO_BOX_CALIBRATION,
+                MULTISELECT_BOX_CALIBRATION,
+            ):
+                for question in list(calibration):
+                    if question not in active_choices:
+                        del calibration[question]
+            if "H3" not in active_choices:
+                H3_CIRCLE_CALIBRATION = (0, {})
+        return
+
+    by_question = {}
+    circles = {}
+    for item in pipeline_config.FORM_CONTROL_CALIBRATION:
+        question = item["question"]
+        page = item["page"]
+        label = item["label"]
+        rect = item["rect"]
+        if item["control_type"] == "circle":
+            circles.setdefault(question, {})[label] = rect
+            continue
+        layout = str(item["layout"])
+        by_question.setdefault(question, {}).setdefault(layout, (page, {}))[1][label] = rect
+
+    yesno_geometry, multiselect_geometry = {}, {}
+    yesno_semantics, multiselect_semantics = {}, {}
+    for question, layouts in by_question.items():
+        ordered = sorted(layouts.items(), key=lambda entry: entry[0])
+        if question in pipeline_config.MULTI_SELECT_QUESTION_NUMBERS:
+            if len(ordered) != 1:
+                raise ValueError(f"Multi-select question {question!r} cannot have multiple layouts")
+            page, boxes = ordered[0][1]
+            multiselect_geometry[question] = (page, boxes)
+            multiselect_semantics[question] = {"page": page, "labels": list(boxes)}
+        else:
+            candidates = [value for _layout, value in ordered]
+            yesno_geometry[question] = candidates if len(candidates) > 1 else candidates[0]
+            yesno_semantics[question] = {
+                "page": candidates[0][0],
+                "labels": list(candidates[0][1]),
+                **({"layouts": len(candidates)} if len(candidates) > 1 else {}),
+            }
+
+    _LEGACY_YESNO_BOX_GEOMETRY.clear()
+    _LEGACY_YESNO_BOX_GEOMETRY.update(yesno_geometry)
+    _LEGACY_MULTISELECT_BOX_GEOMETRY.clear()
+    _LEGACY_MULTISELECT_BOX_GEOMETRY.update(multiselect_geometry)
+    YESNO_BOX_CALIBRATION.clear()
+    YESNO_BOX_CALIBRATION.update(yesno_semantics)
+    MULTISELECT_BOX_CALIBRATION.clear()
+    MULTISELECT_BOX_CALIBRATION.update(multiselect_semantics)
+    h3_page = next(
+        (
+            item["page"] for item in pipeline_config.FORM_CONTROL_CALIBRATION
+            if item["control_type"] == "circle" and item["question"] == "H3"
+        ),
+        0,
+    )
+    H3_CIRCLE_CALIBRATION = (h3_page, circles.get("H3", {}))
+
+
+_apply_configured_control_calibration()
+BASELINE_MARKS = (
+    pipeline_config.FORM_BASELINE_MARKS
+    if pipeline_config.FORM_PROFILE_CONFIGURED else BASELINE_MARKS
+)
+INK_THRESHOLD = pipeline_config.FORM_INK_THRESHOLD
+GRID_COLUMN_CENTERS = (
+    pipeline_config.FORM_GRID_COLUMN_CENTERS
+    if pipeline_config.FORM_PROFILE_CONFIGURED else GRID_COLUMN_CENTERS
+)
+GRID_BOX_EXPECTED_SIZE = pipeline_config.FORM_GRID_BOX_EXPECTED_SIZE
+
+
 def all_box_questions():
     """Every (question, page_idx, candidate_idx, {label: rect}, kind) the
     calibrator should emit a profile for."""
@@ -193,7 +283,7 @@ def all_box_questions():
 # Per-question baseline correction for questions whose baseline rect was measured
 # against a DIFFERENT reference file than CALIBRATION_SOURCE. Measured on a 10-file 
 # reference corpus; a property of the printed template, not of any one scan.
-QUESTION_BASELINE_CORRECTION = {
+QUESTION_BASELINE_CORRECTION = {} if pipeline_config.FORM_PROFILE_CONFIGURED else {
     "31": (0.0, 23.0),
     "33": (0.0, 17.0),
     "34": (0.0, 16.0),
@@ -261,6 +351,8 @@ def _validate_box_calibration_labels() -> None:
     def _check(qnum, geometry_labels, source_name):
         choice_labels = choice_lists.get(qnum)
         if choice_labels is None:
+            if not geometry_labels:
+                return
             problems.append(
                 f"{source_name}[{qnum!r}] has pixel geometry for a question that "
                 "isn't a choice-list question in the live SURVEY_QUESTIONS at all "
@@ -921,8 +1013,9 @@ def generate_calibration_artifact(pdf_sources, dpi=RENDER_DPI,
         "reason": "pixel geometry does not establish answer semantics",
         "question_semantics": semantic_reference,
     }, {
-        "prompt": "Confirm which detected x-coordinate clusters form the six-column grid "
-                  "and which rectangles belong to each question.",
+        "prompt": "Confirm whether any detected x-coordinate clusters form a fixed-column "
+                  "response grid and map each detected control rectangle to its printed "
+                  "question and choice.",
         "reason": "box detection alone cannot distinguish the grid from question controls",
     }]
     artifact = {

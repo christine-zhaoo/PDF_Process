@@ -81,6 +81,7 @@ import argparse
 import concurrent.futures
 import csv
 import datetime
+import json
 import logging
 import re
 import sys
@@ -104,19 +105,18 @@ import pipeline_config
 BUCKET_NAME = pipeline_config.GCS_BUCKET
 ROOT_PREFIX = pipeline_config.GCS_RAW_PREFIX
 DESTINATION_PREFIX = pipeline_config.GCS_SPLIT_PREFIX
-PAGES_PER_SURVEY = 2
-TPS_EXTRACTION_MODEL = pipeline_config.TPS_EXTRACTION_MODEL
-# Name kept as-is (not renamed) even though step1 no longer extracts any TPS
-# number at all - explicit user request, survey identity is now purely the
-# source file name + page range (see split_combined_pdf()). This model is
-# still used for every remaining Gemini call here (language gating, blank/
-# declined/scribble checking) - keeping ONE model across all of them rather
-# than mixing in a stronger/costlier one for just one check. See
-# pipeline_config.py's TPS_EXTRACTION_MODEL for the model actually in effect.
-TPS_EXTRACTION_LOCATION = pipeline_config.VERTEX_LOCATION
-TPS_EXTRACTION_PROJECT = pipeline_config.GCP_PROJECT_ID
-TPS_EXTRACTION_MAX_ATTEMPTS = 3
-TPS_EXTRACTION_RETRY_DELAY_SECONDS = 2
+PAGES_PER_SURVEY = pipeline_config.PAGES_PER_SURVEY
+STEP1_CLASSIFICATION_MODEL = pipeline_config.STEP1_CLASSIFICATION_MODEL
+STEP1_CLASSIFICATION_LOCATION = pipeline_config.VERTEX_LOCATION
+STEP1_CLASSIFICATION_PROJECT = pipeline_config.GCP_PROJECT_ID
+STEP1_LANGUAGE_CHECK_MAX_ATTEMPTS = pipeline_config.STEP1_CHECK_MAX_ATTEMPTS
+STEP1_CHECK_RETRY_DELAY_SECONDS = pipeline_config.STEP1_CHECK_RETRY_DELAY_SECONDS
+# Retain former module names for scripts that import them directly.
+TPS_EXTRACTION_MODEL = STEP1_CLASSIFICATION_MODEL
+TPS_EXTRACTION_LOCATION = STEP1_CLASSIFICATION_LOCATION
+TPS_EXTRACTION_PROJECT = STEP1_CLASSIFICATION_PROJECT
+TPS_EXTRACTION_MAX_ATTEMPTS = STEP1_LANGUAGE_CHECK_MAX_ATTEMPTS
+TPS_EXTRACTION_RETRY_DELAY_SECONDS = STEP1_CHECK_RETRY_DELAY_SECONDS
 BQ_PROJECT = pipeline_config.GCP_PROJECT_ID
 BQ_DATASET = pipeline_config.BQ_DATASET
 MANIFEST_TABLE = pipeline_config.BQ_TABLE_MANIFEST
@@ -146,7 +146,7 @@ RUN_TOKEN_TOTALS = {
 # rejections also surface as) is far more expensive to recover from - via
 # _generate_content_with_limits()'s backoff-and-retry - than just running a
 # bit slower. Tune upward only after confirming headroom in the actual
-# Vertex quota for TPS_EXTRACTION_PROJECT/TPS_EXTRACTION_LOCATION.
+# Vertex quota for STEP1_CLASSIFICATION_PROJECT/STEP1_CLASSIFICATION_LOCATION.
 SOURCE_PDF_WORKERS = 4
 MAX_CONCURRENT_VERTEX_CALLS = 4
 GEMINI_RATE_LIMIT_MAX_ATTEMPTS = 5
@@ -418,8 +418,8 @@ def _get_genai_client():
 
     return genai.Client(
         vertexai=True,
-        project=TPS_EXTRACTION_PROJECT,
-        location=TPS_EXTRACTION_LOCATION,
+        project=STEP1_CLASSIFICATION_PROJECT,
+        location=STEP1_CLASSIFICATION_LOCATION,
         http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_SECONDS * 1000),
     )
 
@@ -479,8 +479,8 @@ def _generate_content_with_limits(client, model: str, contents: list, label: str
 
 def validate_survey_language(
     page,
-    model: str = TPS_EXTRACTION_MODEL,
-    max_attempts: int = TPS_EXTRACTION_MAX_ATTEMPTS,
+    model: str = STEP1_CLASSIFICATION_MODEL,
+    max_attempts: int = STEP1_LANGUAGE_CHECK_MAX_ATTEMPTS,
 ) -> bool:
     """The dedicated language gate for a survey - explicit user request,
     replacing two earlier, weaker attempts at the same check:
@@ -534,24 +534,39 @@ def validate_survey_language(
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
 
-    prompt = (
-        "Look at this whole scanned survey page. Is the survey FORM ITSELF "
-        "- its printed questions, instructions, and answer choices (e.g. "
-        "'Strongly Agree'/'Agree'/etc., or the question text like 'Staff "
-        "treated me with respect') - written in English?\n\n"
-        "Judge ONLY the form's own printed text. Ignore the language of any "
-        "handwritten answers the respondent wrote in (a comment, an agency "
-        "name, an address) - a respondent writing their answer in Spanish "
-        "on an English form does NOT make this NON_ENGLISH, and a "
-        "respondent writing an English comment on a Spanish form does NOT "
-        "make this ENGLISH. Only the form's own printed language matters.\n\n"
-        "Respond with exactly one word: ENGLISH if the form's printed "
-        "questions/instructions/choices are in English, NON_ENGLISH if "
-        "they're written in a different language (e.g. a Spanish-language "
-        "form such as 'Encuesta de la Percepcion del Tratamiento'), or "
-        "UNCERTAIN if you cannot tell. No other text, punctuation, or "
-        "markdown."
+    generic_language_check = (
+        pipeline_config.FORM_PROFILE_CONFIGURED
+        or pipeline_config.FORM_DETECTION_MODE == "model_only"
     )
+    if generic_language_check:
+        expected_language = pipeline_config.SURVEY_LANGUAGE
+        prompt = (
+            f"Look at this scanned survey page and determine whether the form's "
+            f"own printed questions, instructions, and answer choices are written "
+            f"in {expected_language}. Ignore the language of handwritten responses. "
+            f"Respond with exactly one word: MATCH if the printed form language is "
+            f"{expected_language}, OTHER_LANGUAGE if it is another language, or "
+            "UNCERTAIN if you cannot tell. No other text, punctuation, or markdown."
+        )
+    else:
+        prompt = (
+            "Look at this whole scanned survey page. Is the survey FORM ITSELF "
+            "- its printed questions, instructions, and answer choices (e.g. "
+            "'Strongly Agree'/'Agree'/etc., or the question text like 'Staff "
+            "treated me with respect') - written in English?\n\n"
+            "Judge ONLY the form's own printed text. Ignore the language of any "
+            "handwritten answers the respondent wrote in (a comment, an agency "
+            "name, an address) - a respondent writing their answer in Spanish "
+            "on an English form does NOT make this NON_ENGLISH, and a "
+            "respondent writing an English comment on a Spanish form does NOT "
+            "make this ENGLISH. Only the form's own printed language matters.\n\n"
+            "Respond with exactly one word: ENGLISH if the form's printed "
+            "questions/instructions/choices are in English, NON_ENGLISH if "
+            "they're written in a different language (e.g. a Spanish-language "
+            "form such as 'Encuesta de la Percepcion del Tratamiento'), or "
+            "UNCERTAIN if you cannot tell. No other text, punctuation, or "
+            "markdown."
+        )
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -580,11 +595,17 @@ def validate_survey_language(
                     total_tokens,
                 )
             verdict = (response.text or "").strip().upper()
-            if verdict == "ENGLISH":
+            if verdict == ("MATCH" if generic_language_check else "ENGLISH"):
                 return True
-            if verdict in ("NON_ENGLISH", "UNCERTAIN"):
+            if verdict in (
+                ("OTHER_LANGUAGE", "UNCERTAIN")
+                if generic_language_check
+                else ("NON_ENGLISH", "UNCERTAIN")
+            ):
                 return False
-            last_error = ValueError(f"language gate returned {verdict!r}; expected ENGLISH/NON_ENGLISH/UNCERTAIN")
+            last_error = ValueError(
+                f"language gate returned {verdict!r}; expected a recognized language verdict"
+            )
         except Exception as error:  # noqa: BLE001 - retry, then fail closed (reject) below
             last_error = error
 
@@ -594,12 +615,12 @@ def validate_survey_language(
                 attempt,
                 max_attempts,
                 last_error,
-                TPS_EXTRACTION_RETRY_DELAY_SECONDS,
+                STEP1_CHECK_RETRY_DELAY_SECONDS,
             )
-            time.sleep(TPS_EXTRACTION_RETRY_DELAY_SECONDS)
+            time.sleep(STEP1_CHECK_RETRY_DELAY_SECONDS)
 
     status(
-        "[GEMINI] Survey language gate failed after %d attempt(s) (%s); rejecting (fail-closed).",
+        "[GEMINI] Survey language gate failed after %d attempt(s) (%s); marking for review.",
         max_attempts, last_error,
     )
     return False
@@ -608,7 +629,8 @@ def validate_survey_language(
 def assess_page_content_and_declined(
     page,
     second_page=None,
-    model: str = TPS_EXTRACTION_MODEL,
+    model: str = STEP1_CLASSIFICATION_MODEL,
+    additional_pages=None,
 ) -> tuple:
     """Combined content-quality + declined-marking check for a full survey,
     in a single Gemini call. Previously this was two separate calls
@@ -662,11 +684,21 @@ def assess_page_content_and_declined(
     import pymupdf
     from google.genai import types
 
+    all_pages = [page]
+    if second_page is not None:
+        all_pages.append(second_page)
+    all_pages.extend(additional_pages or [])
+    if second_page is None and additional_pages:
+        second_page = additional_pages[0]
     page_description = (
         "this scanned 2-page survey (the first image is page 1, the second "
         "image is page 2)" if second_page is not None else
         "this scanned survey page"
     )
+    if pipeline_config.FORM_PROFILE_CONFIGURED and len(all_pages) > 1:
+        page_description = (
+            f"this scanned {len(all_pages)}-page {pipeline_config.FORM_NAME} survey"
+        )
     blank_scope = (
         "anywhere across BOTH pages - the numbered-question answer grid on "
         "page 1, AND page 2's Q24 written comment box and its Q25-35 "
@@ -689,7 +721,29 @@ def assess_page_content_and_declined(
         "ANYWHERE on the page - across the answer grid, in the margins, or "
         "above the printed header at the very top"
     )
-    prompt = (
+    if (
+        pipeline_config.FORM_PROFILE_CONFIGURED
+        or pipeline_config.FORM_DETECTION_MODE == "model_only"
+    ):
+        question_catalog = "\n".join(
+            f"- {number}: {question_text}"
+            for number, _group, question_text, _choices in pipeline_config.SURVEY_QUESTIONS
+        )
+        decline_terms = json.dumps(pipeline_config.DECLINED_KEYWORDS, ensure_ascii=False)
+        prompt = (
+            f"Review {page_description} as a whole. Use the configured question list "
+            "below to decide whether any survey answer is present; do not count a "
+            "header-only identifier/date as a completed answer. Return exactly two "
+            "space-separated tokens. First token: OK if content is legible, BLANK if "
+            "no survey answer is filled, or UNREADABLE if the survey content cannot be "
+            "read. Second token: DECLINED_WORD if a clearly written decline term from "
+            f"{decline_terms} appears, DECLINED_SCRIBBLE only for an unmistakable "
+            "intentional cancellation across the survey, or NOT_DECLINED otherwise. "
+            "Do not classify ordinary answer marks as cancellation. Questions:\n"
+            f"{question_catalog}"
+        )
+    else:
+        prompt = (
         f"Look at {page_description} as a whole and answer two "
         "questions about it, responding with exactly two words separated by "
         "a space (no other text).\n\n"
@@ -787,14 +841,13 @@ def assess_page_content_and_declined(
         "Otherwise respond NOT_DECLINED.\n\n"
         "Example response: 'OK NOT_DECLINED', 'UNREADABLE DECLINED_WORD', "
         "or 'BLANK NOT_DECLINED'."
-    )
+        )
     try:
-        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
-        image_parts = [types.Part.from_bytes(data=pixmap.tobytes("png"), mime_type="image/png")]
-        if second_page is not None:
-            second_pixmap = second_page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+        image_parts = []
+        for form_page in all_pages:
+            pixmap = form_page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
             image_parts.append(
-                types.Part.from_bytes(data=second_pixmap.tobytes("png"), mime_type="image/png")
+                types.Part.from_bytes(data=pixmap.tobytes("png"), mime_type="image/png")
             )
         client = _get_genai_client()
         response = _generate_content_with_limits(
@@ -889,7 +942,10 @@ def split_combined_pdf(
             # whole-source failure (there's no clean per-survey page range to
             # extract) - manifest-only, unlike the per-survey categories below.
             if not validate_survey_language(source_doc[0]):
-                rejected_reason = f"{rejected_reason}; Also: the PDF is in a language other than English"
+                rejected_reason = (
+                    f"{rejected_reason}; Also: the PDF is in a language other than "
+                    f"{pipeline_config.SURVEY_LANGUAGE}"
+                )
             content_issue, _decline_marking = assess_page_content_and_declined(source_doc[0])
             if content_issue:
                 rejected_reason = f"{rejected_reason}; Also: {content_issue}"
@@ -932,13 +988,21 @@ def split_combined_pdf(
             # translates it, instead of being discarded outright.
             language_note = None
             if not validate_survey_language(source_doc[start]):
-                language_note = "The survey appears to be written in a language other than English"
+                language_note = (
+                    "The survey appears to be written in a language other than "
+                    f"{pipeline_config.SURVEY_LANGUAGE}"
+                )
 
             # Page 2 is passed too (when this survey unit has one) so BLANK is
             # judged across the whole survey, not just page 1's answer grid -
             # see assess_page_content_and_declined()'s docstring for why.
-            second_page = source_doc[start + 1] if start + 1 < len(source_doc) else None
-            content_issue, decline_marking = assess_page_content_and_declined(source_doc[start], second_page)
+            additional_pages = [
+                source_doc[index]
+                for index in range(start + 1, min(start + pages_per_survey, len(source_doc)))
+            ]
+            content_issue, decline_marking = assess_page_content_and_declined(
+                source_doc[start], additional_pages=additional_pages
+            )
 
             # Rule priority (explicit user request, in this order):
             #   1. A written 'Declined' word wins over EVERYTHING - including
@@ -1125,13 +1189,18 @@ def reconcile_manifest_rows_for_complete_source(
                     language_note = None
                     if not validate_survey_language(source_doc[start]):
                         language_note = (
-                            "The survey appears to be written in a language other than English"
+                            "The survey appears to be written in a language other than "
+                            f"{pipeline_config.SURVEY_LANGUAGE}"
                         )
-                    second_page = (
-                        source_doc[start + 1] if start + 1 < page_count else None
-                    )
                     content_issue, decline_marking = assess_page_content_and_declined(
-                        source_doc[start], second_page
+                        source_doc[start],
+                        additional_pages=[
+                            source_doc[index]
+                            for index in range(
+                                start + 1,
+                                min(start + PAGES_PER_SURVEY, page_count),
+                            )
+                        ],
                     )
 
                     rejected_reason = None

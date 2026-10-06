@@ -6,11 +6,14 @@ This repo processes scanned LADPH survey PDFs end-to-end: organizing raw scans, 
 
 Every step imports its settings — GCS bucket/prefixes, GCP project, BigQuery dataset/table names, Gemini/Vision model names, extraction thresholds, and the entire survey question schema (questions, answer choices, and per-question verification rules) — from `pipeline_config.py`, instead of hardcoding its own copy. This is what makes it possible to point the whole pipeline at a different bucket/project, or port it to a **different survey PDF entirely**, without touching any step's code.
 
-`pipeline_config.py` itself downloads a human-editable Excel workbook from GCS (`gs://<bucket>/Pipeline_Config/pipeline_configuration.xlsx` — see `_CONFIG_GCS_BUCKET`/`_CONFIG_GCS_BLOB` at the top of the file) every time any step runs, and overrides its own built-in fallback defaults with whatever that workbook says. The workbook has two tabs:
+`pipeline_config.py` itself downloads a human-editable Excel workbook from GCS (`gs://<bucket>/Pipeline_Config/pipeline_configuration.xlsx` — see `_CONFIG_GCS_BUCKET`/`_CONFIG_GCS_BLOB` at the top of the file) every time any step runs. The workbook contains:
 - **Settings** — one row per scalar setting (bucket, project, table names, model names, thresholds), with a plain-language question, the current answer, and where to find that value.
-- **Survey Questions** — one row per question on the form, its answer choices, and how it should be read/verified (single choice / multiple choice / short written answer / long written answer / unchecked written answer), plus which page it's on and how disagreements between the AI model, the pixel detector, and Cloud Vision's OCR should be resolved for that question.
+- **Form Setup** — form identity, pages per survey, detection mode, language, decline keywords, and reviewed measurement settings.
+- **Survey Questions** — one row per question, answer choices/type, page, optional format constraints, and optional Vision label anchors.
+- **Control Calibration** — reviewer-approved question/choice-to-control coordinate mappings.
+- **Calibration Review** — detected geometry suggestions, kept pending until a human maps and approves them.
 
-If the workbook is unreachable (moved, deleted, no network), every step falls back to the values hardcoded in `pipeline_config.py` and prints a `[pipeline_config] WARNING`, rather than failing — but a fallback means the workbook's edits aren't taking effect, so treat that warning as something to fix.
+The question schema is required: if the workbook cannot be read, the pipeline stops with an error rather than processing with an empty or stale schema. Older workbooks without the new optional form-profile tabs remain readable using legacy defaults.
 
 Regenerate the workbook's starting point (e.g. after adding a brand-new setting to `pipeline_config.py`) with `generate_pipeline_config_doc.py`; it pre-fills from whatever the live workbook already has, so regenerating never silently discards someone's edits.
 
@@ -20,7 +23,13 @@ python3 generate_pipeline_config_doc.py pipeline_configuration_2026.xlsx \
   --upload-blob Pipeline_Config/pipeline_configuration_2026.xlsx
   
 
-**Pixel-level calibration is deliberately NOT in this workbook** — exact checkbox x/y coordinates, anchor label text, confusable handwritten-digit pairs, and ink thresholds live in step1–step4's own code, because they're tied to this exact form's physical print layout. Porting to a genuinely different PDF format requires re-measuring that geometry against the new form (see step 2), not just editing a config value.
+Some detector algorithms remain specialized to known layouts, but approved registration marks, grid parameters, and control rectangles are workbook-driven. For a new form, start in `model_only` mode; geometry detection provides suggestions only. Do not activate `hybrid` detectors until question-to-control mappings have been reviewed and approved.
+
+To start a new form from a local blank template, run:
+```sh
+python3 generate_pipeline_config_doc.py pipeline_configuration_new.xlsx --setup-from-pdf blank_form.pdf
+```
+Review every extracted question and page number, then map detected control rectangles to exact question/choice labels in **Control Calibration**. Mark each reviewed suggestion in **Calibration Review** `APPROVED`, and mark any runtime control mapping `APPROVED` before enabling `hybrid`. Keep `FORM_SETUP_STATUS` as `DRAFT` until the schema and geometry review are complete; the runtime loader refuses draft or partially reviewed profiles. The command can upload the draft workbook with `--upload-blob`, but uploading a draft does not make it runnable.
 
 ## Pipeline overview
 
@@ -28,14 +37,14 @@ python3 generate_pipeline_config_doc.py pipeline_configuration_2026.xlsx \
 step1_merge_pdf.py          step2_pdf_calibration.py     step3_pdf_quality_check.py     step4_process_pdf.py            step5_file_quality.py         step6_load_feedback.py
 (organize/split scans)  ->  (measure page geometry)  ->  (per-file quality check)   ->  (extract answers)           ->  (needs_review rollup)      ->  (apply human corrections)
         |                           |                            |                              |                                |                                |
-  GCS: date folders        BQ: pdf_calibration_profile   BQ: pdf_quality               BQ: survey_responses            BQ: file_quality_review        BQ: survey_responses_with_feedback
+  GCS: source-name folders BQ: pdf_calibration_profile   BQ: pdf_quality               BQ: survey_responses            BQ: file_quality_review        BQ: survey_responses_with_feedback
 
                                                                          pipeline_config.py (settings + survey schema, read from a GCS-hosted Excel workbook)
                                                                                  ^ every step above imports from this
 ```
 
 ### Step 1 — `step1_merge_pdf.py`: Organize & split scans
-Processes PDFs in GCS without depending on their naming/date format. Step 1 splits each source into two-page survey PDFs and stores them in a folder named after the original PDF's filename stem (for example, `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf`). The current date is recorded in the manifest, not used as an output folder.
+Processes PDFs in GCS without depending on their naming/date format. Step 1 splits each source into units using configured `PAGES_PER_SURVEY` (two by default) and stores them in a folder named after the original PDF's filename stem (for example, `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf`). The current date is recorded in the manifest, not used as an output folder.
 
 - **Input:** loose PDFs under `gs://<bucket>/<root-prefix>/` (defaults from `pipeline_config.py`'s `GCS_BUCKET`/`GCS_RAW_PREFIX`)
 - **Output:** reorganized PDFs in per-source-name folders; a manifest loaded to BigQuery (default table `pdf_manifest_list`, from `pipeline_config.py`'s `BQ_TABLE_MANIFEST`, partitioned by `moved_date`); optional failure log CSV (`step1_failed_sources*.csv`)
@@ -64,7 +73,7 @@ Measures each page's registration-mark transform, per-question box geometry, and
 ### Step 3 — `step3_pdf_quality_check.py`: Per-file quality check
 Reads every PDF and writes one QC row per file: `overall_quality` (clear / unclear / totally_unreadable) and `recommended_route` (pixel / vision / fallback). Primarily reuses step 2's `pdf_calibration_profile` geometry; if a file is missing there, it self-measures inline and raises an `[ALERT]`.
 
-- **Input:** PDFs under a folder/GCS prefix; BigQuery `pdf_calibration_profile` (step 2)
+- **Input:** PDFs under a folder/GCS prefix; optionally BigQuery `pdf_calibration_profile` (step 2)
 - **Output:** rows in BigQuery `pdf_quality` (partitioned by `partition_date`)
 - **Usage:** no CLI — call directly:
   ```python
@@ -75,9 +84,9 @@ Reads every PDF and writes one QC row per file: `overall_quality` (clear / uncle
 - **Key deps:** `numpy`, `google-cloud-bigquery`; optionally `vertexai` / `google-cloud-aiplatform` for vision-based judging
 
 ### Step 4 — `step4_process_pdf.py`: Extract answers
-The largest and core script: reads each survey PDF with a Vertex AI Gemini vision model (checkboxes/handwriting aren't in the text layer), cross-checked against a deterministic pixel-based reader and Google Cloud Vision OCR for handwritten fields, flagging rows that `needs_review`. Files within a folder are extracted concurrently (`FILE_EXTRACTION_WORKERS` worker threads, from `pipeline_config.py`; I/O-bound, same rationale as step 1's `SOURCE_PDF_WORKERS`). Also owns the human-feedback export/sync (`--export-needs-review-feedback`, ingested by step 6 — see Commands below).
+The largest and core script: reads each survey PDF with a Vertex AI Gemini vision model (checkboxes/handwriting aren't in the text layer), with optional approved pixel calibration and Google Cloud Vision checks for configured written fields, flagging rows that `needs_review`. New form profiles default to `model_only`; pixel geometry is used only after reviewers approve the mappings and select hybrid mode. Files within a folder are extracted concurrently (`FILE_EXTRACTION_WORKERS` worker threads, from `pipeline_config.py`). Also owns the human-feedback export/sync (`--export-needs-review-feedback`, ingested by step 6 — see Commands below).
 
-- **Input:** organized per-date-folder-then-batch-subfolder PDFs (output of step 1, e.g. `Nov 17 2025/Nov17_10/`) in GCS; optionally step 2's `pdf_calibration_profile` as a per-file pixel-detection hint, and step 3's `pdf_quality` for routing
+- **Input:** PDFs in source-name folders (output of step 1) in GCS; optionally step 2's `pdf_calibration_profile` as a per-file pixel-detection hint, and step 3's `pdf_quality` for routing
 - **Output:** rows in BigQuery `survey_responses` (columns include `survey_question`, `survey_answer`, `mark_position`, `needs_review`, `detection_method`, `model_confidence`, `vision_cross_check`)
 - **Usage:**
   ```
@@ -103,9 +112,9 @@ Reads BigQuery's `survey_responses` table (from step 4) and builds a `file_quali
 - **Key deps:** `google-cloud-bigquery`, `pandas`, `pyspark` (with Spark BigQuery connector jar)
 
 ### Step 6 — `step6_load_feedback.py`: Apply human corrections
-Ingests the LATEST `tps_feedback_{datetime}.xlsx` file step 4's `--export-needs-review-feedback` wrote, and applies any filled-in `correct_answer` cells to `survey_responses_with_feedback` (never to `survey_responses` itself). Idempotent: a row already marked `updated_with_feedback` is matched but left untouched, so re-running against an old/already-ingested file is always safe; a row a reviewer left blank is also left untouched (not marked reviewed), so it's exported again next time instead of being silently dropped.
+Ingests the latest timestamped feedback workbook using the configured `FEEDBACK_FILE_PREFIX` that step 4's `--export-needs-review-feedback` wrote, and applies any filled-in `correct_answer` cells to `survey_responses_with_feedback` (never to `survey_responses` itself). Idempotent: a row already marked `updated_with_feedback` is matched but left untouched, so re-running against an old/already-ingested file is always safe; a row a reviewer left blank is also left untouched (not marked reviewed), so it's exported again next time instead of being silently dropped.
 
-- **Input:** the latest `gs://<feedback-bucket>/<feedback-prefix>tps_feedback_*.xlsx` file; BigQuery `survey_responses` (synced from, never modified)
+- **Input:** the latest `gs://<feedback-bucket>/<feedback-prefix><FEEDBACK_FILE_PREFIX>*.xlsx` file; BigQuery `survey_responses` (synced from, never modified)
 - **Output:** BigQuery `survey_responses_with_feedback` — `survey_answer`/`correct_answer` overwritten, `updated_with_feedback=TRUE`, `feedback_updated_time`, `ingested_from` set on every row actually applied
 - **Usage:**
   ```
@@ -117,26 +126,21 @@ Ingests the LATEST `tps_feedback_{datetime}.xlsx` file step 4's `--export-needs-
 
 ## Detailed logic & rules
 
-This section documents the actual decision rules, thresholds, and edge-case handling in each script, for maintainers who need to tune or debug the pipeline.
+This section documents the actual decision rules, thresholds, and edge-case handling in each script, for maintainers who need to tune or debug the pipeline. The original TPS form's fixed-layout calibration and recognition rules remain as a legacy fallback for workbooks without a reviewed Form Setup profile. New form profiles use workbook-specified questions, pages, language, validation rules, anchors, and approved control geometry; they start in `model_only` mode.
 
 ### Step 1 — `step1_merge_pdf.py`
 
-**TPS number reading.** The handwritten 4-digit TPS number is not OCR'd with regex — it's read by Gemini (`pipeline_config.TPS_EXTRACTION_MODEL`, called at `temperature=0` for reproducibility) from a cropped image of the page's upper-right corner (crop `x: 0.80–0.99×width, y: 0.08–0.24×height`, rendered at 3x zoom). The prompt requires a response of exactly `"<4 digits> HIGH|LOW"`; a missing/unparseable confidence word defaults to LOW. The model must return `REJECT_UNREADABLE` rather than guess when the digits/crop aren't legible — this raises `TpsRejected`, rejecting the survey (not uploaded). Up to 3 attempts, 2s apart. The previous survey's TPS+1 is passed as a hint ("expected next"), but the model is told to defer to what's actually handwritten.
+Step 1 does not extract or use a handwritten survey ID. It groups pages by configured `PAGES_PER_SURVEY`, preserves the input PDF stem in its output path, and records the run date only in the manifest. The language check uses `SURVEY_LANGUAGE`; a mismatch or failed check is retained for human review rather than used as a file-name/date filter. Step 1's Gemini model, language retry count, and retry delay are configurable in the Settings sheet.
 
-**Language gate (`validate_survey_language()`).** A SEPARATE check from TPS extraction — the TPS crop above is far too small to judge a survey's language from, so this renders and sends the FULL first page to Gemini with a single, focused ENGLISH/NON_ENGLISH/UNCERTAIN question. Fail-closed: anything other than a confident ENGLISH answer (including a parse failure or every retry erroring out) rejects the survey, unlike this module's usual "advisory, never blocks" pattern for other checks — a language gate that fails open would silently let through exactly the kind of survey it exists to catch. Runs before the content/blank/declined check below.
-- **Digit-shape cross-check (whole-batch, two-pass).** `split_combined_pdf()` runs in three passes per source PDF: pass 1 reads every survey's raw TPS/confidence/content check in page order; pass 2 seeds one `_DigitTemplateBank` from every HIGH-confidence reading across the **entire batch** (each crop tagged with its own survey's start-page index); pass 3 then runs the confusable-pair checks against that complete bank (excluding a record's own crop) before doing collision handling in page order. This replaced an earlier incremental, one-pass version where a survey near the end of a batch had no templates yet to compare against for a digit that only appeared in a later survey.
-- **Confidence downgrade:** a self-reported HIGH reading is downgraded to LOW if it differs from the expected `+1` sequence by exactly one digit that's a member of a confusable pair: `{1,4}, {1,7}, {3,8}, {5,6}, {0,6}, {0,8}, {0,9}, {6,8}, {8,9}, {2,7}` — but only once the bank actually has templates for *both* candidate digits from another survey (`has_templates_for()`), so a digit with no real competition isn't wrongly downgraded.
-- **Confidence upgrade (reverse check):** a self-reported LOW reading is upgraded to HIGH if every confusable-pair digit it contains has bank templates for both candidates and every one matches the claimed digit, not the alternative — independent pixel evidence overriding the model's own hedging on an otherwise-legible reading. A TPS number with no confusable-pair digits, or with any digit lacking bank coverage, stays LOW. Digits are otherwise never silently corrected, only confidence-adjusted either direction.
+**Splitting logic and naming.** Every input PDF is split into fixed, non-overlapping units of configured `PAGES_PER_SURVEY` (2 by default); source filename patterns and dates are not used to decide whether or how to split. Each output keeps the source stem as its enclosing folder and gets a one-based survey index. For example, `TPS 2026 Adult English_Filled.pdf` produces `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf` for source pages 1–2 when the setting is 2. The current date is recorded in the manifest only. If the source page count is not divisible by the configured page count, that source is recorded as unsplittable.
 
-**Splitting logic and naming.** Every input PDF is split into fixed, non-overlapping 2-page surveys; source filename patterns and dates are not used to decide whether or how to split. Each output keeps the source stem as its enclosing folder and gets a one-based survey index. For example, `TPS 2026 Adult English_Filled.pdf` produces `TPS 2026 Adult English_Filled/TPS 2026 Adult English_Filled_p1.pdf` for source pages 1–2. The current date is recorded in the manifest only. If the source page count is not divisible by two, that source is recorded as unsplittable.
-
-**Content checks (per survey unit).** Each 2-page unit continues through the language and blank/declined-content checks. Outputs are routed to the normal, `Declined/`, or `Rejected/` category locations and the manifest records the source page range and any review/rejection reason.
+**Content checks (per survey unit).** Each configured survey unit continues through the language and blank/declined-content checks. Outputs are routed to the normal, `Declined/`, or `Rejected/` category locations and the manifest records the source page range and any review/rejection reason.
 
 **Failure logging (`step1_failed_sources*.csv`).** Rows are logged for unsplittable source PDFs, rejected survey units, and unhandled per-source errors. Filenames without a date are not failures.
 
 **Dry-run.** Runs the content checks and computes the manifest but skips GCS uploads and BigQuery writes. It also bypasses the already-processed optimization, so each PDF is evaluated again.
 
-**Key thresholds:** content/language Gemini calls retry up to `TPS_EXTRACTION_MAX_ATTEMPTS=3` with a 2s delay; `SOURCE_PDF_WORKERS=4` concurrent source PDFs; `MAX_CONCURRENT_VERTEX_CALLS=4`.
+**Key thresholds:** language checks use `STEP1_CHECK_MAX_ATTEMPTS` and `STEP1_CHECK_RETRY_DELAY_SECONDS`; `SOURCE_PDF_WORKERS=4` concurrent source PDFs; `MAX_CONCURRENT_VERTEX_CALLS=4`.
 
 **Manifest schema (`organize_manifest`/`pdf_manifest_list`):** `source_file, source_gcs_uri, parsed_month_day, destination_folder, destination_gcs_uri, moved_at, moved_date (partition), source_page_range, rejected, rejected_reason, needs_review, needs_review_reason`. Re-running replaces rows only for the same `(source_gcs_uri, source_page_range)`, not the whole file/folder.
 
@@ -177,9 +181,9 @@ no reasons               → overall_quality="clear",               route="pixel
 
 ### Step 4 — `step4_process_pdf.py`
 
-**⚠️ Note:** the module docstring describes a two-stage MERGE + EXTRACT pipeline (merge each date folder's PDFs into one file + a page manifest, then extract from the merged file). In the current version of this script, **the MERGE stage is not implemented** — there is no code that concatenates PDFs or writes a page manifest, and `main()` has no merge-related CLI flag. In practice, the script's only stage that runs is EXTRACT, and it reads directly from the original per-folder source PDFs (via `list_date_folders`/`list_pdfs_in_folder`), not from any merged output. This is worth confirming with the script owner — it may be planned-but-unbuilt, or the merge concept may be intentionally dropped in favor of reading source folders directly.
+**Legacy note:** the module docstring below still contains historical TPS-specific implementation notes. The current configured workflow reads individual PDFs, uses the approved form profile and question metadata, and does not merge source PDFs.
 
-**Folder/file discovery (what actually runs).** Since step 1's bucket reorganization into per-batch subfolders, a "folder" for this script's purposes is now two path segments deep: `<date folder>/<batch subfolder>` (e.g. `Nov 23 2025/Nov23_7`), one per `survey_batch_subfolder()` unit, not one per date folder — `list_date_folders()` lists date folders, then lists each one's batch subfolders. This is also the granularity `folder_name` is stored/deleted at in BigQuery, so a `--folders`/single-file rerun only reloads the one batch it targets instead of every batch scanned that day. Loose files sitting directly under the root, or directly under a date folder (not inside a batch subfolder), are both skipped and logged as warnings. Within a batch subfolder, only `.pdf` files are picked up, sorted in natural order (`Nov18_2.pdf` before `Nov18_10.pdf`). `parse_report_date()` only reads the first (`<date folder>`) segment.
+**Folder/file discovery.** Step 4 finds PDF-containing directories below `GCS_INPUT_PREFIX`; current Step 1 output is one source-named folder per PDF (for example, `TPS 2026 Adult English_Filled/`). It groups each PDF's BigQuery rows by its immediate parent folder, so a targeted rerun replaces only that source survey's rows. Older nested date/batch layouts remain discoverable. Loose PDFs directly under the input prefix are skipped and logged. PDFs within each folder are sorted in natural order. A date-like folder name supplies `report_date`; for other folder names, Step 4 uses the current run date.
 
 **Extraction — vision model.** Each page is rendered to a 300-DPI PNG (not sent as raw PDF — native PDF ingestion misread dense checkbox tables) and sent to Gemini (`pipeline_config.GEMINI_MODEL`) with a 16-rule prompt covering: only count actual ink (not printed outlines/creases), one answer for single-select vs. multiple for Q33/Q34, blank is a valid answer, "(specify)" free text gets appended to the answer, position-then-label reading order for the 6-point scale (to prevent self-contradiction), a required one-sentence reasoning per question (surfaces later in `review_note`), strict `mark_position` format, and a 0.0-1.0 self-reported `confidence` the model is told not to inflate. H1 must be exactly 6 digits; H6 must be MM/DD/YYYY.
 

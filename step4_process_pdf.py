@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-merge_survey_pdfs.py
+step4_process_pdf.py
 
-Single self-contained script that does two things against a GCS bucket of
-scanned survey PDFs (currently: the "Treatment Perceptions Survey (Adult)"
-CalOMS form — see SURVEY_QUESTIONS below):
+Current configured workflow: read individual survey PDFs from GCS, apply the
+approved form profile and question metadata from the pipeline workbook, and
+extract/load one row per configured question. This script does not merge PDFs.
+Configured profiles use generic extraction and only approved calibration
+mappings; TPS-specific logic below is retained for legacy workbooks without a
+Form Setup profile.
 
-  1. MERGE  — combine each date subfolder's PDFs into one PDF per folder,
-     plus a page-level manifest (folder / source file / page range).
-
-  2. EXTRACT — read every source PDF with a Vertex AI Gemini model (the
+Historical TPS implementation notes follow. The legacy workflow describes
+EXTRACT — reading source PDFs with a Vertex AI Gemini model (the
      survey answers are hand-marked checkboxes/write-ins, not in the PDF's
      text layer, so this needs a vision-capable model, not plain text
      extraction) and load one row per question into a BigQuery table with
@@ -1386,7 +1387,14 @@ _VISION_FREEFORM_FIELDS = pipeline_config._VISION_FREEFORM_FIELDS
 # read the field at all, not reading it differently - so a found_digits
 # count below this known minimum is treated as "no independent signal"
 # (match=None) rather than "disagree" (match=False).
-_WRITTEN_FIELD_EXPECTED_DIGITS = {"26": 2}
+_WRITTEN_FIELD_EXPECTED_DIGITS = (
+    {}
+    if pipeline_config.FORM_PROFILE_CONFIGURED
+    else {"H1": 6, "26": 2}
+)
+for _question, _metadata in pipeline_config.QUESTION_METADATA_BY_NUMBER.items():
+    if _metadata.get("expected_digits") is not None:
+        _WRITTEN_FIELD_EXPECTED_DIGITS[_question] = int(_metadata["expected_digits"])
 
 # H4 (agency/program name) and H5
 # (address) are free-form written fields that are legitimately left blank
@@ -1448,6 +1456,9 @@ def _format_vision_authoritative_value(question_number: str, anchored_value: str
       missed/extra box), so this deliberately declines to guess a date
       shape out of the wrong number of digits.
     """
+    if pipeline_config.FORM_PROFILE_CONFIGURED:
+        compacted = " ".join(anchored_value.split())
+        return compacted if compacted else None
     if question_number in ("H2", "H5"):
         compacted = " ".join(anchored_value.split())
         return compacted if compacted else None
@@ -1517,17 +1528,42 @@ def _validate_written_field_format(number: str, answer: str) -> Optional[str]:
     answer = (answer or "").strip()
     if not answer:
         return None
-    if number == "H1":
+    metadata = pipeline_config.QUESTION_METADATA_BY_NUMBER.get(number, {})
+    expected_format = str(metadata.get("expected_format", "")).strip().lower()
+    expected_digits = metadata.get("expected_digits")
+    expected_date_format = metadata.get("date_format")
+    expected_year = metadata.get("expected_year")
+    if expected_digits is not None and not expected_format:
+        expected_format = "digits"
+    if not expected_format:
+        if not pipeline_config.FORM_PROFILE_CONFIGURED and number == "H1":
+            expected_format, expected_digits = "digits", 6
+        elif not pipeline_config.FORM_PROFILE_CONFIGURED and number == "H6":
+            expected_format = "date"
+            expected_date_format = "%m/%d/%Y"
+            expected_year = REPORT_YEAR
+
+    if expected_format in {"digits", "integer"}:
         digits_only = re.sub(r"[\s-]", "", answer)
-        if not re.fullmatch(r"\d{6}", digits_only):
+        pattern = rf"\d{{{int(expected_digits)}}}" if expected_digits else r"\d+"
+        if not re.fullmatch(pattern, digits_only):
             return (
-                f"H1 (Home Unit CalOMS Provider ID) should be a 6-digit number, but the "
-                f"reported answer {answer!r} is not exactly 6 digits - re-check the "
-                "6 boxed digits on the form."
+                f"{number} should match the configured {expected_digits or 'numeric'}-digit "
+                f"format, but the reported answer {answer!r} does not."
             )
-    elif number == "H6":
+    elif expected_format == "decimal":
+        try:
+            numeric_value = float(answer.replace(",", ""))
+        except ValueError:
+            return f"{number} should be a numeric value, but {answer!r} is not numeric."
+        if metadata.get("minimum") is not None and numeric_value < metadata["minimum"]:
+            return f"{number} is below the configured minimum {metadata['minimum']}."
+        if metadata.get("maximum") is not None and numeric_value > metadata["maximum"]:
+            return f"{number} is above the configured maximum {metadata['maximum']}."
+    elif expected_format == "date":
         parsed = None
-        for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        date_formats = [expected_date_format] if expected_date_format else ["%m/%d/%Y", "%m/%d/%y"]
+        for fmt in date_formats:
             try:
                 parsed = datetime.datetime.strptime(answer, fmt)
                 break
@@ -1535,22 +1571,13 @@ def _validate_written_field_format(number: str, answer: str) -> Optional[str]:
                 continue
         if parsed is None:
             return (
-                f"H6 (Today's Date) should be a date in MM/DD/YYYY format, but the "
-                f"reported answer {answer!r} doesn't parse as one - re-check the "
-                "respondent's own written completion date on the form."
+                f"{number} should match the configured date format "
+                f"{expected_date_format or 'MM/DD/YYYY'}, but {answer!r} does not parse."
             )
-        # Every form in this batch was filled out in REPORT_YEAR (see that
-        # constant's own comment) - a parsed year that doesn't match is
-        # guaranteed to be either a misread digit (most likely) or a
-        # genuinely unusual form, either way worth a human glance. This is
-        # a SEPARATE check from the parseability check above: a date can be
-        # perfectly well-formed (e.g. "10/21/2015") and still fail this one.
-        if str(parsed.year) != REPORT_YEAR:
+        if expected_year is not None and parsed.year != int(expected_year):
             return (
-                f"H6 (Today's Date) parsed as {answer!r}, but the year "
-                f"{parsed.year} doesn't match this batch's expected year "
-                f"({REPORT_YEAR}) - likely a misread digit, re-check the "
-                "respondent's own written completion date on the form."
+                f"{number} parsed as {answer!r}, but year {parsed.year} does not "
+                f"match the configured expected year ({expected_year})."
             )
     return None
 
@@ -1937,7 +1964,59 @@ class QARow:
 REPORT_YEAR = pipeline_config.REPORT_YEAR
 
 
+def _build_model_only_extraction_prompt() -> str:
+    question_lines = []
+    for number, _group, question_text, choices in pipeline_config.SURVEY_QUESTIONS:
+        choices_list = pipeline_config.split_choices(choices) if pipeline_config.is_choice_list(choices) else []
+        metadata = pipeline_config.QUESTION_METADATA_BY_NUMBER.get(number, {})
+        kind = (
+            "Select all marked choices" if number in pipeline_config.MULTI_SELECT_QUESTION_NUMBERS
+            else "Select the single marked choice" if choices_list
+            else "Read the handwritten response"
+        )
+        format_notes = []
+        if metadata.get("expected_format"):
+            format_notes.append(f"Expected format: {metadata['expected_format']}")
+        if metadata.get("expected_digits"):
+            format_notes.append(f"Expected digit count: {metadata['expected_digits']}")
+        if metadata.get("date_format"):
+            format_notes.append(f"Date format: {metadata['date_format']}")
+        if metadata.get("expected_year"):
+            format_notes.append(f"Expected year: {metadata['expected_year']}")
+        if metadata.get("minimum") is not None:
+            format_notes.append(f"Minimum: {metadata['minimum']}")
+        if metadata.get("maximum") is not None:
+            format_notes.append(f"Maximum: {metadata['maximum']}")
+        format_note = f"\n  {'; '.join(format_notes)}" if format_notes else ""
+        question_lines.append(
+            f"- {number}: {question_text}\n"
+            f"  Task: {kind}.\n"
+            f"  Choices: {json.dumps(choices_list, ensure_ascii=False) if choices_list else 'free response'}"
+            f"{format_note}"
+        )
+    question_spec = "\n".join(question_lines)
+    return (
+        f"You are reading one scanned, hand-completed {pipeline_config.FORM_NAME} form. "
+        f"The expected language is {pipeline_config.SURVEY_LANGUAGE}. Read the printed "
+        "questions below and report only answers supported by visible respondent marks "
+        "or handwriting. Do not infer missing answers.\n\n"
+        "For fixed choices, answer with the exact matching choice text. For multiple "
+        "selection questions, join all marked choices with '; '. For written fields, "
+        "transcribe only what is legible. For every question, return an object with "
+        "question_number, reasoning, mark_position, answer, answer_language, and confidence. "
+        "mark_position is the 1-based position in the listed choices, or an empty string "
+        "for written answers or an unmarked question. Set confidence between 0 and 1, "
+        "reflecting visual certainty. Return a JSON array only.\n\n"
+        f"QUESTIONS\n{question_spec}"
+    )
+
+
 def build_extraction_prompt() -> str:
+    if (
+        pipeline_config.FORM_PROFILE_CONFIGURED
+        or pipeline_config.FORM_DETECTION_MODE == "model_only"
+    ):
+        return _build_model_only_extraction_prompt()
     multi_select_list = ", ".join(sorted(MULTI_SELECT_QUESTION_NUMBERS))
     lines = [
         "You are reading one scanned, hand-filled 'Treatment Perceptions Survey "
@@ -2371,7 +2450,7 @@ def _page_scale_factors(img_shape, dpi: int = _RENDER_DPI):
 # line detected (its line reappears at 165, confirmed empirically, not
 # assumed) - re-verified against both original real files plus the new
 # shaded one with no regressions.
-_INK_THRESHOLD = 165
+_INK_THRESHOLD = pipeline_config.FORM_INK_THRESHOLD
 
 # Minimum (top-cell-density - second-place-cell-density) required before trusting a
 # pixel-grid reading. Real marked cells in the one sample tested had margins of
@@ -2488,7 +2567,11 @@ _GRID_FAINT_LINE_FLOOR = 0.30
 # per-file centers agreed to within ~5px of each other, so one shared
 # calibration is safe to reuse across files exactly like _YESNO_BOX_CALIBRATION
 # already does for other questions.
-_GRID_COLUMN_CENTERS = (1661.75, 1790.4, 1919.6, 2049.9, 2179.6, 2309.1)
+_GRID_COLUMN_CENTERS = (
+    pipeline_config.FORM_GRID_COLUMN_CENTERS
+    if pipeline_config.FORM_PROFILE_CONFIGURED
+    else (1661.75, 1790.4, 1919.6, 2049.9, 2179.6, 2309.1)
+)
 # Search pad around each calibrated center, per row (not per file - see below).
 # 25px would exactly graze the true box edge on Nov10_1.pdf (confirmed: at
 # pad=25 the true right border landed exactly on the search window's own
@@ -2497,7 +2580,7 @@ _GRID_COLUMN_CENTERS = (1661.75, 1790.4, 1919.6, 2049.9, 2179.6, 2309.1)
 # the window with room to spare, without getting wide enough to risk pulling
 # in the NEXT column (columns are ~130px apart center-to-center).
 _GRID_COLUMN_PAD = 32
-_GRID_BOX_EXPECTED_SIZE = 40  # both width and height, at 300 DPI
+_GRID_BOX_EXPECTED_SIZE = pipeline_config.FORM_GRID_BOX_EXPECTED_SIZE
 
 
 def _group_consecutive_positions(positions: list, max_gap: int = 3) -> list:
@@ -4511,6 +4594,67 @@ _H3_CIRCLE_CALIBRATION = (0, {
     "Detox/WM": (1715, 1744, 304, 332),
     "Recovery Services": (1956, 1984, 303, 332),
 })
+
+if pipeline_config.FORM_CONTROL_CALIBRATION:
+    _configured_yesno = {}
+    _configured_multi = {}
+    _configured_circles = {}
+    for item in pipeline_config.FORM_CONTROL_CALIBRATION:
+        question = item["question"]
+        page = item["page"]
+        label = item["label"]
+        if item["control_type"] == "circle":
+            _configured_circles.setdefault(question, (page, {}))[1][label] = item["rect"]
+        else:
+            target = (
+                _configured_multi if question in pipeline_config.MULTI_SELECT_QUESTION_NUMBERS
+                else _configured_yesno
+            )
+            layout = str(item["layout"])
+            target.setdefault(question, {}).setdefault(layout, (page, {}))[1][label] = item["rect"]
+    _YESNO_BOX_CALIBRATION = {}
+    for question, layouts in _configured_yesno.items():
+        ordered = sorted(layouts.items(), key=lambda entry: entry[0])
+        candidates = [value for _layout, value in ordered]
+        _YESNO_BOX_CALIBRATION[question] = (
+            candidates if len(candidates) > 1 else candidates[0]
+        )
+    _MULTISELECT_BOX_CALIBRATION = {
+        question: next(iter(layouts.values()))
+        for question, layouts in _configured_multi.items()
+    }
+    _H3_CIRCLE_CALIBRATION = _configured_circles.get("H3", (0, {}))
+elif pipeline_config.FORM_PROFILE_CONFIGURED:
+    _YESNO_BOX_CALIBRATION = {}
+    _MULTISELECT_BOX_CALIBRATION = {}
+    _H3_CIRCLE_CALIBRATION = (0, {})
+else:
+    _active_choice_questions = set(CHOICE_LISTS_BY_NUMBER)
+    _YESNO_BOX_CALIBRATION = {
+        question: calibration for question, calibration in _YESNO_BOX_CALIBRATION.items()
+        if question in _active_choice_questions
+    }
+    _MULTISELECT_BOX_CALIBRATION = {
+        question: calibration for question, calibration in _MULTISELECT_BOX_CALIBRATION.items()
+        if question in _active_choice_questions
+    }
+    if "H3" not in _active_choice_questions:
+        _H3_CIRCLE_CALIBRATION = (0, {})
+
+if pipeline_config.FORM_PROFILE_CONFIGURED:
+    _GRID_CONFIDENCE_MARGIN_OVERRIDE = {}
+    _YESNO_BOX_PAD_OVERRIDE = {}
+    _YESNO_BOX_UP_PAD_OVERRIDE = {}
+    _YESNO_CONFIDENCE_MARGIN_OVERRIDE = {}
+    _YESNO_ROW_ABOVE_SEARCH_OVERRIDE = {}
+    _YESNO_ROW_LINE_SEARCH_OVERRIDE = {}
+    _YESNO_ROW_PITCH_PARTNER = {}
+    _YESNO_ROW_MODE = {}
+    _YESNO_BOX_INK_BORDER_OVERRIDE = {}
+    _YESNO_UNVALIDATED_CALIBRATION = set()
+    _MULTISELECT_BOX_PAD_OVERRIDE = {}
+    _MULTISELECT_INK_BORDER_OVERRIDE = {}
+
 _H3_CIRCLE_PAD = 45  # widened from 25 - see detect_h3_answer()'s scale comment
 _H3_CIRCLE_DIAM = 29  # expected outer diameter (px, at 300 DPI) of the printed circle glyph
 _H3_CONFIDENCE_MARGIN = 0.8  # deliberately generous - real margins measured 0.95-1.0, nowhere near this
@@ -4550,6 +4694,8 @@ def _validate_box_calibration_labels() -> None:
     def _check(qnum, geometry_labels, source_name):
         choice_labels = CHOICE_LISTS_BY_NUMBER.get(qnum)
         if choice_labels is None:
+            if not geometry_labels:
+                return
             problems.append(
                 f"{source_name}[{qnum!r}] has pixel geometry for a question that "
                 "isn't a choice-list question in the live SURVEY_QUESTIONS at all "
@@ -6172,6 +6318,21 @@ _WRITTEN_FIELD_ANCHORS = {
     "26": ([["age"]], "right", 200, None, None),
 }
 
+if pipeline_config.FORM_PROFILE_CONFIGURED:
+    _WRITTEN_FIELD_ANCHORS = {}
+
+for _question, _metadata in pipeline_config.QUESTION_METADATA_BY_NUMBER.items():
+    if _metadata.get("vision_anchor") and _question not in _WRITTEN_FIELD_ANCHORS:
+        _anchor_words = str(_metadata["vision_anchor"]).lower().split()
+        _stop_words = str(_metadata.get("vision_stop_phrase", "")).lower().split()
+        _WRITTEN_FIELD_ANCHORS[_question] = (
+            [_anchor_words],
+            _metadata.get("vision_direction", "right"),
+            int(_metadata.get("vision_reach", 300)),
+            _stop_words or None,
+            None,
+        )
+
 
 def _sort_words_reading_order(words: list, row_tolerance: int = 15) -> list:
     """Groups OCR words (each {"text","x0","y0","x1","y1"} - see
@@ -6310,7 +6471,7 @@ def _extract_anchored_field_value(question_number: str, vision_result: dict) -> 
     phrase_alternatives, direction, max_reach, stop_phrase, row_tolerance_override = _WRITTEN_FIELD_ANCHORS[question_number]
 
     y_band = None
-    if question_number == "H5":
+    if question_number == "H5" and not pipeline_config.FORM_PROFILE_CONFIGURED:
         # "Address" also appears in H2's "Program Reporting Unit (Address)"
         # header, on a different row - disambiguate by requiring the SAME
         # row as H4's "Agency" label (they're printed on one shared line:
@@ -6526,7 +6687,7 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         #     latter counts as real corroborating evidence of blank; a
         #     merely-unlocated label proves nothing about this field's
         #     actual content.
-        if question_number == "24":
+        if question_number == "24" and not pipeline_config.FORM_PROFILE_CONFIGURED:
             full_text = vision_result.get("full_text", "")
             if full_text and not _extract_q24_comment_text(full_text):
                 return True, "", 1.0, ""
@@ -6554,7 +6715,12 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                 # page (question numbers, "2 weeks"/"4 weeks" choice text),
                 # so it almost always found a false-positive match and could
                 # never actually confirm blank - worse than no signal at all.
-                if question_number == "26" and anchored_value is not None and not re.search(r"\d", anchored_value):
+                if (
+                    not pipeline_config.FORM_PROFILE_CONFIGURED
+                    and question_number == "26"
+                    and anchored_value is not None
+                    and not re.search(r"\d", anchored_value)
+                ):
                     return True, "", 1.0, ""
         return None, "", None, ""  # nothing written according to the model - nothing to cross-check
 
@@ -6572,7 +6738,8 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
 
     if question_number in _VISION_TOKEN_FIELDS:
         if anchored_value is not None:
-            if question_number in ("H1", "26"):
+            expected_digits = _WRITTEN_FIELD_EXPECTED_DIGITS.get(question_number)
+            if expected_digits is not None:
                 target_digits = re.sub(r"\D", "", model_answer)
                 if not target_digits:
                     return None, "", None, ""  # model's answer for a digits-expected field wasn't actually numeric - nothing sound to compare
@@ -6596,15 +6763,13 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
                 # itself short, this isn't the "Vision under-read a good
                 # model answer" case this exists for, so it falls through
                 # to the ordinary disagreement check below instead).
-                expected_digits = _WRITTEN_FIELD_EXPECTED_DIGITS.get(question_number)
                 if (
-                    expected_digits is not None
-                    and len(found_digits) < expected_digits
+                    len(found_digits) < expected_digits
                     and len(target_digits) >= expected_digits
                 ):
                     return True, (
-                        f"Cloud Vision found no matching {expected_digits}-digit number that could "
-                        f"be an age for {question_number} ({anchored_value!r} near this field's own "
+                        f"Cloud Vision found fewer than the configured {expected_digits} digits "
+                        f"for {question_number} ({anchored_value!r} near this field's own "
                         f"printed label, only {len(found_digits)} digit(s)) - defaulting to the "
                         f"model's own answer {model_answer!r}."
                     ), 1.0, anchored_value
@@ -6643,7 +6808,8 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         # answer), but still better than skipping the check entirely.
         target = _normalize_for_match(model_answer)
         token_snippet = "; ".join(tokens[:12]) + (", ..." if len(tokens) > 12 else "")
-        if question_number in ("H1", "26"):
+        expected_digits = _WRITTEN_FIELD_EXPECTED_DIGITS.get(question_number)
+        if expected_digits is not None:
             target_digits = re.sub(r"\D", "", target)
             if not target_digits:
                 return None, "", None, ""
@@ -6664,7 +6830,11 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
             # user request) - take the best-overlapping single token on the page
             # rather than requiring a byte-exact match against any of them.
             best_coverage = 0.0
-            if question_number == "H2" and target:
+            if (
+                question_number == "H2"
+                and target
+                and not pipeline_config.FORM_PROFILE_CONFIGURED
+            ):
                 for tok in tokens:
                     compact_tok = _normalize_for_match(tok)
                     matcher = difflib.SequenceMatcher(None, target, compact_tok)
@@ -6710,7 +6880,7 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
             # revision's wording, or a Vision misread of that stretch), that
             # side is left uncut, same as before this fix - strictly no
             # worse, only better when a cut lands.
-            if question_number == "24":
+            if question_number == "24" and not pipeline_config.FORM_PROFILE_CONFIGURED:
                 compare_text = _extract_q24_comment_text(compare_text)
 
         # H6 is a special case even among the freeform fields: like H1/26,
@@ -6728,7 +6898,11 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         # see self_test_anchored_vision_extraction(). The whole-page FALLBACK
         # (anchored_value is None) keeps the original fuzzy-text behavior,
         # since full_text there is normal running OCR text, not a digit grid.
-        if question_number == "H6" and anchored_value is not None:
+        if (
+            question_number == "H6"
+            and anchored_value is not None
+            and not pipeline_config.FORM_PROFILE_CONFIGURED
+        ):
             target_digits = re.sub(r"\D", "", model_answer)
             # Only DATE-SHAPED tokens from the reconstructed value (digits
             # and date separators only: 0-9, "/", "-", ".") ever feed the
@@ -7011,7 +7185,11 @@ def cross_check_written_field_with_vision(question_number: str, model_answer: st
         # comment. Scoped to the anchored path only (never the whole-page
         # fallback, where a short answer's characters could trivially
         # "match" somewhere in unrelated printed page text).
-        if question_number == "H4" and anchored_value is not None:
+        if (
+            question_number == "H4"
+            and anchored_value is not None
+            and not pipeline_config.FORM_PROFILE_CONFIGURED
+        ):
             compact_answer = re.sub(r"[^a-z0-9]", "", norm_answer)
             compact_full = re.sub(r"[^a-z0-9]", "", norm_full)
             if compact_answer:
@@ -7307,7 +7485,10 @@ def extract_qa_from_pdf(
 
     if quality_route not in _VALID_PDF_QUALITY_ROUTES:
         quality_route = None
-    skip_pixel = quality_route == "fallback"
+    skip_pixel = (
+        quality_route == "fallback"
+        or pipeline_config.FORM_DETECTION_MODE == "model_only"
+    )
     force_vision = quality_route in ("vision", "fallback")
     # Revision 37 follow-up #2 (explicit user request): neither route
     # blanket-forces needs_review anymore. "vision" and "fallback" only
@@ -7358,15 +7539,10 @@ def extract_qa_from_pdf(
     # any failure here (different scan layout, OpenCV hiccup, etc.) just means
     # we fall back to the model-only reading for this file, never a hard error.
     #
-    # skip_pixel (quality_route == "fallback"): the upstream classifier has
-    # already determined this scan's geometry itself is untrustworthy (grid/
-    # registration not locatable, excessive tilt/warp) - running any of the
-    # deterministic detectors below against an unreadable geometry risks a
-    # CONFIDENTLY WRONG position-anchored reading, not a safe miss, so this
-    # whole pixel stage is skipped entirely for this file and every question
-    # relies on the model's own reading alone (see quality_route's docstring
-    # above for the full reasoning).
-    if page_images and not skip_pixel:
+    # skip_pixel is true when the quality classifier rejects this scan's
+    # geometry or an approved profile selects model_only detection. In both
+    # cases, position-anchored detectors could produce misleading readings.
+    if page_images and not skip_pixel and not pipeline_config.FORM_PROFILE_CONFIGURED:
         try:
             grid_results = detect_checkbox_grid_answers(
                 page_images[0], calibration_profile=calibration_profile
@@ -7391,16 +7567,6 @@ def extract_qa_from_pdf(
                     "reading for this file. This can happen on an unusually skewed/cropped scan; "
                     "if it happens on every file, check check_grid_dependencies() below."
                 )
-                # Explicit user request (Revision 28): when the pixel grid
-                # detector can't verify ANY of Q1-18 at all (as opposed to
-                # verifying most rows but silently missing one or two), the
-                # whole 18-question block is running on the model's own
-                # unverified reading with NO independent cross-check
-                # whatsoever - qualitatively different from every other
-                # question on this form, all of which have at least a
-                # self-consistency check. Flag every one of Q1-18 for human
-                # review rather than let them look identical to a normal,
-                # pixel-verified row.
                 for qnum in map(str, range(1, 19)):
                     if qnum in answers:
                         answers[qnum]["pixel_grid_totally_missing"] = True
@@ -7470,6 +7636,8 @@ def extract_qa_from_pdf(
             for qnum in WRITTEN_TEXT_QUESTION_NUMBERS:
                 if qnum not in answers:
                     continue
+                if qnum not in _VISION_TOKEN_FIELDS and qnum not in _VISION_FREEFORM_FIELDS:
+                    continue
                 page_idx = _WRITTEN_TEXT_QUESTION_PAGE.get(qnum, 0)
                 if page_idx not in vision_results_by_page:
                     if page_idx < len(page_images):
@@ -7521,7 +7689,11 @@ def extract_qa_from_pdf(
                 # all along, so it's kept as-is and treated the same as a
                 # genuine corroborated blank (needs_review=False) - see
                 # _q24_vision_text_looks_like_a_real_comment()'s docstring.
-                if qnum == "24" and not (answers[qnum].get("answer") or "").strip():
+                if (
+                    qnum == "24"
+                    and not pipeline_config.FORM_PROFILE_CONFIGURED
+                    and not (answers[qnum].get("answer") or "").strip()
+                ):
                     found_comment_text = _extract_q24_comment_text(vision_result.get("full_text", ""))
                     if found_comment_text and _q24_vision_text_looks_like_a_real_comment(found_comment_text):
                         answers[qnum]["model_answer_before_vision_override"] = answers[qnum].get("answer", "")
@@ -10025,7 +10197,10 @@ def export_needs_review_feedback(
     for col in df.select_dtypes(include=["datetimetz"]).columns:
         df[col] = df[col].dt.tz_localize(None)
 
-    file_name = f"tps_feedback_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    file_name = (
+        f"{pipeline_config.FEEDBACK_FILE_PREFIX}"
+        f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    )
     blob_name = f"{feedback_prefix.rstrip('/')}/{file_name}"
 
     buffer = _write_feedback_workbook(df)

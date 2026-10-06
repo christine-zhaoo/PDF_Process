@@ -1,4 +1,4 @@
-"""Central configuration for the LADPH Treatment Perceptions Survey (TPS)
+"""Central configuration for the LADPH survey-processing
 pipeline - step1_merge_pdf.py through step6_load_feedback.py.
 
 WHY THIS FILE EXISTS: every step of this pipeline used to hardcode its own
@@ -10,20 +10,16 @@ every place one of those values was duplicated. This file is the single
 source of truth for all of that - every step imports from here instead of
 defining its own copy.
 
-WHAT'S DELIBERATELY *NOT* HERE: pixel-level calibration (exact checkbox
-x/y coordinates, anchor label text like "agency"/"address", confusable
-handwritten-digit pairs, ink thresholds). Those live in step1-4's own code
-because they're tied to this exact form's physical print layout - porting
-to a genuinely different PDF format requires re-measuring that geometry
-against the new form (see step2_pdf_calibration.py), not just editing a
-config value. Everything in THIS file, by contrast, is either an
-operational setting (where things live, which model/table to use) or pure
-data about the survey's questions - both are safe to redefine for a new
-form/deployment without touching any pipeline code.
+Form-specific choices that can be reviewed safely (form page count,
+question validation metadata, detection mode, and approved control
+coordinates) are loaded from the workbook's Form Setup, Survey Questions,
+and Control Calibration tabs. A new form starts in DRAFT and cannot run
+until its extracted schema and calibration have been reviewed and approved.
 
 WHERE THE VALUES BELOW ACTUALLY COME FROM: every constant below is a
-FALLBACK default, used only if the GCS-hosted configuration workbook (see
-_CONFIG_GCS_BUCKET/_CONFIG_GCS_BLOB just below) can't be read. On a normal
+FALLBACK default for operational settings; the GCS-hosted workbook (see
+_CONFIG_GCS_BUCKET/_CONFIG_GCS_BLOB just below) is required for the survey
+schema. On a normal
 run, this module downloads and parses that workbook at import time and
 OVERRIDES these defaults with whatever it finds - see _load_overrides()
 near the bottom of this file. This means the real, current values a given
@@ -32,12 +28,11 @@ this module's own `import pipeline_config; print(pipeline_config.GCS_BUCKET)`
 etc. after import) to see what actually applied. Regenerate the workbook's
 starting point with generate_pipeline_config_doc.py.
 
-To port this pipeline to a different survey PDF: edit the "Survey
-Questions" tab of that workbook (and the "Settings" tab for a different
-bucket/project/table/threshold) - no code change needed. If the workbook is
-unreachable, every step falls back to the values hardcoded below and prints
-a warning; a stale fallback still WORKS, it just means the workbook's edits
-aren't taking effect yet.
+To port this pipeline to a different survey PDF, generate a DRAFT workbook
+from its blank template with generate_pipeline_config_doc.py
+--setup-from-pdf, review the questions and geometry, then approve its
+profile. Older workbooks without the form-profile tabs remain supported.
+The workbook is required at runtime; missing configuration is a fatal error.
 """
 
 import io
@@ -58,9 +53,8 @@ _CONFIG_GCS_BLOB = "Pipeline_Config/pipeline_configuration_2027.xlsx"
 GCS_BUCKET = "tps_survey"
 # step1's input: raw, multi-survey combined scans as they land from scanning.
 GCS_RAW_PREFIX = "TPS_Scanned_2025/"
-# step1's output, and step2/step3/step4's input: one 2-page PDF per survey,
-# organized into <date folder>/<batch subfolder>/ - see step1_merge_pdf.py's
-# split_combined_pdf()/organize_loose_pdfs().
+# step1's output, and step2/step3/step4's input: one configured-page-count
+# PDF per survey, stored beneath a folder named after its source PDF.
 GCS_SPLIT_PREFIX = "TPS_Scanned_2025_Reorgnized/"
 
 # step6's input: the human-reviewed feedback/corrections spreadsheet.
@@ -71,6 +65,23 @@ GCS_FEEDBACK_BUCKET = "tps_survey"
 # lexicographically) file from - see export_needs_review_feedback() in
 # step4_process_pdf.py and step6_load_feedback.py's find_latest_feedback_blob().
 GCS_FEEDBACK_PREFIX = "TPS_Feedback/"
+FEEDBACK_FILE_PREFIX = "tps_feedback_"
+
+# ==========================================================================
+# Form profile — reviewed form-specific setup generated from a blank template
+# ==========================================================================
+FORM_SETUP_STATUS = "APPROVED"
+FORM_PROFILE_CONFIGURED = False
+FORM_NAME = "Treatment Perceptions Survey"
+PAGES_PER_SURVEY = 2
+FORM_DETECTION_MODE = "hybrid"
+SURVEY_LANGUAGE = "English"
+DECLINED_KEYWORDS = ["declined"]
+FORM_BASELINE_MARKS = {}
+FORM_INK_THRESHOLD = 165
+FORM_GRID_COLUMN_CENTERS = []
+FORM_GRID_BOX_EXPECTED_SIZE = 40
+FORM_CONTROL_CALIBRATION = []
 
 # ==========================================================================
 # GCP project / BigQuery dataset+tables
@@ -91,12 +102,12 @@ BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK = "survey_responses_with_feedback"  # st
 # Vertex AI / Cloud Vision
 # ==========================================================================
 VERTEX_LOCATION = "global"
-# step1: TPS-number extraction, the content/blank/declined check, and the
-# survey-language gate all share this one model (explicit user request: keep
-# a single model across every step1 Gemini call rather than mixing in a
-# stronger/costlier one for just part of it - see validate_survey_language()
-# and assess_page_content_and_declined() in step1_merge_pdf.py).
-TPS_EXTRACTION_MODEL = "gemini-3.8-flash"
+# step1's form-content and language checks use one configurable model.
+STEP1_CLASSIFICATION_MODEL = "gemini-3.8-flash"
+# Backward compatibility for existing workbooks and callers.
+TPS_EXTRACTION_MODEL = STEP1_CLASSIFICATION_MODEL
+STEP1_CHECK_MAX_ATTEMPTS = 3
+STEP1_CHECK_RETRY_DELAY_SECONDS = 2
 # step4: the main survey question/answer extraction model.
 GEMINI_MODEL = "gemini-3.8-flash"
 # step3: the Cloud Vision judgment call on handwriting_readable/tears_or_
@@ -110,12 +121,9 @@ VISION_PROJECT_ID = None
 # ==========================================================================
 # Report year
 # ==========================================================================
-# The year this batch of surveys was collected - fed to step4's extraction
-# prompt as a known anchor for reading H6 ("Today's Date") and used in its
-# "does the year look right" plausibility check on Cloud Vision's OCR of
-# that field. Not currently consulted by step1/step2 (they derive a survey's
-# date from its folder name, with the run's own current year as a fallback
-# only when the folder name has none).
+# Legacy TPS setting used for H6 date guidance/validation when loading a
+# workbook without a reviewed form profile. New profiles use per-question
+# Expected Year metadata instead.
 REPORT_YEAR = "2025"
 
 # ==========================================================================
@@ -275,6 +283,7 @@ _VISION_AUTHORITATIVE_FIELDS = set()
 # Which page (0-indexed) of a survey's 2-page PDF each write-in question
 # sits on - used to fetch the right page's Vision OCR result.
 _WRITTEN_TEXT_QUESTION_PAGE = {}
+QUESTION_METADATA_BY_NUMBER = {}
 
 
 # ==========================================================================
@@ -318,7 +327,9 @@ def _apply_settings(settings: dict) -> None:
         "BQ_TABLE_CALIBRATION", "BQ_TABLE_QUALITY", "BQ_TABLE_SURVEY_RESPONSES",
         "BQ_TABLE_CORRECTIONS", "BQ_TABLE_PIPELINE_CONFIG", "BQ_TABLE_FILE_QUALITY",
         "BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK", "VERTEX_LOCATION",
-        "TPS_EXTRACTION_MODEL", "GEMINI_MODEL", "STEP3_VISION_MODEL", "REPORT_YEAR",
+        "STEP1_CLASSIFICATION_MODEL", "TPS_EXTRACTION_MODEL",
+        "GEMINI_MODEL", "STEP3_VISION_MODEL", "REPORT_YEAR",
+        "FEEDBACK_FILE_PREFIX",
     )
     float_params = ("MODEL_CONFIDENCE_THRESHOLD", "VISION_FREEFORM_COVERAGE_THRESHOLD")
     bool_params = ("VISION_DOUBLE_CHECK_ENABLED", "PDF_QUALITY_ROUTING_ENABLED", "PIPELINE_CONFIG_ENABLED")
@@ -334,12 +345,39 @@ def _apply_settings(settings: dict) -> None:
             g[name] = float(raw)
         elif name == "FILE_EXTRACTION_WORKERS":
             g[name] = int(float(raw))
+        elif name == "STEP1_CHECK_MAX_ATTEMPTS":
+            attempts = int(float(raw))
+            if attempts < 1:
+                raise ValueError("STEP1_CHECK_MAX_ATTEMPTS must be at least 1")
+            g[name] = attempts
+        elif name == "STEP1_CHECK_RETRY_DELAY_SECONDS":
+            delay = float(raw)
+            if delay < 0:
+                raise ValueError("STEP1_CHECK_RETRY_DELAY_SECONDS cannot be negative")
+            g[name] = delay
         elif name in bool_params:
             g[name] = _is_yes(raw)
         elif name == "VISION_PROJECT_ID":
             g[name] = raw or None
+        elif name == "PAGES_PER_SURVEY":
+            pages = int(float(raw))
+            if pages < 1:
+                raise ValueError("PAGES_PER_SURVEY must be at least 1")
+            g[name] = pages
+        elif name in ("FORM_SETUP_STATUS", "FORM_NAME", "FORM_DETECTION_MODE", "SURVEY_LANGUAGE"):
+            g[name] = raw
+        elif name == "DECLINED_KEYWORDS":
+            g[name] = split_choices(raw)
         # else: a recognized-but-unhandled name (shouldn't happen given the
         # lists above cover every settings-sheet row) - leave the default.
+
+    legacy_model = settings.get("TPS_EXTRACTION_MODEL", "")
+    configured_model = settings.get("STEP1_CLASSIFICATION_MODEL", "")
+    if configured_model:
+        g["STEP1_CLASSIFICATION_MODEL"] = configured_model
+    elif legacy_model:
+        g["STEP1_CLASSIFICATION_MODEL"] = legacy_model
+    g["TPS_EXTRACTION_MODEL"] = g["STEP1_CLASSIFICATION_MODEL"]
 
 
 def _first_present(row: dict, *keys: str) -> str:
@@ -388,6 +426,22 @@ def _apply_survey_questions(rows: list) -> None:
     vision_freeform = set()
     vision_authoritative = set()
     written_text_page = {}
+    question_metadata = {}
+    legacy_page_column = (
+        "Which page of the 2-page form is this on? (0 = first page, 1 = second page; leave blank for a Single/Multiple Choice question)",
+        "Page (0 or 1)",
+    )
+    legacy_page_values = [
+        int(float(value))
+        for row in rows
+        for value in [_first_present(row, *legacy_page_column)]
+        if value != ""
+    ]
+    legacy_pages_one_based = (
+        PAGES_PER_SURVEY > 1
+        and PAGES_PER_SURVEY in legacy_page_values
+        and 0 not in legacy_page_values
+    )
 
     for row in rows:
         number = row.get("Number", "")
@@ -439,13 +493,70 @@ def _apply_survey_questions(rows: list) -> None:
         )):
             vision_authoritative.add(number)
 
-        page = _first_present(
-            row,
-            "Which page of the 2-page form is this on? (0 = first page, 1 = second page; leave blank for a Single/Multiple Choice question)",
-            "Page (0 or 1)",
-        )
-        if page != "":
-            written_text_page[number] = int(float(page))
+        page_1based = _first_present(row, "Question Page (1-based)")
+        if page_1based:
+            page_index = int(float(page_1based)) - 1
+        else:
+            legacy_page = _first_present(row, *legacy_page_column)
+            if legacy_page == "":
+                page_index = None
+            else:
+                page_value = int(float(legacy_page))
+                page_index = page_value - 1 if legacy_pages_one_based else page_value
+        if page_index is not None:
+            if page_index < 0 or page_index >= PAGES_PER_SURVEY:
+                raise ValueError(
+                    f"Question {number!r} page {page_index + 1} is outside "
+                    f"the configured {PAGES_PER_SURVEY}-page form"
+                )
+            question_metadata.setdefault(number, {})["page"] = page_index
+            if vision_check != "none":
+                written_text_page[number] = page_index
+
+        metadata_fields = {
+            "Expected Answer Format": "expected_format",
+            "Expected Digit Count": "expected_digits",
+            "Expected Date Format": "date_format",
+            "Expected Year": "expected_year",
+            "Minimum Value": "minimum",
+            "Maximum Value": "maximum",
+            "Vision Anchor Text": "vision_anchor",
+            "Vision Anchor Direction": "vision_direction",
+            "Vision Anchor Reach (pixels)": "vision_reach",
+            "Vision Stop Phrase": "vision_stop_phrase",
+        }
+        metadata = question_metadata.setdefault(number, {})
+        for column, key in metadata_fields.items():
+            value = row.get(column, "")
+            if value == "":
+                continue
+            if key in ("expected_digits", "expected_year", "vision_reach"):
+                metadata[key] = int(float(value))
+            elif key in ("minimum", "maximum"):
+                metadata[key] = float(value)
+            else:
+                metadata[key] = value
+        expected_format = str(metadata.get("expected_format", "")).lower()
+        if expected_format and expected_format not in {"digits", "integer", "decimal", "date"}:
+            raise ValueError(
+                f"Question {number!r} has unsupported Expected Answer Format "
+                f"{expected_format!r}; use digits, integer, decimal, or date."
+            )
+        if metadata.get("expected_digits") is not None and metadata["expected_digits"] < 1:
+            raise ValueError(f"Question {number!r} Expected Digit Count must be positive")
+        if (
+            metadata.get("minimum") is not None
+            and metadata.get("maximum") is not None
+            and metadata["minimum"] > metadata["maximum"]
+        ):
+            raise ValueError(f"Question {number!r} Minimum Value exceeds Maximum Value")
+        direction = str(metadata.get("vision_direction", "right")).lower()
+        if metadata.get("vision_anchor") and direction not in {"right", "below"}:
+            raise ValueError(
+                f"Question {number!r} Vision Anchor Direction must be right or below"
+            )
+        if metadata.get("vision_anchor"):
+            metadata["vision_direction"] = direction
 
     if not survey_questions:
         raise ValueError(
@@ -461,6 +572,138 @@ def _apply_survey_questions(rows: list) -> None:
     g["_VISION_FREEFORM_FIELDS"] = vision_freeform
     g["_VISION_AUTHORITATIVE_FIELDS"] = vision_authoritative
     g["_WRITTEN_TEXT_QUESTION_PAGE"] = written_text_page
+    g["QUESTION_METADATA_BY_NUMBER"] = question_metadata
+
+
+def _apply_form_setup(rows: list) -> None:
+    """Apply generated form profile values; draft profiles are never runnable."""
+    globals()["FORM_PROFILE_CONFIGURED"] = True
+    values = {
+        _clean(row.get("Parameter", "")): _clean(row.get("Value", ""))
+        for _, row in rows.iterrows()
+        if _clean(row.get("Parameter", "")) != ""
+    }
+    if values.get("FORM_SETUP_STATUS", FORM_SETUP_STATUS).upper() != "APPROVED":
+        raise ValueError(
+            "The form setup is still DRAFT. Review the generated question and "
+            "control mappings in the workbook, then set FORM_SETUP_STATUS to APPROVED."
+        )
+    if values.get("FORM_NAME"):
+        globals()["FORM_NAME"] = values["FORM_NAME"]
+    if values.get("PAGES_PER_SURVEY"):
+        pages = int(float(values["PAGES_PER_SURVEY"]))
+        if pages < 1:
+            raise ValueError("PAGES_PER_SURVEY must be at least 1")
+        globals()["PAGES_PER_SURVEY"] = pages
+    if values.get("FORM_DETECTION_MODE"):
+        mode = values["FORM_DETECTION_MODE"].lower()
+        if mode not in {"hybrid", "model_only"}:
+            raise ValueError("FORM_DETECTION_MODE must be hybrid or model_only")
+        globals()["FORM_DETECTION_MODE"] = mode
+    if values.get("SURVEY_LANGUAGE"):
+        globals()["SURVEY_LANGUAGE"] = values["SURVEY_LANGUAGE"]
+    if values.get("DECLINED_KEYWORDS"):
+        globals()["DECLINED_KEYWORDS"] = split_choices(values["DECLINED_KEYWORDS"])
+    for key, value in (
+        ("FORM_BASELINE_MARKS", "BASELINE_MARKS_JSON"),
+        ("FORM_GRID_COLUMN_CENTERS", "GRID_COLUMN_CENTERS_JSON"),
+    ):
+        if values.get(value):
+            import json
+            parsed = json.loads(values[value])
+            if key == "FORM_BASELINE_MARKS":
+                parsed = {
+                    int(page): tuple(tuple(float(coord) for coord in point) for point in points)
+                    for page, points in parsed.items()
+                }
+            else:
+                parsed = tuple(float(center) for center in parsed)
+            globals()[key] = parsed
+    if values.get("FORM_INK_THRESHOLD"):
+        globals()["FORM_INK_THRESHOLD"] = int(float(values["FORM_INK_THRESHOLD"]))
+    if values.get("FORM_GRID_BOX_EXPECTED_SIZE"):
+        globals()["FORM_GRID_BOX_EXPECTED_SIZE"] = float(values["FORM_GRID_BOX_EXPECTED_SIZE"])
+
+
+def _apply_control_calibration(rows: list) -> None:
+    question_choices = {
+        number: split_choices(choices) if is_choice_list(choices) else []
+        for number, _group, _text, choices in SURVEY_QUESTIONS
+    }
+    calibration = []
+    for _, row in rows.iterrows():
+        if _clean(row.get("Approval Status", "")).upper() != "APPROVED":
+            continue
+        question = _clean(row.get("Question Number", ""))
+        label = _clean(row.get("Choice Label", ""))
+        control_type = _clean(row.get("Control Type", "")).lower()
+        if not question or not label or control_type not in {"checkbox", "circle"}:
+            raise ValueError(
+                "Approved control calibration rows need a question number, "
+                "choice label, and Control Type of checkbox or circle."
+            )
+        if question not in question_choices or label not in question_choices[question]:
+            raise ValueError(
+                f"Approved control calibration for {question!r}/{label!r} does not "
+                "match a configured question and answer choice."
+            )
+        coords = tuple(
+            float(row.get(column))
+            for column in ("Left", "Right", "Top", "Bottom")
+        )
+        if not (coords[0] < coords[1] and coords[2] < coords[3]):
+            raise ValueError(f"Invalid approved rectangle for question {question!r}, label {label!r}")
+        page = int(float(row.get("Page (1-based)"))) - 1
+        if page < 0 or page >= PAGES_PER_SURVEY:
+            raise ValueError(
+                f"Approved calibration for question {question!r} uses page "
+                f"{page + 1}, outside the configured {PAGES_PER_SURVEY}-page form"
+            )
+        calibration.append({
+            "question": question,
+            "page": page,
+            "control_type": control_type,
+            "label": label,
+            "rect": coords,
+            "layout": _clean(row.get("Layout", "")) or "1",
+        })
+        question_meta = QUESTION_METADATA_BY_NUMBER.setdefault(question, {})
+        prior_page = question_meta.setdefault("page", page)
+        if prior_page != page:
+            raise ValueError(
+                f"Approved controls for question {question!r} span multiple pages; "
+                "the question page must be reviewed explicitly."
+            )
+    globals()["FORM_CONTROL_CALIBRATION"] = calibration
+
+
+def _validate_form_question_pages() -> None:
+    if not FORM_PROFILE_CONFIGURED or FORM_SETUP_STATUS.upper() != "APPROVED":
+        return
+    missing_pages = [
+        number for number, _group, _text, _choices in SURVEY_QUESTIONS
+        if "page" not in QUESTION_METADATA_BY_NUMBER.get(number, {})
+    ]
+    if missing_pages:
+        raise ValueError(
+            "Approved form profiles need a Question Page (1-based) for every question; "
+            f"missing: {', '.join(missing_pages)}"
+        )
+
+
+def _validate_calibration_review(rows: list) -> None:
+    if not FORM_PROFILE_CONFIGURED or FORM_SETUP_STATUS.upper() != "APPROVED":
+        return
+    statuses = {
+        _clean(row.get("Status", "")).upper()
+        for _, row in rows.iterrows()
+    }
+    if not statuses or statuses != {"APPROVED"}:
+        raise ValueError(
+            "An approved form profile requires every Calibration Review row to be "
+            "marked APPROVED. Suggested geometry must be explicitly reviewed before "
+            "the profile can run."
+        )
 
 
 def _load_overrides() -> None:
@@ -480,12 +723,57 @@ def _load_overrides() -> None:
         }
         _apply_settings(settings)
 
+        workbook = pd.ExcelFile(io.BytesIO(data))
+        if "Form Setup" in workbook.sheet_names:
+            form_setup_df = pd.read_excel(io.BytesIO(data), sheet_name="Form Setup")
+            _apply_form_setup(form_setup_df)
+
         questions_df = pd.read_excel(io.BytesIO(data), sheet_name="Survey Questions")
         rows = [
             {col: _clean(row[col]) for col in questions_df.columns}
             for _, row in questions_df.iterrows()
         ]
         _apply_survey_questions(rows)
+
+        if "Control Calibration" in workbook.sheet_names:
+            calibration_df = pd.read_excel(io.BytesIO(data), sheet_name="Control Calibration")
+            if (
+                FORM_PROFILE_CONFIGURED
+                and FORM_SETUP_STATUS.upper() == "APPROVED"
+                and FORM_DETECTION_MODE == "hybrid"
+                and any(
+                    _clean(row.get("Approval Status", "")).upper() != "APPROVED"
+                    for _, row in calibration_df.iterrows()
+                    if any(_clean(row.get(column, "")) for column in calibration_df.columns)
+                )
+            ):
+                raise ValueError(
+                    "Hybrid mode requires every populated Control Calibration row to be "
+                    "marked APPROVED; pending mappings cannot activate detectors."
+                )
+            _apply_control_calibration(calibration_df)
+            if FORM_DETECTION_MODE == "hybrid" and not FORM_CONTROL_CALIBRATION:
+                raise ValueError(
+                    "FORM_DETECTION_MODE is hybrid, but the workbook contains no "
+                    "approved control calibration rows. Use model_only or approve "
+                    "the mapped controls before enabling calibrated detectors."
+                )
+            if FORM_DETECTION_MODE == "hybrid" and any(
+                item["control_type"] == "circle" and item["question"] != "H3"
+                for item in FORM_CONTROL_CALIBRATION
+            ):
+                raise ValueError(
+                    "Hybrid mode's circle detector currently supports H3 only. "
+                    "Use model_only until a circle mapping has a compatible detector."
+                )
+        if "Calibration Review" in workbook.sheet_names:
+            review_df = pd.read_excel(io.BytesIO(data), sheet_name="Calibration Review")
+            _validate_calibration_review(review_df)
+        elif FORM_PROFILE_CONFIGURED and FORM_SETUP_STATUS.upper() == "APPROVED":
+            raise ValueError(
+                "An approved Form Setup profile requires a Calibration Review sheet."
+            )
+        _validate_form_question_pages()
 
         print(f"[pipeline_config] Loaded settings + survey schema from {location}.")
     except Exception as e:  # noqa: BLE001 - re-raised below with context

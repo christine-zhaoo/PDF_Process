@@ -11,13 +11,11 @@ survey's questions.
 Usage:
     ./.venv/bin/python generate_pipeline_config_doc.py [output.xlsx]
 
-By default the workbook is PRE-FILLED with this deployment's CURRENT LIVE
-values - read from the GCS-hosted workbook itself if it's reachable (so
-regenerating never silently discards a value someone already changed there),
-falling back to pipeline_config.py's own built-in defaults only for a value
-that workbook doesn't have yet. To configure a NEW deployment from scratch,
-edit the "Answer" column in Settings and the rows in "Survey Questions",
-leaving anything you don't need to change alone.
+By default the workbook is pre-filled from the current settings and question
+schema. If the live workbook has no reviewed Form Setup profile, the new
+profile is deliberately DRAFT/model_only and has no active control geometry.
+Use --setup-from-pdf to generate a question and geometry-review draft for a
+new blank form; no suggestion is activated without human approval.
 """
 import argparse
 import io
@@ -92,6 +90,8 @@ def _current(param_name: str, code_default):
     fallback default."""
     if param_name in _LIVE:
         return _LIVE[param_name]
+    if param_name == "STEP1_CLASSIFICATION_MODEL" and "TPS_EXTRACTION_MODEL" in _LIVE:
+        return _LIVE["TPS_EXTRACTION_MODEL"]
     return code_default
 
 
@@ -111,11 +111,13 @@ SETTINGS_ROWS = [
     ("GCS_RAW_PREFIX", "Inside that bucket, which folder holds the RAW scans as they come off the scanner, before this pipeline splits them into one file per survey (step 1's input)?",
      cfg.GCS_RAW_PREFIX, "Open the bucket in Cloud Storage and look at the folder structure; ask whoever uploads the scans which folder they drop new files into."),
     ("GCS_SPLIT_PREFIX", "Inside that bucket, which folder holds the SPLIT files - one PDF per survey - that step 1 produces and steps 2/3/4 read from?",
-     cfg.GCS_SPLIT_PREFIX, "Same place as above - the folder step 1 writes its output into. Look for subfolders named by date (e.g. \"Nov 23 2025\")."),
+     cfg.GCS_SPLIT_PREFIX, "Same place as above - the folder step 1 writes its output into. Each source PDF is organized under a folder named after its filename stem."),
     ("GCS_FEEDBACK_BUCKET", "What bucket holds the spreadsheet where a human reviewer's corrections are recorded (step 6's input)?",
      cfg.GCS_FEEDBACK_BUCKET, "Usually the same bucket as above, unless your team keeps reviewed feedback in a separate bucket - check with whoever runs the review step."),
     ("GCS_FEEDBACK_PREFIX", "Inside that bucket, which folder does step 4 write its reviewable feedback spreadsheets into, and step 6 read the latest one from?",
      cfg.GCS_FEEDBACK_PREFIX, "Cloud Storage → open the feedback bucket → look for a folder containing files named like \"tps_feedback_20251123_143000.xlsx\"; step 6 always picks the newest one automatically."),
+    ("FEEDBACK_FILE_PREFIX", "Prefix used for timestamped review feedback spreadsheets written by step 4 and selected by step 6.",
+     cfg.FEEDBACK_FILE_PREFIX, "Use a stable filename prefix; the pipeline appends YYYYMMDD_HHMMSS.xlsx."),
 
     # --- Section: Where the processing runs ---
     ("__SECTION__", "WHERE THE PROCESSING RUNS (GOOGLE CLOUD PROJECT)"),
@@ -149,8 +151,12 @@ SETTINGS_ROWS = [
 
     # --- Section: Which AI models to use ---
     ("__SECTION__", "WHICH AI MODELS TO USE"),
-    ("TPS_EXTRACTION_MODEL", "Which Gemini model does step 1 use to read each scanned page's survey ID number and check whether the page is blank, declined, or in the wrong language?",
-     cfg.TPS_EXTRACTION_MODEL, "Vertex AI Console → Model Garden → search \"Gemini\" → copy the exact model ID shown (e.g. gemini-3.8-flash). Ask engineering before changing this - a different model can change accuracy."),
+    ("STEP1_CLASSIFICATION_MODEL", "Which Gemini model does step 1 use to check whether each survey page is blank, declined, or written in the configured language?",
+     cfg.STEP1_CLASSIFICATION_MODEL, "Vertex AI Console → Model Garden → search \"Gemini\" → copy the exact model ID shown (e.g. gemini-3.8-flash)."),
+    ("STEP1_CHECK_MAX_ATTEMPTS", "How many times should step 1 retry its language check when a model response is unavailable or unrecognized?",
+     cfg.STEP1_CHECK_MAX_ATTEMPTS, "Internal reliability setting. Keep at least 1 attempt."),
+    ("STEP1_CHECK_RETRY_DELAY_SECONDS", "How many seconds should step 1 wait between language-check attempts?",
+     cfg.STEP1_CHECK_RETRY_DELAY_SECONDS, "Internal reliability setting. Use 0 for no delay."),
     ("GEMINI_MODEL", "Which Gemini model does step 4 use to read every question's answer off the scanned form?",
      cfg.GEMINI_MODEL, "Same place as above. This is the single most important model in the whole pipeline - changing it changes the accuracy of every extracted answer."),
     ("STEP3_VISION_MODEL", "Which Gemini model does step 3 use for its own judgment call on whether a scan's handwriting is readable or the page is torn/damaged?",
@@ -158,8 +164,8 @@ SETTINGS_ROWS = [
 
     # --- Section: This survey's own details ---
     ("__SECTION__", "THIS SURVEY BATCH'S OWN DETAILS"),
-    ("REPORT_YEAR", "What calendar year was this batch of surveys actually filled out/collected? Used to sanity-check handwritten dates (e.g. flag a date that reads as a clearly wrong year).",
-     cfg.REPORT_YEAR, "Look at the scanned forms themselves, or ask whoever collected them. This should be a single 4-digit year, e.g. 2025."),
+    ("REPORT_YEAR", "Legacy TPS date-check year. New form profiles should set Expected Year on the relevant question in Survey Questions instead.",
+     cfg.REPORT_YEAR, "Used only when loading a workbook without a reviewed Form Setup profile."),
 
     # --- Section: Accuracy tuning (engineering knobs) ---
     ("__SECTION__", "ACCURACY TUNING (these have no real-world \"source\" - they are internal tuning knobs. Leave them at their defaults unless engineering specifically asks you to change one, e.g. because a particular question keeps getting flagged for review even when it's clearly correct)"),
@@ -217,10 +223,20 @@ QUESTIONS_HEADER = [
     "Number", "Group Key", "Question Text",
     "Answer Choices (only for Single/Multiple Choice - separate each choice with a | pipe. A / slash INSIDE a choice is part of that choice's own text, e.g. 'Yes | No' but 'Unsure/Questioning/Don't know' is one single choice)",
     "Question Type",
-    "Which page of the 2-page form is this on? (0 = first page, 1 = second page; leave blank for a Single/Multiple Choice question)",
+    "Question Page (1-based)",
     "If the AI's answer and the automatic checkbox-detector disagree, trust the AI's answer instead of the detector? (Y/N)",
     "OK to leave this question blank without flagging it for review? (Y/N)",
     "If Cloud Vision's OCR and the AI disagree on this written answer, trust Cloud Vision instead of the AI? (Y/N)",
+    "Expected Answer Format",
+    "Expected Digit Count",
+    "Expected Date Format",
+    "Expected Year",
+    "Minimum Value",
+    "Maximum Value",
+    "Vision Anchor Text",
+    "Vision Anchor Direction",
+    "Vision Anchor Reach (pixels)",
+    "Vision Stop Phrase",
 ]
 
 
@@ -240,6 +256,15 @@ def _question_type_for(number: str) -> str:
 def _question_rows():
     for number, group_key, sub_text, choices in cfg.SURVEY_QUESTIONS:
         qtype = _question_type_for(number)
+        metadata = cfg.QUESTION_METADATA_BY_NUMBER.get(number, {})
+        page_index = metadata.get("page")
+        if page_index is None:
+            page_index = cfg._WRITTEN_TEXT_QUESTION_PAGE.get(number)
+        if page_index is None and not cfg.FORM_PROFILE_CONFIGURED:
+            if number.startswith("H"):
+                page_index = 0
+            elif number.isdigit():
+                page_index = 0 if int(number) <= 23 else 1
         yield [
             number,
             group_key or "",
@@ -249,14 +274,72 @@ def _question_rows():
             # pipe form - see pipeline_config.CHOICE_SEPARATOR.
             cfg.join_choices(cfg.split_choices(choices)) if cfg.is_choice_list(choices) else "",
             qtype,
-            cfg._WRITTEN_TEXT_QUESTION_PAGE.get(number, ""),
+            page_index + 1 if page_index is not None else "",
             _yn(number in cfg.MODEL_OVERRULES_PIXEL_QUESTION_NUMBERS),
             _yn(number in cfg._BLANK_ANSWER_EXEMPT_FIELDS),
             _yn(number in cfg._VISION_AUTHORITATIVE_FIELDS),
+            metadata.get("expected_format", ""),
+            metadata.get("expected_digits", ""),
+            metadata.get("date_format", ""),
+            metadata.get("expected_year", ""),
+            metadata.get("minimum", ""),
+            metadata.get("maximum", ""),
+            metadata.get("vision_anchor", ""),
+            metadata.get("vision_direction", ""),
+            metadata.get("vision_reach", ""),
+            metadata.get("vision_stop_phrase", ""),
         ]
 
 
-def build_workbook(path: str) -> None:
+FORM_SETUP_HEADER = ["Parameter", "Value", "Description"]
+CONTROL_CALIBRATION_HEADER = [
+    "Question Number", "Page (1-based)", "Control Type", "Choice Label",
+    "Left", "Right", "Top", "Bottom", "Layout", "Approval Status",
+]
+CALIBRATION_REVIEW_HEADER = ["Review Item", "Status", "Suggested Values / Evidence"]
+
+
+def _form_setup_rows(overrides=None):
+    overrides = overrides or {}
+    baseline = (
+        cfg.FORM_BASELINE_MARKS if cfg.FORM_PROFILE_CONFIGURED else {}
+    )
+    centers = (
+        cfg.FORM_GRID_COLUMN_CENTERS if cfg.FORM_PROFILE_CONFIGURED else []
+    )
+    values = [
+        ("FORM_SETUP_STATUS", overrides.get(
+            "FORM_SETUP_STATUS",
+            cfg.FORM_SETUP_STATUS if cfg.FORM_PROFILE_CONFIGURED else "DRAFT",
+        ),
+         "Set to APPROVED only after reviewing the extracted question schema and calibration suggestions."),
+        ("FORM_NAME", overrides.get("FORM_NAME", cfg.FORM_NAME),
+         "Human-readable name for this survey form."),
+        ("PAGES_PER_SURVEY", overrides.get("PAGES_PER_SURVEY", cfg.PAGES_PER_SURVEY),
+         "Number of pages belonging to exactly one survey response."),
+        ("FORM_DETECTION_MODE", overrides.get(
+            "FORM_DETECTION_MODE",
+            cfg.FORM_DETECTION_MODE if cfg.FORM_PROFILE_CONFIGURED else "model_only",
+        ),
+         "model_only is the safe starting point for a new layout; hybrid enables approved calibrated detectors."),
+        ("SURVEY_LANGUAGE", overrides.get("SURVEY_LANGUAGE", cfg.SURVEY_LANGUAGE),
+         "Expected language for the survey."),
+        ("DECLINED_KEYWORDS", overrides.get("DECLINED_KEYWORDS", cfg.join_choices(cfg.DECLINED_KEYWORDS)),
+         "Pipe-separated printed terms that identify a declined survey."),
+        ("BASELINE_MARKS_JSON", overrides.get("BASELINE_MARKS_JSON", json.dumps(baseline)),
+         "Four registration-mark centers per page, measured on the reviewed reference form; blank for model-only forms."),
+        ("FORM_INK_THRESHOLD", overrides.get("FORM_INK_THRESHOLD", cfg.FORM_INK_THRESHOLD),
+         "Grayscale threshold used by the scan measurement and checkbox detectors."),
+        ("GRID_COLUMN_CENTERS_JSON", overrides.get("GRID_COLUMN_CENTERS_JSON", json.dumps(centers)),
+         "X centers for the approved fixed-column answer grid; leave empty if the form has no such grid."),
+        ("FORM_GRID_BOX_EXPECTED_SIZE", overrides.get("FORM_GRID_BOX_EXPECTED_SIZE", cfg.FORM_GRID_BOX_EXPECTED_SIZE),
+         "Expected width/height of a grid control in rendered pixels."),
+    ]
+    return [[name, value, description] for name, value, description in values]
+
+
+def build_workbook(path: str, *, form_setup=None, calibration_review=None,
+                   control_rows=None, question_rows=None) -> None:
     wb = openpyxl.Workbook()
 
     # ---- Settings sheet ----
@@ -286,11 +369,11 @@ def build_workbook(path: str) -> None:
     # ---- Survey Questions sheet ----
     ws2 = wb.create_sheet("Survey Questions")
     ws2.append(QUESTIONS_HEADER)
-    for row in _question_rows():
+    for row in (question_rows if question_rows is not None else _question_rows()):
         ws2.append(row)
-        for col in (5, 7, 8, 9):
+        for col in (5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19):
             ws2.cell(row=ws2.max_row, column=col).fill = ANSWER_FILL
-    widths2 = [10, 14, 48, 48, 30, 20, 20, 18, 20]
+    widths2 = [10, 14, 48, 48, 30, 20, 20, 18, 20, 24, 18, 20, 16, 16, 16, 28, 24, 20, 28]
     for i, w in enumerate(widths2, start=1):
         ws2.column_dimensions[get_column_letter(i)].width = w
     for row in ws2.iter_rows(min_row=2, max_row=ws2.max_row):
@@ -316,6 +399,91 @@ def build_workbook(path: str) -> None:
     for col_letter in ("G", "H", "I"):
         yn_dv.add(f"{col_letter}2:{col_letter}{max_data_row}")
 
+    # ---- Form Setup / calibration review sheets ----
+    ws_setup = wb.create_sheet("Form Setup")
+    ws_setup.append(FORM_SETUP_HEADER)
+    for row in _form_setup_rows(form_setup):
+        ws_setup.append(row)
+    for i, width in enumerate((32, 36, 90), start=1):
+        ws_setup.column_dimensions[get_column_letter(i)].width = width
+    _style_header(ws_setup, len(FORM_SETUP_HEADER))
+    for row in ws_setup.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = WRAP
+
+    ws_cal = wb.create_sheet("Control Calibration")
+    ws_cal.append(CONTROL_CALIBRATION_HEADER)
+    if control_rows is not None:
+        selected_control_rows = control_rows
+    elif cfg.FORM_PROFILE_CONFIGURED:
+        selected_control_rows = cfg.FORM_CONTROL_CALIBRATION
+    else:
+        selected_control_rows = []
+    for row in selected_control_rows:
+        if isinstance(row, dict):
+            row = [
+                row["question"], row["page"] + 1, row["control_type"], row["label"],
+                *row["rect"], row.get("layout", "1"), row.get("approval_status", "APPROVED"),
+            ]
+        ws_cal.append(row)
+    for i, width in enumerate((18, 16, 18, 50, 14, 14, 14, 14, 12, 20), start=1):
+        ws_cal.column_dimensions[get_column_letter(i)].width = width
+    _style_header(ws_cal, len(CONTROL_CALIBRATION_HEADER))
+    for row in ws_cal.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = WRAP
+    approval_dv = DataValidation(type="list", formula1='"APPROVED,PENDING"', allow_blank=False)
+    ws_cal.add_data_validation(approval_dv)
+    approval_dv.add(f"J2:J{ws_cal.max_row + 200}")
+
+    ws_review = wb.create_sheet("Calibration Review")
+    ws_review.append(CALIBRATION_REVIEW_HEADER)
+    if calibration_review is None:
+        ws_review.append([
+            "Current calibration",
+            "APPROVED" if cfg.FORM_PROFILE_CONFIGURED else "PENDING",
+            "Existing reviewed configuration." if cfg.FORM_PROFILE_CONFIGURED
+            else "No form profile exists yet; calibration remains inactive.",
+        ])
+    else:
+        generated = calibration_review.get("generated", {})
+        summary = {
+            key: generated.get(key)
+            for key in (
+                "BASELINE_MARKS", "INK_THRESHOLD", "GRID_COLUMN_CENTERS",
+                "GRID_BOX_EXPECTED_SIZE",
+            )
+        }
+        ws_review.append(["Measured profile suggestions", "PENDING", json.dumps(summary)])
+        for page in calibration_review.get("page_geometry", []):
+            geometry = {
+                key: page.get(key)
+                for key in ("page", "boxes", "box_centers_x", "box_expected_size", "circles")
+            }
+            ws_review.append([
+                f"Detected controls on page {page.get('page')}",
+                "PENDING",
+                json.dumps(geometry),
+            ])
+        for item in calibration_review.get("review_prompts", []):
+            ws_review.append([
+                item.get("prompt", "Review calibration"),
+                "PENDING",
+                item.get("reason", ""),
+            ])
+    ws_review.column_dimensions["A"].width = 32
+    ws_review.column_dimensions["B"].width = 18
+    ws_review.column_dimensions["C"].width = 110
+    _style_header(ws_review, len(CALIBRATION_REVIEW_HEADER))
+    for row in ws_review.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = WRAP
+    review_dv = DataValidation(type="list", formula1='"APPROVED,PENDING"', allow_blank=False)
+    review_dv.error = "Approve only after reviewing the question/control mappings and measurements."
+    review_dv.errorTitle = "Calibration review is required"
+    ws_review.add_data_validation(review_dv)
+    review_dv.add(f"B2:B{ws_review.max_row + 200}")
+
     # ---- Read Me First sheet ----
     ws3 = wb.create_sheet("Read Me First", 0)
 
@@ -338,10 +506,9 @@ def build_workbook(path: str) -> None:
         "changes to this file in this same location, and the very next run picks them up."
     )
     _row(
-        "It has two parts: the 'Settings' tab (where files live, which Google Cloud project/"
-        "database/AI models to use, and a handful of accuracy tuning numbers), and the 'Survey "
-        "Questions' tab (the full list of every question on the form, its answer choices, and "
-        "how it should be read/checked)."
+        "It contains operational Settings, a Form Setup profile, a Survey Questions schema, "
+        "reviewed Control Calibration, and a Calibration Review tab for machine-generated "
+        "geometry suggestions. New-form suggestions remain inactive until a human approves them."
     )
     _row("")
     _row("HOW THE PIPELINE USES THIS DOCUMENT, STEP BY STEP", bold=True, size=12, fill=SECTION_FILL)
@@ -351,8 +518,8 @@ def build_workbook(path: str) -> None:
         "another; every one of them reads its own settings straight out of this workbook first."
     )
     steps = [
-        ("Step 1 - Split & Sort", "Takes the raw combined scans and splits them into one 2-page PDF per survey, sorted into dated folders.",
-         "GCS_BUCKET, GCS_RAW_PREFIX, GCS_SPLIT_PREFIX, GCP_PROJECT_ID, BQ_TABLE_MANIFEST, TPS_EXTRACTION_MODEL, REPORT_YEAR"),
+        ("Step 1 - Split & Sort", "Takes raw combined scans and splits them into survey units using Form Setup's PAGES_PER_SURVEY, stored under a folder named after the source PDF.",
+         "GCS_BUCKET, GCS_RAW_PREFIX, GCS_SPLIT_PREFIX, PAGES_PER_SURVEY, FORM_NAME, SURVEY_LANGUAGE, DECLINED_KEYWORDS, BQ_TABLE_MANIFEST"),
         ("Step 2 - Measure Each Scan", "Measures each split survey's page alignment and ink darkness, so later steps know exactly where each checkbox sits on THIS particular scan.",
          "GCS_SPLIT_PREFIX, GCP_PROJECT_ID, BQ_TABLE_CALIBRATION"),
         ("Step 3 - Grade Scan Quality", "Classifies each file as clearly readable, unclear, or unreadable, so step 4 knows which files need extra scrutiny.",
@@ -386,9 +553,10 @@ def build_workbook(path: str) -> None:
         "its entire understanding of the form from this tab alone, every run."
     )
     _row(
-        "'Question Type' is the most important column - it tells the pipeline HOW to read and "
-        "verify that question. Click any cell in that column to see the dropdown of the five "
-        "valid types:"
+        "'Question Type' tells the pipeline how to read and verify that question. For a new "
+        "form, fill in its 1-based page number and any needed answer-format and Vision-anchor "
+        "metadata. Keep Form Setup at DRAFT until the question list and suggested geometry have "
+        "been reviewed. Use model_only for the first approved runs of an unfamiliar layout."
     )
     for t in QUESTION_TYPES:
         _row(f"   • {t}")
@@ -414,10 +582,9 @@ def build_workbook(path: str) -> None:
         "single choice (one checkbox on the form), not three."
     )
     _row(
-        "The quickest way to check you got it right: count the | pipes in the cell, add 1, and "
-        "make sure that equals the number of checkboxes printed next to that question on the "
-        "form. The ORDER matters too - list them in the same order they're printed, because the "
-        "pipeline identifies a marked answer by its position in this list."
+        "For fixed choices, count the | pipes and add 1; this should equal the printed number "
+        "of controls. Choice order must match the form. Approved control coordinates must map "
+        "to an existing question and exact answer label."
     )
     _row(
         "   • Written Answer - Short Code or Number: a handwritten field that's just one "
@@ -593,8 +760,8 @@ def build_question_extraction_prompt() -> str:
     file (after a human reviews it - see that flag's own help text)."""
     type_list = "\n".join(f"  - \"{t}\"" for t in QUESTION_TYPES)
     return (
-        "You are transcribing a scanned, printed survey FORM TEMPLATE - a "
-        "'Treatment Perceptions Survey' - into structured JSON. This PDF may "
+        "You are transcribing a scanned, printed survey FORM TEMPLATE into "
+        "structured JSON. This PDF may "
         "be a blank template or a filled-in EXAMPLE with handwritten answers "
         "already written on it; if so, COMPLETELY IGNORE every handwritten "
         "mark, checkbox X, or written-in value anywhere on the page. You are "
@@ -616,16 +783,11 @@ def build_question_extraction_prompt() -> str:
         "transcribing it - is the reason this extraction step exists at all, "
         "so treat verbatim transcription as the only acceptable output, never "
         "a tidied-up or shortened rewrite.\n\n"
-        "Go through the ENTIRE form, both the numbered questions (1, 2, 3, "
-        "...) AND the unnumbered header fields at the top of page 1 (CalOMS "
-        "Provider ID, Program Reporting Unit/Address, Setting, Field Based "
-        "Services Agency, Field Based Services Address, Today's Date) - label "
-        "these six header fields exactly \"H1\" through \"H6\" in that same "
-        "order (H1=CalOMS Provider ID, H2=Program Reporting Unit/Address, "
-        "H3=Setting, H4=Field Based Services Agency, H5=Field Based Services "
-        "Address, H6=Today's Date), and every other question by its own "
-        "printed number (\"1\", \"2\", ... \"35\", with no leading zero and no "
-        "period).\n\n"
+        "Go through the ENTIRE form. Use each printed question number exactly "
+        "as it appears, without a trailing period. If there are unnumbered "
+        "header fields, assign stable labels H1, H2, H3, etc. in reading order "
+        "and copy their printed labels verbatim. Do not assume particular "
+        "field names, question counts, or page layouts.\n\n"
         "Return ONLY a JSON object - no other text, markdown, or commentary - "
         "shaped exactly like this, one key per question/field:\n"
         "{\n"
@@ -685,8 +847,8 @@ def extract_survey_questions_from_pdf(
     (see main()'s --extract-from-pdf/--write-overrides).
 
     Defaults for vertex_project/vertex_location/model all come from
-    pipeline_config.py (TPS_EXTRACTION_PROJECT/TPS_EXTRACTION_LOCATION/
-    TPS_EXTRACTION_MODEL-equivalent settings) when not given explicitly, same
+    pipeline_config.py (GCP_PROJECT_ID, VERTEX_LOCATION, and
+    STEP1_CLASSIFICATION_MODEL) when not given explicitly, same
     convention as step1_merge_pdf.py/step4_process_pdf.py's own Gemini calls.
 
     Raises on any failure (a malformed/non-JSON response, an API error) -
@@ -700,7 +862,7 @@ def extract_survey_questions_from_pdf(
 
     vertex_project = vertex_project or cfg.GCP_PROJECT_ID
     vertex_location = vertex_location or cfg.VERTEX_LOCATION
-    model = model or cfg.TPS_EXTRACTION_MODEL
+    model = model or cfg.STEP1_CLASSIFICATION_MODEL
 
     with pymupdf.open(pdf_path) as doc:
         image_parts = [
@@ -810,6 +972,12 @@ def main() -> None:
         "_CONFIG_GCS_BUCKET (the same bucket the live workbook is read from).",
     )
     ap.add_argument(
+        "--setup-from-pdf", default=None, metavar="FORM.pdf",
+        help="Create a new-form workbook draft: extract questions and measure page/control "
+        "geometry from a local blank template PDF. All setup and geometry remains DRAFT/PENDING "
+        "until reviewed; no suggested control mapping is automatically activated.",
+    )
+    ap.add_argument(
         "--extract-from-pdf", default=None, metavar="FORM.pdf",
         help="Instead of building a workbook, read every question's printed text/choices/type "
         "straight off this survey form PDF with Gemini (see build_question_extraction_prompt()) "
@@ -832,9 +1000,89 @@ def main() -> None:
     )
     ap.add_argument(
         "--gemini-model", default=None,
-        help="[--extract-from-pdf] Gemini model ID. Defaults to TPS_EXTRACTION_MODEL.",
+        help="[--extract-from-pdf] Gemini model ID. Defaults to STEP1_CLASSIFICATION_MODEL.",
     )
     args = ap.parse_args()
+
+    if args.setup_from_pdf and args.extract_from_pdf:
+        ap.error("Use only one of --setup-from-pdf or --extract-from-pdf.")
+    if args.setup_from_pdf and (args.question_overrides or args.replace_questions):
+        ap.error("--setup-from-pdf cannot be combined with question override options.")
+
+    if args.setup_from_pdf:
+        import pymupdf
+        from pathlib import Path
+        import step2_pdf_calibration
+
+        with pymupdf.open(args.setup_from_pdf) as document:
+            page_count = len(document)
+        if page_count < 1:
+            ap.error("--setup-from-pdf must point to a non-empty form template PDF.")
+
+        extracted = extract_survey_questions_from_pdf(
+            args.setup_from_pdf,
+            vertex_project=args.vertex_project,
+            vertex_location=args.vertex_location,
+            model=args.gemini_model,
+        )
+        question_rows = []
+        semantic_questions = []
+        for number, question in extracted.items():
+            question_text = question.get("question_text", "")
+            raw_choices = question.get("choices", "")
+            question_type = question.get("question_type", "")
+            if question_type not in QUESTION_TYPES:
+                raise ValueError(
+                    f"Extracted question {number!r} has unsupported question type "
+                    f"{question_type!r}; review the question extraction before building a workbook."
+                )
+            is_written = question_type.startswith("Written Answer")
+            choices = "" if is_written else raw_choices
+            semantic_questions.append((number, None, question_text, choices))
+            question_rows.append([
+                number, "", question_text, choices, question_type, "",
+                "N", "N", "N", "", "", "", "", "", "", "", "", "", "",
+            ])
+
+        artifact = step2_pdf_calibration.generate_calibration_artifact(
+            [args.setup_from_pdf],
+            survey_questions=semantic_questions,
+        )
+        generated = artifact.get("generated", {})
+        form_setup = {
+            "FORM_SETUP_STATUS": "DRAFT",
+            "FORM_NAME": Path(args.setup_from_pdf).stem,
+            "PAGES_PER_SURVEY": page_count,
+            "FORM_DETECTION_MODE": "model_only",
+            "BASELINE_MARKS_JSON": json.dumps(generated.get("BASELINE_MARKS") or {}),
+            "GRID_COLUMN_CENTERS_JSON": json.dumps(generated.get("GRID_COLUMN_CENTERS") or []),
+            "FORM_INK_THRESHOLD": generated.get("INK_THRESHOLD") or cfg.FORM_INK_THRESHOLD,
+            "FORM_GRID_BOX_EXPECTED_SIZE": (
+                generated.get("GRID_BOX_EXPECTED_SIZE")
+                or cfg.FORM_GRID_BOX_EXPECTED_SIZE
+            ),
+        }
+        review = {
+            "generated": generated,
+            "page_geometry": generated.get("page_geometry", []),
+            "review_prompts": artifact.get("review_prompts", []),
+        }
+        build_workbook(
+            args.output,
+            form_setup=form_setup,
+            calibration_review=review,
+            control_rows=[],
+            question_rows=question_rows,
+        )
+        if args.upload_blob:
+            upload_to_gcs(args.output, args.upload_blob, bucket_name=args.bucket)
+        print(
+            f"Created DRAFT setup for {form_setup['FORM_NAME']!r} with {len(question_rows)} "
+            f"question(s) and {page_count} page(s). Review Form Setup, Survey Questions, and "
+            "Calibration Review; map controls in Control Calibration; then set FORM_SETUP_STATUS "
+            "to APPROVED. New forms default to model_only and never activate suggested geometry."
+        )
+        return
 
     if args.extract_from_pdf:
         if not args.write_overrides:

@@ -1,6 +1,7 @@
 """Ingests human-reviewed feedback (correct_answer) from the LATEST
-tps_feedback_{datetime}.xlsx file step4_process_pdf.py's --export-needs-
-review-feedback wrote to gs://<GCS_FEEDBACK_BUCKET>/<GCS_FEEDBACK_PREFIX>,
+<FEEDBACK_FILE_PREFIX>{datetime}.xlsx file step4_process_pdf.py's
+--export-needs-review-feedback wrote to
+gs://<GCS_FEEDBACK_BUCKET>/<GCS_FEEDBACK_PREFIX>,
 and applies it directly to BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK (never
 to survey_responses itself - see step4_process_pdf.py's sync_survey_
 responses_with_feedback() docstring for why feedback state lives only on
@@ -52,12 +53,14 @@ BQ_FEEDBACK_TABLE = pipeline_config.BQ_TABLE_SURVEY_RESPONSES_WITH_FEEDBACK
 FEEDBACK_BUCKET = pipeline_config.GCS_FEEDBACK_BUCKET
 FEEDBACK_PREFIX = pipeline_config.GCS_FEEDBACK_PREFIX
 
-_FEEDBACK_FILE_RE = re.compile(r"^tps_feedback_\d{8}_\d{6}\.xlsx$")
+_FEEDBACK_FILE_RE = re.compile(
+    rf"^{re.escape(pipeline_config.FEEDBACK_FILE_PREFIX)}\d{{8}}_\d{{6}}\.xlsx$"
+)
 
 
 def find_latest_feedback_blob(bucket, prefix: str):
-    """Returns the most-recently-EXPORTED tps_feedback_{datetime}.xlsx blob
-    under prefix (the datetime suffix step4_process_pdf.py's --export-
+    """Returns the most-recently-exported configured-prefix timestamped
+    feedback workbook under prefix (the datetime suffix step4_process_pdf.py's --export-
     needs-review-feedback stamps into the name sorts lexicographically, so
     "greatest name" == "latest export run" - no need to trust GCS blob-
     updated timestamps), or None if no such file exists yet."""
@@ -148,17 +151,17 @@ def main():
     ap.add_argument("--bq-dataset", default=BQ_DATASET, help="BigQuery dataset name.")
     ap.add_argument("--survey-table", default=BQ_SURVEY_TABLE, help="survey_responses table name (synced FROM, never modified).")
     ap.add_argument("--feedback-table", default=BQ_FEEDBACK_TABLE, help="survey_responses_with_feedback table name (synced/ingested INTO).")
-    ap.add_argument("--feedback-bucket", default=FEEDBACK_BUCKET, help="GCS bucket to look for the latest tps_feedback_{datetime}.xlsx file in.")
-    ap.add_argument("--feedback-prefix", default=FEEDBACK_PREFIX, help="GCS prefix (folder) to look for the latest tps_feedback_{datetime}.xlsx file under.")
+    ap.add_argument("--feedback-bucket", default=FEEDBACK_BUCKET, help="GCS bucket to look for the latest configured-prefix feedback workbook in.")
+    ap.add_argument("--feedback-prefix", default=FEEDBACK_PREFIX, help="GCS prefix (folder) to look for the latest configured-prefix feedback workbook under.")
     args, _unknown = ap.parse_known_args()
 
     bucket = step4.connect_gcs_bucket(args.feedback_bucket)
     blob = find_latest_feedback_blob(bucket, args.feedback_prefix)
     if blob is None:
         err(
-            "[FEEDBACK] No tps_feedback_*.xlsx file found under gs://%s/%s - "
+            "[FEEDBACK] No %s*.xlsx feedback file found under gs://%s/%s - "
             "run `python step4_process_pdf.py --export-needs-review-feedback` first.",
-            args.feedback_bucket, args.feedback_prefix,
+            pipeline_config.FEEDBACK_FILE_PREFIX, args.feedback_bucket, args.feedback_prefix,
         )
         sys.exit(1)
     gcs_uri = f"gs://{args.feedback_bucket}/{blob.name}"
