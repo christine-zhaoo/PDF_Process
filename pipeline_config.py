@@ -677,6 +677,25 @@ def _apply_control_calibration(rows: list) -> None:
     globals()["FORM_CONTROL_CALIBRATION"] = calibration
 
 
+def ink_cluster_limits() -> tuple[int, int, int]:
+    """Return (minimum samples, minimum marks, maximum marks) for ink clustering.
+
+    Legacy workbooks retain their validated TPS bounds. Configured profiles
+    derive the sample and mark limits from approved checkbox geometry, so a
+    smaller form is not rejected by TPS-specific box counts.
+    """
+    if not FORM_PROFILE_CONFIGURED:
+        return 12, 8, 25
+
+    checkbox_count = sum(
+        item["control_type"] == "checkbox"
+        for item in FORM_CONTROL_CALIBRATION
+    )
+    if checkbox_count < 2:
+        return 2, 1, 1
+    return min(12, checkbox_count), 1, checkbox_count - 1
+
+
 def _validate_form_question_pages() -> None:
     if not FORM_PROFILE_CONFIGURED or FORM_SETUP_STATUS.upper() != "APPROVED":
         return

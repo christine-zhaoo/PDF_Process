@@ -224,7 +224,10 @@ QUESTION_BASELINE_CORRECTION = (
 SEARCH_BOUND = 22
 REG_MARK_SIZE, REG_MARK_SIZE_TOL, REG_MARK_FILL = 74, 28, 0.75
 CONFIRM_PAD = 8
-MIN_PLAUSIBLE_MARKED, MAX_PLAUSIBLE_MARKED, CLEAR_GAP = 8, 25, 0.08
+MIN_INK_SAMPLES, MIN_PLAUSIBLE_MARKED, MAX_PLAUSIBLE_MARKED = (
+    pipeline_config.ink_cluster_limits()
+)
+CLEAR_GAP = 0.08
 
 
 def all_box_questions():
@@ -424,10 +427,11 @@ def render_pages(pdf_bytes, dpi=RENDER_DPI):
 
 
 def _split_clusters(ratios):
+    """Split box ink ratios using limits shared with Step 2."""
     import numpy as np
     r = np.array(sorted(ratios), float)
     n = len(r)
-    if n < 12:
+    if n < MIN_INK_SAMPLES:
         return None
     lo_k = max(1, n - MAX_PLAUSIBLE_MARKED)
     hi_k = max(lo_k + 1, n - MIN_PLAUSIBLE_MARKED)

@@ -300,9 +300,11 @@ REG_MARK_FILL = 0.75
 # Per-box search pad used when CONFIRMING a transformed position.
 CONFIRM_PAD = 8
 
-# A plausible marked-box count per file, and the minimum gap that counts as a "clear" (safe-to-threshold) blank/marked ink split. See _split_clusters().
-MIN_PLAUSIBLE_MARKED = 8
-MAX_PLAUSIBLE_MARKED = 25
+# Ink-cluster limits are legacy TPS defaults or are derived from approved
+# configured-profile checkbox geometry. See pipeline_config.ink_cluster_limits().
+MIN_INK_SAMPLES, MIN_PLAUSIBLE_MARKED, MAX_PLAUSIBLE_MARKED = (
+    pipeline_config.ink_cluster_limits()
+)
 CLEAR_GAP = 0.08
 
 CALIBRATOR_VERSION = "notebook_1-1.0"
@@ -1253,7 +1255,7 @@ def _split_clusters(ratios):
     it falls outside the [MIN_PLAUSIBLE_MARKED, MAX_PLAUSIBLE_MARKED]
     window (bug fix, explicit user request: confirmed on a real file,
     2025_Nov_23_5_TPS_4047.pdf, where only 6 of this file's 72 confirmed
-    boxes were genuinely marked - well under MIN_PLAUSIBLE_MARKED=8 - with
+    boxes were genuinely marked - below the legacy plausible-count floor - with
     an unmistakable 0.2067 gap separating them from every blank box. The
     old windowed-only search could never see that gap (index 66 sits past
     hi_k=64), so it was forced to pick the best gap it COULD find inside
@@ -1271,7 +1273,7 @@ def _split_clusters(ratios):
     import numpy as np
     r = np.array(sorted(ratios), float)
     n = len(r)
-    if n < 12:
+    if n < MIN_INK_SAMPLES:
         return None
 
     # First pass: look for a genuinely clear gap ANYWHERE in the full
